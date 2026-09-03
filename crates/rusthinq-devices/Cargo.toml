@@ -1,0 +1,32 @@
+[package]
+name = "rusthinq-devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device handlers and modelId registry for rusthinq"
+
+[features]
+default = ["native", "scripting"]
+# Built-in Rust device handlers (see src/devices/mod.rs's `register_devices!`
+# table). Currently empty (this fork pruned all upstream handlers to start its
+# own set from scratch) so this gates no dependencies today, only the module
+# itself — kept alongside `scripting` so `--no-default-features
+# --features scripting` (script-only) and `--features native` (native-only)
+# are both meaningful builds as handlers get added.
+native = []
+# Rhai device-scripting support for external `.rhai` converters (see
+# src/scripting/mod.rs). Off (--no-default-features) drops rhai/notify entirely
+# for embedders that only ever use native handlers.
+scripting = ["dep:rhai", "dep:notify", "dep:notify-debouncer-mini"]
+
+[dependencies]
+notify = { version = "8.2.0", optional = true }
+notify-debouncer-mini = { version = "0.7.0", optional = true }
+rhai = { version = "1.26.0", features = ["sync"], optional = true }
+rusthinq-core = { workspace = true }
+rusthinq-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
