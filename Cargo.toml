@@ -54,5 +54,5 @@ hmac = "0.13"
 url = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 rsa = { version = "0.9", features = ["pem"] }
-rand = "0.8"
+rand = "0.10"
 toml = "1.1"
