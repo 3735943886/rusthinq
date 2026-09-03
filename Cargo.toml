@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rusthinq-util",
+    "crates/rusthinq-core",
+    "crates/rusthinq-devices",
+    "crates/rusthinq-bridge",
+    "crates/rusthinq-cloud",
+    "crates/rusthinq-setup",
+    "crates/rusthinq-tools",
+]
+default-members = [
+    "crates/rusthinq-util",
+    "crates/rusthinq-core",
+    "crates/rusthinq-devices",
+    "crates/rusthinq-bridge",
+    "crates/rusthinq-cloud",
+    "crates/rusthinq-setup",
+    "crates/rusthinq-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/anszom/rethink"
+
+[workspace.dependencies]
+rusthinq-util = { path = "crates/rusthinq-util" }
+rusthinq-core = { path = "crates/rusthinq-core" }
+rusthinq-devices = { path = "crates/rusthinq-devices" }
+rusthinq-bridge = { path = "crates/rusthinq-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+base64 = "0.23"
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rumqttc = "0.25"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.11"
+hmac = "0.13"
+url = "2"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+toml = "1.1"

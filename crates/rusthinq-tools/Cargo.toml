@@ -1,0 +1,35 @@
+[package]
+name = "rusthinq-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI utilities: packet-parser, packet-sender, capture, MCP, cloud helpers"
+
+[[bin]]
+name = "rusthinq-packet-parser"
+path = "src/bin/packet_parser.rs"
+
+[[bin]]
+name = "rusthinq-packet-sender"
+path = "src/bin/packet_sender.rs"
+
+[[bin]]
+name = "rusthinq-capture"
+path = "src/bin/rusthinq_capture.rs"
+
+[[bin]]
+name = "rusthinq-mcp"
+path = "src/bin/rusthinq_mcp.rs"
+
+[[bin]]
+name = "rusthinq-lgcloud-monitor"
+path = "src/bin/lgcloud_monitor.rs"
+
+[dependencies]
+rusthinq-util = { workspace = true }
+rusthinq-bridge = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rumqttc = { workspace = true }

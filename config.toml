@@ -1,0 +1,85 @@
+hostname = "rusthinq.local" # this can't be an IP address
+
+# /route normally tells the appliance to talk to `hostname` from now on. Turn this on when the
+# appliance was never set up against rusthinq and only reaches it because its traffic is
+# redirected (port DNAT): /route then echoes back the name the appliance asked for, so it keeps
+# using an address it already resolves and stores nothing that outlives the redirection.
+# Leave it off for appliances set up over SoftAP - they have no redirection to carry them here.
+# advertise_requested_host = false
+
+ca_key_file = "ca.key" # will be created on first run if necessary
+ca_cert_file = "ca.cert" # will be created on first run if necessary
+
+# If port forwarding or other redirection is involved, the bind port may not match
+# the port that the device will connect to from the outside.
+# In such cases, you may need to specify them separately:
+#  https_port = { bind = 4433, advertise = 443 }
+# or even with a specific bind address:
+#  https_port = { bind = 4433, address = "192.168.0.111", advertise = 443 }
+# or not:
+#  https_port = 443
+# Note that diverging from the defaults (443 & 8883) may degrade compatibility with
+# some devices
+https_port = 443
+mqtts_port = 8883
+
+# the defaults should not be changed unless you know what you're doing
+thinq1_https_port = 46030
+thinq1_port = 47878
+
+log = ["status", "incoming", "HTTPS", "bridge"]
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq" # rusthinq topics will be prefixed with this
+mqtt_user = ""
+mqtt_pass = ""
+# Topic prefix for the raw wire-frame observer/inject bus and the device simulator —
+# lets a trusted local tool watch or fake device traffic on this same broker
+# connection. Unset by default: neither registers, so no debug/inject surface exists
+# anywhere. Uncomment to enable (can equal rusthinq_prefix above, or be its own value
+# if you want the broker's ACLs to gate this surface separately from the rest of the
+# control plane).
+raw_prefix = "rusthinq-raw"
+# Where the id -> published-property map used to clean up a permanently-gone device's
+# retained topics gets persisted, so it survives a restart. On by default (not an
+# opt-in feature); defaults to mqtt_state.json next to this config file if unset.
+# state_file = "mqtt_state.json"
+
+[bridge]
+storage_path = "./state"
+
+# Rhai device scripting (see rusthinq-devices::scripting). Absent entirely = the
+# feature doesn't exist: registry.rs never falls back to a script for an unknown
+# modelId. Put a <modelId>.rhai file in rhai_dir to give that model a handler
+# (e.g. rhai_dir/RAC_056905_WW.rhai) — shared logic can live in its own .rhai file
+# there too and be pulled in with `import "common" as common;`.
+#
+# *** raw_prefix and a <modelId>.rhai script are NOT mutually exclusive, and rusthinq
+# *** does not arbitrate between them — read this before adding either for a model
+# *** that already has the other.
+#
+# raw_bus (see raw_prefix above) taps EVERY connected device's rx/tx unconditionally,
+# the instant raw_prefix is set — it has no idea whether registry.rs also handed that
+# device's model a script/native handler, and neither side disables the other. There
+# is no priority: both simply run in parallel on every frame, always.
+#
+# That's fine, even useful, when raw_prefix is just what its doc comment says — a
+# debug/RE tap (rusthinq-mcp, sniffing live traffic to see what a script actually
+# produced vs. what's really on the wire, testing an undocumented command via inject
+# before adding it to the script). Nothing about that use collides with a script
+# running for the same device.
+#
+# It stops being fine the moment raw_prefix is being used as another driver's *sole*
+# data source — like the rethink-TS-adapter setup above, which has no other way to
+# see a device's traffic. Give that same model a <modelId>.rhai too and you now have
+# two independent, mutually-unaware full drivers (the script inside rusthinq, the TS
+# adapter outside it) both interpreting the same wire data and each publishing its own
+# state. They won't crash and their topics don't literally collide (different
+# prefixes/processes), but you get duplicated logic and no guarantee the two ever
+# agree — pure operator bookkeeping, not something the code checks or warns about.
+#
+# [devices]
+# rhai_dir = "./scripts"
+# watch = true # hot-reload on save: recompiles the changed file, keeps the
+# previous version running if the new one fails to compile
