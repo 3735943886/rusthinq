@@ -27,6 +27,20 @@ mqtts_port = 8883
 thinq1_https_port = 46030
 thinq1_port = 47878
 
+# Topics to log at INFO (anything not listed here is silently dropped; there's no
+# separate debug/trace level - see rusthinq-core's logging module). Add "all" to
+# enable everything. Available topics:
+#   status   - lifecycle/status lines (startup, CA cert creation, MQTT connection
+#              established, orphaned device re-accepted, ThinQ1 HTTP listening, ready)
+#   incoming - every CLIP/MQTT message a device publishes to the broker, topic +
+#              raw payload, including per-packet device_packet traffic - very
+#              high-volume on a busy device, mainly useful while debugging wire-level
+#              issues
+#   outgoing - every message rusthinq itself publishes back to a device (the
+#              cloud->device counterpart of "incoming")
+#   HTTPS    - HTTP route hits (e.g. /route, TotalDeviceInfoSvc)
+#   bridge   - LG-cloud bridge/relay activity: connect/disconnect, relayed packets,
+#              sign-in URL, login/logout outcomes
 log = ["status", "incoming", "HTTPS", "bridge"]
 
 [mqtt]
