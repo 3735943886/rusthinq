@@ -86,6 +86,16 @@ pub struct DevicesConfig {
     pub watch: bool,
 }
 
+/// Optional web dashboard (`rusthinq-gui`, only compiled in with the `gui`
+/// feature). Absent `[gui]` means it doesn't run at all, same opt-in-by-presence
+/// pattern as `[bridge]`/`[devices]`. It talks to `mqtt.mqtt_url` as its own MQTT
+/// client, same as any other tool would -- nothing here is a second control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuiConfig {
+    /// Local TCP port the dashboard's HTTP server binds to.
+    pub bind: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawConfig {
     pub hostname: String,
@@ -107,6 +117,8 @@ pub struct RawConfig {
     pub bridge: Option<BridgeConfig>,
     #[serde(default)]
     pub devices: Option<DevicesConfig>,
+    #[serde(default)]
+    pub gui: Option<GuiConfig>,
     #[serde(default)]
     pub log: Option<Vec<String>>,
     /// Let `/route` echo back the hostname a connecting appliance actually requested
@@ -131,6 +143,7 @@ pub struct Config {
     pub mqtt_enabled: bool,
     pub bridge: Option<BridgeConfig>,
     pub devices: Option<DevicesConfig>,
+    pub gui: Option<GuiConfig>,
     pub log: Vec<String>,
     pub advertise_requested_host: bool,
 }
@@ -186,6 +199,7 @@ pub fn normalize(raw: RawConfig) -> Config {
         mqtt_enabled: raw.mqtt_enabled.unwrap_or(true),
         bridge: raw.bridge,
         devices: raw.devices,
+        gui: raw.gui,
         log: raw
             .log
             .unwrap_or_else(|| vec!["status".into(), "incoming".into(), "HTTPS".into()]),
@@ -393,5 +407,41 @@ mqtt_pass = ""
 rhai_dir = "./scripts"
 "#;
         assert!(!parse_config_text(text).unwrap().devices.unwrap().watch);
+    }
+
+    #[test]
+    fn gui_section_is_absent_by_default_and_parses_when_present() {
+        let without = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        assert!(parse_config_text(without).unwrap().gui.is_none());
+
+        let with = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+
+[gui]
+bind = 8080
+"#;
+        assert_eq!(parse_config_text(with).unwrap().gui.unwrap().bind, 8080);
     }
 }

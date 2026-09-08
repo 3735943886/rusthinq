@@ -208,6 +208,17 @@ async fn main() -> Result<()> {
         br.set_on_session_change_hook(Arc::new(move || device_list.publish()));
     }
 
+    // Owner-given device names from the ThinQ account (see rusthinq_bridge::Bridge's
+    // `name`/`start_name_refresh_loop`) — same "republish when it changes" reasoning
+    // as the session-change hook above, so a freshly fetched name reaches a
+    // subscriber without waiting for some unrelated event to next call publish().
+    #[cfg(feature = "bridge")]
+    if let Some(ref br) = lg_bridge {
+        let device_list = device_list.clone();
+        br.set_on_names_changed_hook(Arc::new(move || device_list.publish()));
+        br.start_name_refresh_loop();
+    }
+
     // Retained, but only ever *written* on a device connect/disconnect above — if the
     // broker itself loses its retained store (e.g. restarted) around the same time this
     // MQTT client reconnects, nothing else would put the snapshot back until the next
@@ -266,6 +277,27 @@ async fn main() -> Result<()> {
                 );
             }
         });
+    }
+
+    // Optional web dashboard (rusthinq_gui) — its own independent MQTT client, not
+    // wired into `mqtt_sink`/`DeviceBridge` at all (see rusthinq-gui's crate docs).
+    // Same opt-in-by-presence pattern as `[bridge]`/`[devices]`.
+    #[cfg(feature = "gui")]
+    if let Some(ref gui) = config.gui {
+        let gui_cfg = gui.clone();
+        let mqtt_cfg = config.mqtt.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rusthinq_gui::run(gui_cfg, mqtt_cfg).await {
+                logging::log("status", &[&format!("rusthinq-gui ended: {e}")]);
+            }
+        });
+    }
+    #[cfg(not(feature = "gui"))]
+    if config.gui.is_some() {
+        tracing::warn!(
+            "config.toml has a [gui] section but this binary was built without the \
+             `gui` feature — ignoring it, no web dashboard available"
+        );
     }
 
     // Not every connection arriving on the HTTPS port is one rusthinq should answer —

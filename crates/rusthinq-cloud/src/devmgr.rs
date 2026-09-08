@@ -136,6 +136,10 @@ impl ConnectedDevice {
         *self.deploy_info.lock() = Some((app_info, platform_info));
     }
 
+    /// Registered by `bridge_adapter.rs`'s `LocalDevice::on_unhandled_clip` -- its
+    /// only production caller, so this is otherwise dead code without the `bridge`
+    /// feature.
+    #[cfg(any(test, feature = "bridge"))]
     pub fn add_unhandled_clip_handler<F: Fn(serde_json::Value) + Send + Sync + 'static>(
         &self,
         f: F,

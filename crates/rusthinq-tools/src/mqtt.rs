@@ -115,8 +115,7 @@ pub fn subscribe_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::process::{Child, Command, Stdio};
+    use crate::test_support::TestBroker;
 
     #[test]
     fn parse_host_port_defaults_and_explicit() {
@@ -132,57 +131,6 @@ mod tests {
             parse_host_port("broker.local:8883"),
             ("broker.local".to_string(), 8883)
         );
-    }
-
-    /// A local mosquitto instance on an ephemeral port, for exercising the real
-    /// wire protocol rather than mocking rumqttc. Environments without a
-    /// `mosquitto` binary skip these tests instead of failing the suite.
-    struct TestBroker {
-        child: Child,
-        port: u16,
-    }
-
-    impl TestBroker {
-        fn start() -> Option<Self> {
-            let port = {
-                let listener = TcpListener::bind("127.0.0.1:0").ok()?;
-                listener.local_addr().ok()?.port()
-            };
-            let child = match Command::new("mosquitto")
-                .args(["-p", &port.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(_) => {
-                    eprintln!("skipping mqtt.rs integration test: mosquitto not found on PATH");
-                    return None;
-                }
-            };
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-                if Instant::now() > deadline {
-                    panic!("mosquitto did not start listening on {port} in time");
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Some(Self { child, port })
-        }
-
-        fn addr(&self) -> String {
-            format!("127.0.0.1:{}", self.port)
-        }
-    }
-
-    impl Drop for TestBroker {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
     }
 
     #[test]

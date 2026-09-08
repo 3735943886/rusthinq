@@ -41,6 +41,7 @@ impl DeviceListPublisher {
             all.insert(
                 id.clone(),
                 json!({
+                    "name": self.bridge.as_ref().and_then(|b| b.name(&id)),
                     "model": dev.meta.model_id,
                     "modelName": dev.meta.model_name,
                     "deviceType": dev.meta.device_type,
@@ -107,6 +108,8 @@ mod tests {
         assert_eq!(v["devices"]["dev-1"]["platform"], "thinq2");
         assert_eq!(v["devices"]["dev-1"]["mapped"], false);
         assert_eq!(v["devices"]["dev-1"]["bridged"], false);
+        // No bridge configured at all -- can't have a ThinQ-account name for anything.
+        assert_eq!(v["devices"]["dev-1"]["name"], Value::Null);
         assert_eq!(v["bridgeLoggedIn"], Value::Null);
     }
 

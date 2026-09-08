@@ -105,6 +105,21 @@ pub struct Bridge {
     /// for this path (unlike the explicit enable/disable MQTT commands, which already
     /// publish after their own `await` completes).
     on_session_change: Mutex<Option<SessionChangeHook>>,
+    /// What the owner calls each appliance, from the ThinQ account (`alias` in LG's
+    /// device list) — the same names the app shows. rusthinq only ever knows a
+    /// device by its id and model, useless for telling identical appliances apart;
+    /// the account already has the answer. See `name`/`start_name_refresh_loop`.
+    device_names: Mutex<HashMap<String, String>>,
+    /// Wakes `run_name_refresh_loop` early — `complete_login` fires this so a fresh
+    /// login doesn't wait out the rest of `NAME_REFRESH_INTERVAL` before names show
+    /// up.
+    name_refresh_notify: tokio::sync::Notify,
+    /// Called every time `device_names` actually changes — rusthinq-cloud wires
+    /// this to republish its retained `<prefix>/devices` snapshot, same reason
+    /// `on_session_change` exists: without it, a name that just arrived from the
+    /// account wouldn't reach a subscriber until some unrelated event (a device
+    /// connecting, a bridge enable/disable) happened to republish next.
+    on_names_changed: Mutex<Option<SessionChangeHook>>,
 }
 
 impl Bridge {
@@ -117,7 +132,16 @@ impl Bridge {
             logged_in: Mutex::new(logged_in),
             note_urls: Mutex::new(None),
             on_session_change: Mutex::new(None),
+            device_names: Mutex::new(HashMap::new()),
+            name_refresh_notify: tokio::sync::Notify::new(),
+            on_names_changed: Mutex::new(None),
         })
+    }
+
+    /// Install a hook run every time `refresh_names` actually changes the cached
+    /// names — see `on_names_changed` above.
+    pub fn set_on_names_changed_hook(&self, hook: SessionChangeHook) {
+        *self.on_names_changed.lock() = Some(hook);
     }
 
     /// Install a hook run every time a session is attached or detached — see
@@ -149,6 +173,80 @@ impl Bridge {
 
     pub fn storage(&self) -> &Arc<dyn BridgeState> {
         &self.storage
+    }
+
+    /// The owner's name for `id`, if the account has one cached (see
+    /// `start_name_refresh_loop`). `None` before the first successful refresh, or if
+    /// the account never gave this device an alias.
+    pub fn name(&self, id: &str) -> Option<String> {
+        self.device_names.lock().get(id).cloned()
+    }
+
+    /// Starts the periodic ThinQ-account device-name refresh as a background task —
+    /// call this once, from an async context, after constructing the bridge (see
+    /// `rusthinq-cloud`'s `main.rs`). Deliberately not started by `new()` itself:
+    /// that's a plain sync constructor callable outside a Tokio runtime (tests do
+    /// this), and starting a background task there would panic in exactly that case.
+    pub fn start_name_refresh_loop(self: &Arc<Self>) {
+        let bridge = self.clone();
+        tokio::spawn(async move { bridge.run_name_refresh_loop().await });
+    }
+
+    async fn run_name_refresh_loop(self: Arc<Self>) {
+        const NAME_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        loop {
+            if self.is_logged_in()
+                && let Err(e) = self.refresh_names().await
+            {
+                tracing::warn!("could not refresh device names from the ThinQ account: {e:#}");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(NAME_REFRESH_INTERVAL) => {}
+                _ = self.name_refresh_notify.notified() => {}
+            }
+        }
+    }
+
+    /// Best-effort, mirrors rethink's `Bridge.refreshNames`: not logged in just
+    /// clears the cache; any other failure (network, auth) is left for the caller
+    /// to log, same policy as every other real-cloud call in this file.
+    async fn refresh_names(&self) -> anyhow::Result<()> {
+        let Some(creds) = self.storage.get_credentials() else {
+            self.set_device_names(HashMap::new());
+            return Ok(());
+        };
+        let mut client = thinq_api::Client::new(creds.env.clone());
+        client.auth(&creds.refresh_token).await?;
+        let devices = client.list_devices().await?;
+        let names: HashMap<String, String> = devices
+            .iter()
+            .filter_map(|d| {
+                let id = d.get("deviceId").and_then(|v| v.as_str())?;
+                let alias = d.get("alias").and_then(|v| v.as_str())?;
+                (!alias.is_empty()).then(|| (id.to_string(), alias.to_string()))
+            })
+            .collect();
+        self.set_device_names(names);
+        Ok(())
+    }
+
+    /// Replaces the cached names and fires `on_names_changed`, but only if they
+    /// actually changed -- `run_name_refresh_loop` calls this every
+    /// `NAME_REFRESH_INTERVAL`, and most of those ticks change nothing.
+    fn set_device_names(&self, names: HashMap<String, String>) {
+        let mut current = self.device_names.lock();
+        if *current == names {
+            return;
+        }
+        *current = names;
+        drop(current);
+        self.notify_names_changed();
+    }
+
+    fn notify_names_changed(&self) {
+        if let Some(hook) = self.on_names_changed.lock().clone() {
+            hook();
+        }
     }
 
     /// Stop upstream and remove from live map; keep want_enabled + device state.
@@ -211,12 +309,17 @@ impl Bridge {
             },
         }));
         *self.logged_in.lock() = true;
+        // Wakes `run_name_refresh_loop` (if `start_name_refresh_loop` was ever
+        // called) so names show up right away instead of after the rest of
+        // NAME_REFRESH_INTERVAL. A no-op permit if nothing's listening yet.
+        self.name_refresh_notify.notify_one();
         Ok(true)
     }
 
     pub async fn logout(&self) -> anyhow::Result<()> {
         self.storage.set_credentials(None);
         *self.logged_in.lock() = false;
+        self.set_device_names(HashMap::new());
         let ids: Vec<String> = self.sessions.lock().keys().cloned().collect();
         for id in ids {
             self.detach_session(&id);
@@ -992,6 +1095,52 @@ mod lifecycle_tests {
             before,
             "live short-circuit must not re-register handlers"
         );
+    }
+
+    #[tokio::test]
+    async fn name_is_none_before_any_refresh() {
+        let bridge = test_bridge();
+        assert_eq!(bridge.name("dev-1"), None);
+    }
+
+    #[tokio::test]
+    async fn set_device_names_only_fires_the_hook_when_the_map_actually_changes() {
+        let bridge = test_bridge();
+        let fires = Arc::new(rusthinq_util::sync::Mutex::new(0usize));
+        let fires2 = fires.clone();
+        bridge.set_on_names_changed_hook(Arc::new(move || *fires2.lock() += 1));
+
+        let mut names = HashMap::new();
+        names.insert("dev-1".to_string(), "Kitchen Fridge".to_string());
+        bridge.set_device_names(names.clone());
+        assert_eq!(*fires.lock(), 1);
+        assert_eq!(bridge.name("dev-1"), Some("Kitchen Fridge".to_string()));
+
+        // Same content again -- no real change, hook must not re-fire.
+        bridge.set_device_names(names.clone());
+        assert_eq!(*fires.lock(), 1);
+
+        names.insert("dev-2".to_string(), "Living Room AC".to_string());
+        bridge.set_device_names(names);
+        assert_eq!(*fires.lock(), 2);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_cached_names_and_fires_the_hook() {
+        let bridge = test_bridge();
+        let mut names = HashMap::new();
+        names.insert("dev-1".to_string(), "Kitchen Fridge".to_string());
+        bridge.set_device_names(names);
+        assert_eq!(bridge.name("dev-1"), Some("Kitchen Fridge".to_string()));
+
+        let fired = Arc::new(rusthinq_util::sync::Mutex::new(false));
+        let fired2 = fired.clone();
+        bridge.set_on_names_changed_hook(Arc::new(move || *fired2.lock() = true));
+
+        bridge.logout().await.unwrap();
+
+        assert_eq!(bridge.name("dev-1"), None);
+        assert!(*fired.lock());
     }
 
     #[tokio::test]

@@ -20,4 +20,7 @@ impl Bridge {
     pub fn is_logged_in(&self) -> bool {
         false
     }
+    pub fn name(&self, _id: &str) -> Option<String> {
+        None
+    }
 }

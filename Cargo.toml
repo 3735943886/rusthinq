@@ -5,6 +5,7 @@ members = [
     "crates/rusthinq-core",
     "crates/rusthinq-devices",
     "crates/rusthinq-bridge",
+    "crates/rusthinq-gui",
     "crates/rusthinq-cloud",
     "crates/rusthinq-setup",
     "crates/rusthinq-tools",
@@ -14,6 +15,7 @@ default-members = [
     "crates/rusthinq-core",
     "crates/rusthinq-devices",
     "crates/rusthinq-bridge",
+    "crates/rusthinq-gui",
     "crates/rusthinq-cloud",
     "crates/rusthinq-setup",
     "crates/rusthinq-tools",
@@ -40,6 +42,8 @@ rusthinq-util = { path = "crates/rusthinq-util" }
 rusthinq-core = { path = "crates/rusthinq-core" }
 rusthinq-devices = { path = "crates/rusthinq-devices", default-features = false }
 rusthinq-bridge = { path = "crates/rusthinq-bridge" }
+rusthinq-gui = { path = "crates/rusthinq-gui" }
+rusthinq-tools = { path = "crates/rusthinq-tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

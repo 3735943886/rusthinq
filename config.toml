@@ -97,3 +97,12 @@ storage_path = "./state"
 # rhai_dir = "./scripts"
 # watch = true # hot-reload on save: recompiles the changed file, keeps the
 # previous version running if the new one fails to compile
+
+# Optional web dashboard (rusthinq-gui, only compiled in with the `gui` Cargo
+# feature -- off by default, unlike bridge/native/scripting). Absent entirely = it
+# doesn't run at all. Talks to `[mqtt] mqtt_url` as its own independent MQTT client,
+# the same way any other tool would -- see rusthinq-gui's crate docs. The per-device
+# monitor page needs `[mqtt] raw_prefix` set too; without it, it has nothing to show.
+#
+# [gui]
+# bind = 8080
