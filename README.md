@@ -6,10 +6,18 @@ traffic to LG's real cloud, useful for reverse engineering or to keep the offici
 working alongside this.
 
 This is a Rust rewrite and independent continuation of
-[anszom/rethink](https://github.com/anszom/rethink) (TypeScript/Node). Credit for the
-original protocol reverse engineering, device research, and reference implementation
-belongs to [Andrzej Szombierski](https://github.com/anszom) and
-[upstream's contributors](https://github.com/anszom/rethink/graphs/contributors).
+[anszom/rethink](https://github.com/anszom/rethink) (TypeScript/Node). The codebase
+was forked from [BluSyn/rethink's `rust-rewrite` branch](https://github.com/BluSyn/rethink/tree/rust-rewrite)
+— an earlier Rust port of the same project, since marked unmaintained by its author in
+favor of the original TypeScript upstream — and has diverged substantially since:
+a consumer-neutral core with no Home Assistant assumptions baked in (see below), MQTT
+as the only control surface in place of a dedicated management HTTP UI, and everything
+optional (LG-cloud bridge, native/Rhai device handlers, the web dashboard) gated behind
+Cargo features instead of always compiled in. Credit for the original protocol reverse
+engineering, device research, and reference implementation belongs to
+[Andrzej Szombierski](https://github.com/anszom) and
+[upstream's contributors](https://github.com/anszom/rethink/graphs/contributors); credit
+for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
 
 ## What makes this different from upstream
 
@@ -210,26 +218,3 @@ gui_pass = "change-me"
 Leaving either one unset, anyone who can reach `bind` can enable/disable bridging,
 trigger LG account login/logout, and read raw device traffic — only reasonable on a
 trusted LAN.
-
-### Adding a device
-
-Pick whichever of the three approaches above fits the device, then:
-
-- **Native handler:** implement `crates/rusthinq-devices/src/devices/<module>.rs`
-  (tests in the same file), add one line to the `register_devices!` table in
-  `devices/mod.rs`, rebuild.
-- **Rhai script:** drop `<modelId>.rhai` in `rhai_dir`; no rebuild, and no restart if
-  `watch = true`.
-- **Existing TS driver via raw bus:** point `rethink`'s `rusthinq-adapter.ts` at this
-  daemon's `raw_prefix`/`rusthinq_prefix`; no changes on this side at all.
-
-## Notice
-
-LG ThinQ is used here for identification only. This project is not affiliated with LG.
-
-## Warning
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
