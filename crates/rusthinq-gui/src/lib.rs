@@ -12,7 +12,18 @@ use anyhow::Result;
 use rusthinq_core::config::MqttConfig;
 
 pub async fn run(gui: GuiConfig, mqtt_cfg: MqttConfig) -> Result<()> {
+    let auth = match (gui.gui_user, gui.gui_pass) {
+        (Some(user), Some(pass)) => Some(http::BasicAuthCreds { user, pass }),
+        (None, None) => None,
+        _ => {
+            tracing::warn!(
+                "[gui] has only one of gui_user/gui_pass set -- ignoring, dashboard is \
+                 unauthenticated"
+            );
+            None
+        }
+    };
     let shared = state::Shared::new();
     let handle = mqtt::start(mqtt_cfg, shared.clone())?;
-    http::serve(gui.bind, shared, handle).await
+    http::serve(gui.bind, auth, shared, handle).await
 }

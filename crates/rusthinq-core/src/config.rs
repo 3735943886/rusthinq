@@ -94,6 +94,15 @@ pub struct DevicesConfig {
 pub struct GuiConfig {
     /// Local TCP port the dashboard's HTTP server binds to.
     pub bind: u16,
+    /// HTTP Basic Auth, checked on every request when both are set (named after
+    /// `mqtt_user`/`mqtt_pass` above). Left unset, the dashboard is unauthenticated
+    /// -- it binds `0.0.0.0` and can enable/disable bridging, trigger LG
+    /// login/logout, and read raw device traffic, so that's only reasonable on a
+    /// trusted LAN.
+    #[serde(default)]
+    pub gui_user: Option<String>,
+    #[serde(default)]
+    pub gui_pass: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

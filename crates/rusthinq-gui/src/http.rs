@@ -5,15 +5,18 @@ use crate::mqtt::{Handle, Publish};
 use crate::state::Shared;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use base64::Engine as _;
 use rumqttc::QoS;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 
 /// How long an HTTP handler waits for the matching MQTT status reply before giving
@@ -27,9 +30,21 @@ struct AppState {
     mqtt: Handle,
 }
 
-pub async fn serve(bind: u16, shared: Arc<Shared>, mqtt: Handle) -> anyhow::Result<()> {
+/// Built from `[gui] gui_user`/`gui_pass` (see `GuiConfig`) once `lib.rs::run` has
+/// confirmed both are actually set.
+pub struct BasicAuthCreds {
+    pub user: String,
+    pub pass: String,
+}
+
+pub async fn serve(
+    bind: u16,
+    auth: Option<BasicAuthCreds>,
+    shared: Arc<Shared>,
+    mqtt: Handle,
+) -> anyhow::Result<()> {
     let state = AppState { shared, mqtt };
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(index_html))
         .route("/panel.js", get(panel_js))
         .route("/monitor", get(monitor_html))
@@ -41,13 +56,58 @@ pub async fn serve(bind: u16, shared: Arc<Shared>, mqtt: Handle) -> anyhow::Resu
         .route("/bridge/{id}/disable", post(bridge_disable))
         .route("/thinq_login", get(thinq_login))
         .route("/thinq_login_accept", post(thinq_login_accept))
-        .route("/thinq_logout", post(thinq_logout))
-        .with_state(state);
+        .route("/thinq_logout", post(thinq_logout));
+    if let Some(auth) = auth {
+        app = app.layer(middleware::from_fn_with_state(Arc::new(auth), basic_auth));
+        tracing::info!("rusthinq-gui: HTTP Basic Auth enabled");
+    } else {
+        tracing::warn!(
+            "rusthinq-gui: no [gui] auth configured -- dashboard is reachable by anyone \
+             who can connect to this port"
+        );
+    }
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", bind)).await?;
     tracing::info!("rusthinq-gui listening on :{bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Applied to every route (assets included) when `[gui] auth` is set, so an
+/// unauthenticated request never even reaches `index_html` -- the browser's native
+/// Basic Auth prompt is the login form. Credentials are compared in constant time to
+/// avoid leaking a match-length timing side channel.
+async fn basic_auth(
+    State(want): State<Arc<BasicAuthCreds>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|creds| creds.split_once(':').map(|(u, p)| (u.to_string(), p.to_string())))
+        .is_some_and(|(user, pass)| {
+            ct_eq(user.as_bytes(), want.user.as_bytes())
+                && ct_eq(pass.as_bytes(), want.pass.as_bytes())
+        });
+    if ok {
+        return next.run(req).await;
+    }
+    let mut resp = StatusCode::UNAUTHORIZED.into_response();
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"rusthinq-gui\""),
+    );
+    resp
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 async fn index_html() -> Response {
@@ -547,5 +607,45 @@ mod tests {
 
         let resp = bridge_disable(Path("dev-1".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_rejects_missing_or_wrong_credentials_and_allows_correct_ones() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let want = Arc::new(BasicAuthCreds {
+            user: "admin".into(),
+            pass: "s3cret".into(),
+        });
+        let app: Router<()> = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(want, basic_auth));
+
+        let req = |auth: Option<&str>| {
+            let mut b = Request::builder().uri("/");
+            if let Some(a) = auth {
+                b = b.header(header::AUTHORIZATION, a);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        let encode = |creds: &str| base64::engine::general_purpose::STANDARD.encode(creds);
+
+        let resp = app.clone().oneshot(req(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        let resp = app
+            .clone()
+            .oneshot(req(Some(&format!("Basic {}", encode("admin:wrong")))))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(req(Some(&format!("Basic {}", encode("admin:s3cret")))))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

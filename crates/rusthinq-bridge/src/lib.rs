@@ -759,16 +759,6 @@ mod lifecycle_tests {
                 h();
             }
         }
-
-        #[allow(
-            dead_code,
-            reason = "symmetric with simulate_close; not yet exercised by a test"
-        )]
-        fn emit_data(&self, buf: &[u8]) {
-            for h in self.data_handlers.lock().iter() {
-                h(buf);
-            }
-        }
     }
 
     impl LocalDevice for MockLocal {

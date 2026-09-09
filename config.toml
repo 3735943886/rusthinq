@@ -104,5 +104,14 @@ storage_path = "./state"
 # the same way any other tool would -- see rusthinq-gui's crate docs. The per-device
 # monitor page needs `[mqtt] raw_prefix` set too; without it, it has nothing to show.
 #
+# It binds 0.0.0.0, so anyone who can reach `bind` can enable/disable bridging,
+# trigger LG login/logout, and read raw device traffic. Set gui_user/gui_pass
+# (same naming as mqtt_user/mqtt_pass above) unless this is only ever reachable
+# from a trusted LAN -- with both set, every request needs matching HTTP Basic
+# Auth credentials (checked before any route runs, assets included); leaving
+# either unset leaves the dashboard wide open.
+#
 # [gui]
 # bind = 8080
+# gui_user = "admin"
+# gui_pass = "change-me"
