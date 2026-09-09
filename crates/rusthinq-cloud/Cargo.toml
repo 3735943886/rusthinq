@@ -12,8 +12,8 @@ path = "src/main.rs"
 [features]
 # All off: a plain `cargo build` matches a minimal deployment (local/SoftAP devices
 # only, no LG-cloud bridge, no scripting, no web dashboard). release.yml's actual
-# release builds still need their own explicit --features until that's updated
-# separately — see the individual features below for what each one adds back.
+# release builds pass --features bridge,native,scripting,gui explicitly — see the
+# individual features below for what each one adds back.
 default = []
 # Optional forwarding to the real LG cloud (rusthinq_bridge). Off
 # (--no-default-features) drops reqwest/oauth2/rsa/hmac/sha1 etc. entirely for

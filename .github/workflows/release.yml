@@ -15,6 +15,10 @@ env:
   # are intentionally left out of releases.
   PACKAGES: -p rusthinq-cloud -p rusthinq-setup
   BINARIES: rusthinq-cloud rusthinq-setup
+  # rusthinq-cloud ships with nothing enabled by default (see its Cargo.toml) --
+  # release builds want the full feature set: LG-cloud bridge, native/Rhai device
+  # handlers, and the web dashboard.
+  FEATURES: bridge,native,scripting,gui
 
 concurrency:
   group: release-${{ inputs.tag }}
@@ -89,12 +93,12 @@ jobs:
         # Perl on PATH and break the Windows build.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }} ${{ env.PACKAGES }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Build (cross)
         if: matrix.cross
         shell: bash
-        run: cross build --release --target ${{ matrix.target }} ${{ env.PACKAGES }}
+        run: cross build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Package
         shell: bash

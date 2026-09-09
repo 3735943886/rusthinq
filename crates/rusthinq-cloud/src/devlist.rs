@@ -4,7 +4,9 @@
 //! Republished whenever any of those can have changed. Retained so a client that
 //! (re)subscribes gets current state immediately, without needing a request/response
 //! round trip — this is what the old management HTTP/WS surface's `/ws` hello and
-//! `/api/devices/{id}` gave (both removed in favor of MQTT-only control).
+//! `/api/devices/{id}` gave (both removed in favor of MQTT-only control; the optional
+//! `rusthinq-gui` dashboard's `/ws` route rebuilds its panel from this same topic
+//! rather than reviving that surface).
 
 use crate::bridge_handle::Bridge;
 use crate::device_bridge::DeviceBridge;

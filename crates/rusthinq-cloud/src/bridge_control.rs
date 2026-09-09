@@ -1,10 +1,12 @@
-//! Bridge enable/disable, and LG account login/logout, over MQTT — replaces the
-//! `/bridge/{id}/enable`/`/disable` and `/thinq_login*` HTTP routes. Enable/disable
-//! needs the connected device's own local socket to start/stop the upstream LG
-//! session, so it has to stay in the daemon; login/logout don't touch a live device
-//! at all (`Bridge` only needs its credential storage for those), but there's no
-//! reason to keep them a separate one-shot CLI process either — they're reachable
-//! over the exact same MQTT connection as everything else here.
+//! Bridge enable/disable, and LG account login/logout, over MQTT — these topics are
+//! the real implementation; the optional `rusthinq-gui` dashboard's HTTP routes of
+//! the same name (`/bridge/{id}/enable`/`/disable`, `/thinq_login*`) are just a thin
+//! frontend that publishes here and waits for the reply. Enable/disable needs the
+//! connected device's own local socket to start/stop the upstream LG session, so it
+//! has to stay in the daemon; login/logout don't touch a live device at all
+//! (`Bridge` only needs its credential storage for those), but there's no reason to
+//! keep them a separate one-shot CLI process either — they're reachable over the
+//! exact same MQTT connection as everything else here.
 //!
 //! Per-device topics (`<prefix>` = `config.mqtt.rusthinq_prefix`, `<id>` = a real
 //! connected device's id):
