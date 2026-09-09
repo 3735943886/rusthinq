@@ -197,9 +197,8 @@ into the daemon's device-handling code at all, so it sees (and can only do) exac
 what any other MQTT client subscribed to `<rusthinq_prefix>/#` could.
 
 It binds `0.0.0.0` with **no authentication unless you configure one** — set
-`gui_user`/`gui_pass` (same naming as `mqtt_user`/`mqtt_pass`) to require matching
-HTTP Basic Auth on every request (checked before any route runs, including the static
-assets):
+`gui_user`/`gui_pass` to require matching HTTP Basic Auth on every request
+(checked before any route runs, including the static assets):
 
 ```toml
 [gui]
