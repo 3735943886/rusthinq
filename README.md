@@ -67,15 +67,14 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
      script would and can drive the device however it wants, with no Rust or Rhai
      involved at all. See `raw_bus.rs` and the `[mqtt]`/`[devices]` comments in
      `config.toml` for the wire shape.
-  4. **Existing rethink TypeScript device driver, completely unmodified.** A pre-built
-     instance of (3): the `rethink` repo's `rusthinq-adapter.ts` +
-     `cloud/thinq2/rusthinq_transport.ts` plug the same raw bus in as a drop-in
-     replacement for rethink's own MQTT broker connection, runs completely unchanged, as a
-     separate long-lived process, with rethink's own `Connection`/`Bridge` still doing
-     its own discovery and state publishing exactly as it always has. Useful for a model
-     whose upstream driver is too involved to be worth re-writing in Rhai — or anything
-     else — from scratch. See `rethink`'s `rusthinq-adapter-config.jsonc` for the config
-     shape.
+  4. **[rusthinq-adapter](https://github.com/3735943886/rusthinq-adapter): rethink's
+     TypeScript device driver, unmodified.** A pre-built instance of (3): plugs the same
+     raw bus in as a drop-in replacement for rethink's own MQTT broker connection, runs
+     completely unchanged, as a separate long-lived process, with rethink's own
+     `Connection`/`Bridge` still doing its own discovery and state publishing exactly as
+     it always has. Useful for a model whose upstream driver is too involved to be worth
+     re-writing in Rhai — or anything else — from scratch. See that repo's README for
+     setup and its `rusthinq-adapter-config.jsonc` for the config shape.
 
   **Don't combine a registry handler (1 or 2) with raw_bus used as another process's
   full driver (3 or 4) for the same model.** `raw_bus` taps every connected device
