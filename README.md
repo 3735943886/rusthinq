@@ -138,13 +138,13 @@ See `config.toml` in the repo root — every option is documented inline where i
 declared, including the `[devices]` Rhai-scripting section and the raw-bus/script
 coexistence warning above. In short:
 
-| Section | Purpose |
-|---|---|
-| top-level | hostname, TLS CA files, HTTPS/MQTTS port mapping, log filter |
-| `[mqtt]` | broker URL/credentials, `rusthinq_prefix` (device state), `raw_prefix` (RE tap/inject bus, off by default), retained-state persistence path |
-| `[bridge]` | LG-cloud forwarding storage path (only if the `bridge` feature is built) |
-| `[devices]` | `rhai_dir` + hot-reload `watch` flag for `.rhai` scripts (absent entirely = scripting off) |
-| `[gui]` | `gui_port` + optional `gui_user`/`gui_pass` Basic Auth for the web dashboard (only if the `gui` feature is built) |
+| Section | Required? | Purpose |
+|---|---|---|
+| top-level | **Required** | hostname, TLS CA files, HTTPS/MQTTS port mapping, log filter |
+| `[mqtt]` | **Required** | broker URL/credentials, `rusthinq_prefix` (device state), `raw_prefix` (RE tap/inject bus, off by default), retained-state persistence path |
+| `[bridge]` | Optional | LG-cloud forwarding storage path (requires the `bridge` feature) |
+| `[devices]` | Optional | `rhai_dir` + hot-reload `watch` flag for `.rhai` scripts (requires the `scripting` feature) |
+| `[gui]` | Optional | `gui_port` + optional `gui_user`/`gui_pass` Basic Auth for the web dashboard (requires the `gui` feature) |
 
 LG account login for bridge mode is over MQTT too, not a separate CLI: publishing an LG
 country code (or an empty payload for "US") to `<rusthinq_prefix>/bridge/login/set`
