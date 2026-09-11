@@ -21,7 +21,7 @@ mod thinq2;
 
 use anyhow::{Context, Result};
 use bridge_handle::Bridge;
-use rusthinq_core::config::load_config;
+use rusthinq_core::config::{Port, load_config};
 use rusthinq_core::logging;
 use rusthinq_core::mqtt::MqttSink;
 use rusthinq_util::backoff::ExponentialBackoff;
@@ -39,18 +39,28 @@ use tracing_subscriber::EnvFilter;
 /// Logged at `error!`, unconditionally: unlike the topic-filtered
 /// `logging::log("status", ...)` used for routine status lines, a stuck bind should
 /// never be silenced by `config.toml`'s `log = [...]` list.
-async fn bind_with_retry(label: &str, port: u16) -> TcpListener {
+async fn bind_with_retry(label: &str, address: &str, port: u16) -> TcpListener {
     let mut backoff = ExponentialBackoff::for_local_control_plane();
     loop {
-        match TcpListener::bind(("0.0.0.0", port)).await {
+        match TcpListener::bind((address, port)).await {
             Ok(listener) => return listener,
             Err(e) => {
                 let delay = backoff.next_delay();
-                tracing::error!("{label} bind failed on {port}: {e} (retrying in {delay:?})");
+                tracing::error!(
+                    "{label} bind failed on {address}:{port}: {e} (retrying in {delay:?})"
+                );
                 tokio::time::sleep(delay).await;
             }
         }
     }
+}
+
+/// `Port::address`, if set, else the previous unconditional `"0.0.0.0"` -- centralized
+/// here since every `bind_with_retry` caller below needs the same fallback and
+/// `Port::address` was, until now, parsed from `config.toml` but never actually read
+/// anywhere (every listener always bound all interfaces regardless of it).
+fn bind_address(port: &Port) -> String {
+    port.address.clone().unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 #[tokio::main]
@@ -370,16 +380,17 @@ async fn main() -> Result<()> {
     if let Some(ssl_acceptor) = device_tls.clone() {
         let b = broker.clone();
         let port = config.mqtts_port.bind;
+        let address = bind_address(&config.mqtts_port);
         tokio::spawn(async move {
             // Outer loop: an `accept()` failure (not a per-connection TLS failure,
             // which is handled below and never reaches here) drops the whole
             // listener — rebind rather than leaving MQTTS permanently dead for the
             // rest of this process's life, the same as a bind failure itself.
             loop {
-                let listener = bind_with_retry("MQTTS", port).await;
+                let listener = bind_with_retry("MQTTS", &address, port).await;
                 logging::log(
                     "status",
-                    &[&format!("MQTTS listening on {port} (legacy device TLS)")],
+                    &[&format!("MQTTS listening on {address}:{port} (legacy device TLS)")],
                 );
                 loop {
                     match listener.accept().await {
@@ -418,6 +429,7 @@ async fn main() -> Result<()> {
     // HTTPS ThinQ2 provisioning (/route, certificate, …)
     if let Some(ssl_acceptor) = device_tls.clone() {
         let port = config.https_port.bind;
+        let address = bind_address(&config.https_port);
         let ca = Arc::new(ca.clone());
         let cfg = Arc::new(config.clone());
         let router = thinq2::provisioning::routes(cfg, ca.clone());
@@ -427,10 +439,10 @@ async fn main() -> Result<()> {
             // leaving HTTPS permanently dead for the rest of this process's life —
             // same reasoning as the MQTTS listener above.
             loop {
-                let listener = bind_with_retry("HTTPS", port).await;
+                let listener = bind_with_retry("HTTPS", &address, port).await;
                 logging::log(
                     "status",
-                    &[&format!("HTTPS listening on {port} (legacy device TLS)")],
+                    &[&format!("HTTPS listening on {address}:{port} (legacy device TLS)")],
                 );
                 loop {
                     let (stream, peer) = match listener.accept().await {
@@ -517,6 +529,7 @@ async fn main() -> Result<()> {
     // ThinQ1 HTTP
     {
         let port = config.thinq1_https_port.bind;
+        let address = bind_address(&config.thinq1_https_port);
         let meta = thinq1::http::device_metadata_store();
         let router = thinq1::http::routes(meta.clone());
         let acceptor = thinq1::device::DeviceAcceptor::new(meta, manager.clone());
@@ -528,8 +541,11 @@ async fn main() -> Result<()> {
             // rebind rather than leaving ThinQ1 HTTP permanently dead for the rest
             // of this process's life, same reasoning as MQTTS/HTTPS above.
             loop {
-                let listener = bind_with_retry("ThinQ1 HTTP", port).await;
-                logging::log("status", &[&format!("ThinQ1 HTTP listening on {port}")]);
+                let listener = bind_with_retry("ThinQ1 HTTP", &address, port).await;
+                logging::log(
+                    "status",
+                    &[&format!("ThinQ1 HTTP listening on {address}:{port}")],
+                );
                 if let Err(e) = axum::serve(listener, router.clone()).await {
                     tracing::error!("ThinQ1 HTTP ended: {e} (rebinding)");
                 }
@@ -540,6 +556,7 @@ async fn main() -> Result<()> {
     // ThinQ1 device TCP port
     {
         let port = config.thinq1_port.bind;
+        let address = bind_address(&config.thinq1_port);
         let meta = thinq1::http::device_metadata_store();
         let acceptor = thinq1::device::DeviceAcceptor::new(meta, manager.clone());
         tokio::spawn(async move {
@@ -547,10 +564,10 @@ async fn main() -> Result<()> {
             // leaving this port permanently dead for the rest of this process's
             // life — same reasoning as the other listeners above.
             loop {
-                let listener = bind_with_retry("ThinQ1 device port", port).await;
+                let listener = bind_with_retry("ThinQ1 device port", &address, port).await;
                 logging::log(
                     "status",
-                    &[&format!("ThinQ1 device port listening on {port}")],
+                    &[&format!("ThinQ1 device port listening on {address}:{port}")],
                 );
                 loop {
                     match listener.accept().await {

@@ -23,7 +23,8 @@ ca_cert_file = "ca.cert" # will be created on first run if necessary
 https_port = 443
 mqtts_port = 8883
 
-# the defaults should not be changed unless you know what you're doing
+# the defaults should not be changed unless you know what you're doing. Same
+# { bind, advertise, address } table form as https_port/mqtts_port above works here too.
 thinq1_https_port = 46030
 thinq1_port = 47878
 
@@ -45,9 +46,9 @@ log = ["status", "incoming", "HTTPS", "bridge"]
 
 [mqtt]
 mqtt_url = "mqtt://localhost:1883"
-rusthinq_prefix = "rusthinq" # rusthinq topics will be prefixed with this
 mqtt_user = ""
 mqtt_pass = ""
+rusthinq_prefix = "rusthinq" # rusthinq topics will be prefixed with this
 # Topic prefix for the raw wire-frame observer/inject bus and the device simulator —
 # lets a trusted local tool watch or fake device traffic on this same broker
 # connection. Unset by default: neither registers, so no debug/inject surface exists
@@ -104,14 +105,17 @@ storage_path = "./state"
 # the same way any other tool would -- see rusthinq-gui's crate docs. The per-device
 # monitor page needs `[mqtt] raw_prefix` set too; without it, it has nothing to show.
 #
-# It binds 0.0.0.0, so anyone who can reach `bind` can enable/disable bridging,
-# trigger LG login/logout, and read raw device traffic. Set gui_user/gui_pass
+# It binds 0.0.0.0 by default, so anyone who can reach `gui_port` can enable/disable
+# bridging, trigger LG login/logout, and read raw device traffic. Set gui_user/gui_pass
 # (same naming as mqtt_user/mqtt_pass above) unless this is only ever reachable
 # from a trusted LAN -- with both set, every request needs matching HTTP Basic
 # Auth credentials (checked before any route runs, assets included); leaving
-# either unset leaves the dashboard wide open.
+# either unset leaves the dashboard wide open. `gui_port` also takes the same
+# { bind, address } table form as https_port above (no `advertise` -- nothing here
+# is ever told about this port) if you want to restrict it to one interface instead:
+#  gui_port = { bind = 8080, address = "192.168.0.111" }
 #
 # [gui]
-# bind = 8080
+# gui_port = 8080
 # gui_user = "admin"
 # gui_pass = "change-me"

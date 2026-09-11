@@ -25,5 +25,6 @@ pub async fn run(gui: GuiConfig, mqtt_cfg: MqttConfig) -> Result<()> {
     };
     let shared = state::Shared::new();
     let handle = mqtt::start(mqtt_cfg, shared.clone())?;
-    http::serve(gui.bind, auth, shared, handle).await
+    let address = gui.gui_port.address().unwrap_or("0.0.0.0").to_string();
+    http::serve(&address, gui.gui_port.port(), auth, shared, handle).await
 }

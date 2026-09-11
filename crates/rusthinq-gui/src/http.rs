@@ -38,7 +38,8 @@ pub struct BasicAuthCreds {
 }
 
 pub async fn serve(
-    bind: u16,
+    address: &str,
+    port: u16,
     auth: Option<BasicAuthCreds>,
     shared: Arc<Shared>,
     mqtt: Handle,
@@ -69,8 +70,8 @@ pub async fn serve(
     }
     let app = app.with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", bind)).await?;
-    tracing::info!("rusthinq-gui listening on :{bind}");
+    let listener = tokio::net::TcpListener::bind((address, port)).await?;
+    tracing::info!("rusthinq-gui listening on {address}:{port}");
     axum::serve(listener, app).await?;
     Ok(())
 }

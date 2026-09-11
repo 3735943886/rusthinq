@@ -141,7 +141,7 @@ coexistence warning above. In short:
 | `[mqtt]` | broker URL/credentials, `rusthinq_prefix` (device state), `raw_prefix` (RE tap/inject bus, off by default), retained-state persistence path |
 | `[bridge]` | LG-cloud forwarding storage path (only if the `bridge` feature is built) |
 | `[devices]` | `rhai_dir` + hot-reload `watch` flag for `.rhai` scripts (absent entirely = scripting off) |
-| `[gui]` | `bind` port + optional `gui_user`/`gui_pass` Basic Auth for the web dashboard (only if the `gui` feature is built) |
+| `[gui]` | `gui_port` + optional `gui_user`/`gui_pass` Basic Auth for the web dashboard (only if the `gui` feature is built) |
 
 LG account login for bridge mode is over MQTT too, not a separate CLI: publish an LG
 country code (or an empty payload for "US") to `<rusthinq_prefix>/bridge/login/set`,
@@ -196,7 +196,7 @@ default and needs both:
 
   ```toml
   [gui]
-  bind = 8080
+  gui_port = 8080
   ```
 
 If the config section is present but the binary wasn't built with the `gui` feature,
@@ -205,17 +205,23 @@ dashboard runs its own independent MQTT connection to `mqtt.mqtt_url` — it isn
 into the daemon's device-handling code at all, so it sees (and can only do) exactly
 what any other MQTT client subscribed to `<rusthinq_prefix>/#` could.
 
-It binds `0.0.0.0` with **no authentication unless you configure one** — set
-`gui_user`/`gui_pass` to require matching HTTP Basic Auth on every request
+It binds `0.0.0.0` by default with **no authentication unless you configure one** —
+set `gui_user`/`gui_pass` to require matching HTTP Basic Auth on every request
 (checked before any route runs, including the static assets):
 
 ```toml
 [gui]
-bind = 8080
+gui_port = 8080
 gui_user = "admin"
 gui_pass = "change-me"
 ```
 
-Leaving either one unset, anyone who can reach `bind` can enable/disable bridging,
+Leaving either one unset, anyone who can reach `gui_port` can enable/disable bridging,
 trigger LG account login/logout, and read raw device traffic — only reasonable on a
-trusted LAN.
+trusted LAN. `gui_port` also takes the same `{ bind, address }` table form as
+`https_port`/`mqtts_port` (see [Configuration](#configuration) below) if you want to
+restrict it to one interface instead of every one this host has:
+
+```toml
+gui_port = { bind = 8080, address = "192.168.0.111" }
+```

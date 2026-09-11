@@ -86,19 +86,54 @@ pub struct DevicesConfig {
     pub watch: bool,
 }
 
+/// `gui_port`'s shape: either a bare port number (binds `0.0.0.0`, same as every
+/// other listener in this file until `bind_address` in rusthinq-cloud's `main.rs`
+/// started honoring it) or `{ bind, address }` to restrict it to one interface --
+/// e.g. a LAN-only address instead of every interface this host has, including
+/// ones a VPN or container network expose. Deliberately not `PortSpec`
+/// (`https_port`/`mqtts_port` above): those also carry `advertise`, which only
+/// means something for an appliance-facing port a client gets told about (`/route`,
+/// a pairing response) -- nothing here ever advertises `gui_port` to anyone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GuiPortSpec {
+    Number(u16),
+    Full {
+        bind: u16,
+        #[serde(default)]
+        address: Option<String>,
+    },
+}
+
+impl GuiPortSpec {
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Number(n) => *n,
+            Self::Full { bind, .. } => *bind,
+        }
+    }
+
+    pub fn address(&self) -> Option<&str> {
+        match self {
+            Self::Number(_) => None,
+            Self::Full { address, .. } => address.as_deref(),
+        }
+    }
+}
+
 /// Optional web dashboard (`rusthinq-gui`, only compiled in with the `gui`
 /// feature). Absent `[gui]` means it doesn't run at all, same opt-in-by-presence
 /// pattern as `[bridge]`/`[devices]`. It talks to `mqtt.mqtt_url` as its own MQTT
 /// client, same as any other tool would -- nothing here is a second control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiConfig {
-    /// Local TCP port the dashboard's HTTP server binds to.
-    pub bind: u16,
+    /// See [`GuiPortSpec`].
+    pub gui_port: GuiPortSpec,
     /// HTTP Basic Auth, checked on every request when both are set (named after
     /// `mqtt_user`/`mqtt_pass` above). Left unset, the dashboard is unauthenticated
-    /// -- it binds `0.0.0.0` and can enable/disable bridging, trigger LG
-    /// login/logout, and read raw device traffic, so that's only reasonable on a
-    /// trusted LAN.
+    /// -- it binds `0.0.0.0` (or `gui_port`'s `address`, if narrowed) and can
+    /// enable/disable bridging, trigger LG login/logout, and read raw device
+    /// traffic, so that's only reasonable on a trusted LAN.
     #[serde(default)]
     pub gui_user: Option<String>,
     #[serde(default)]
@@ -449,8 +484,33 @@ mqtt_user = ""
 mqtt_pass = ""
 
 [gui]
-bind = 8080
+gui_port = 8080
 "#;
-        assert_eq!(parse_config_text(with).unwrap().gui.unwrap().bind, 8080);
+        let gui = parse_config_text(with).unwrap().gui.unwrap();
+        assert_eq!(gui.gui_port.port(), 8080);
+        assert_eq!(gui.gui_port.address(), None);
+    }
+
+    #[test]
+    fn gui_port_parses_the_bind_address_table_form() {
+        let with = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+
+[gui]
+gui_port = { bind = 8080, address = "192.168.0.111" }
+"#;
+        let gui = parse_config_text(with).unwrap().gui.unwrap();
+        assert_eq!(gui.gui_port.port(), 8080);
+        assert_eq!(gui.gui_port.address(), Some("192.168.0.111"));
     }
 }
