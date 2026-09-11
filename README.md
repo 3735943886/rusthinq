@@ -200,7 +200,7 @@ default and needs both:
 
   ```toml
   [gui]
-  gui_port = 8080
+  gui_port = 44401
   ```
 
 If the config section is present but the binary wasn't built with the `gui` feature,
@@ -215,7 +215,7 @@ setting `gui_user`/`gui_pass` requires matching HTTP Basic Auth on every request
 
 ```toml
 [gui]
-gui_port = 8080
+gui_port = 44401
 gui_user = "admin"
 gui_pass = "change-me"
 ```
@@ -227,5 +227,5 @@ trusted LAN. `gui_port` also takes the same `{ bind, address }` table form as
 restrict it to one interface instead of every one this host has:
 
 ```toml
-gui_port = { bind = 8080, address = "192.168.0.111" }
+gui_port = { bind = 44401, address = "192.168.0.111" }
 ```
