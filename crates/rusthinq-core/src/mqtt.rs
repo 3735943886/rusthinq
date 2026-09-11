@@ -13,9 +13,18 @@
 
 use crate::config::MqttConfig;
 use rusthinq_util::sync::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Trait for publishing to the MQTT control plane (real connection or mock).
 pub trait MqttConnection: Send + Sync {
@@ -46,6 +55,15 @@ pub trait MqttConnection: Send + Sync {
     /// via `publish_raw` since discovery itself lives outside `rusthinq_prefix`),
     /// without hand-duplicating the prefix.
     fn device_topic(&self, id: &str) -> String;
+    /// Every device id this connection has ever published a property for and is
+    /// still tracking (i.e. hasn't been `clear_retained` away), each with the unix
+    /// timestamp of its most recent `publish_property` call. This is the only
+    /// presence signal this consumer-neutral layer has -- it knows nothing about
+    /// connect/disconnect itself. A caller that also tracks which ids are
+    /// *currently* connected (e.g. rusthinq-cloud's `DeviceManager`) can diff
+    /// against this to find devices that are known but not currently online,
+    /// without needing its own separate last-seen bookkeeping.
+    fn known_devices(&self) -> Vec<(String, i64)>;
 }
 
 /// `(topic, payload, retain)` publish callback, or a `set`-message handler keyed
@@ -65,6 +83,10 @@ struct MockMqttInner {
     devices: HashMap<String, MockDeviceInfo>,
     retained: HashMap<String, String>,
     raw: Vec<(String, Vec<u8>, bool)>,
+    /// Mirrors `MqttSink`'s `last_seen_unix` bookkeeping (see `known_devices`), so
+    /// code exercised against this mock in tests sees the same presence signal a
+    /// real `MqttSink` would.
+    last_seen: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +138,7 @@ impl MqttConnection for MockMqttConnection {
         entry
             .properties
             .insert(property.to_string(), value.to_string());
+        inner.last_seen.insert(id.to_string(), now_unix());
     }
 
     fn publish_event(&self, id: &str, topic_suffix: &str, payload: &str) {
@@ -141,11 +164,22 @@ impl MqttConnection for MockMqttConnection {
     }
 
     fn clear_retained(&self, id: &str) {
-        self.inner.lock().devices.remove(id);
+        let mut inner = self.inner.lock();
+        inner.devices.remove(id);
+        inner.last_seen.remove(id);
     }
 
     fn is_connected(&self) -> bool {
         true
+    }
+
+    fn known_devices(&self) -> Vec<(String, i64)> {
+        self.inner
+            .lock()
+            .last_seen
+            .iter()
+            .map(|(id, ts)| (id.clone(), *ts))
+            .collect()
     }
 
     fn device_topic(&self, id: &str) -> String {
@@ -153,16 +187,47 @@ impl MqttConnection for MockMqttConnection {
     }
 }
 
-/// Reads the persisted `id -> property names` map from `path`, if any (missing or
-/// unreadable/corrupt file just means "nothing known yet" — never fatal).
-fn load_published_topics(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Everything persisted per device id in `state_file`: which property names have
+/// ever been published (so `clear_retained` knows what to blank out) and when this
+/// id was last seen (issue #9 -- lets a device that's gone for good be found and
+/// cleaned up instead of sitting in the file forever with no timestamp at all).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DeviceTopicState {
+    #[serde(default)]
+    properties: HashSet<String>,
+    #[serde(default)]
+    last_seen_unix: i64,
 }
 
-fn save_published_topics(path: &std::path::Path, topics: &HashMap<String, HashSet<String>>) {
+/// Reads the persisted per-device state from `path`, if any (missing or
+/// unreadable/corrupt file just means "nothing known yet" — never fatal). Falls
+/// back to the pre-#9 shape (`id -> property names`, no timestamp) for a state file
+/// written before `last_seen_unix` existed, so upgrading doesn't lose the
+/// `clear_retained` bookkeeping a running deployment already had on disk -- those
+/// entries just start with `last_seen_unix: 0` (unknown) until next published.
+fn load_published_topics(path: &std::path::Path) -> HashMap<String, DeviceTopicState> {
+    let Some(raw) = std::fs::read_to_string(path).ok() else {
+        return HashMap::new();
+    };
+    if let Ok(v) = serde_json::from_str(&raw) {
+        return v;
+    }
+    serde_json::from_str::<HashMap<String, HashSet<String>>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, properties)| {
+            (
+                id,
+                DeviceTopicState {
+                    properties,
+                    last_seen_unix: 0,
+                },
+            )
+        })
+        .collect()
+}
+
+fn save_published_topics(path: &std::path::Path, topics: &HashMap<String, DeviceTopicState>) {
     match serde_json::to_string(topics) {
         Ok(json) => {
             if let Err(e) = std::fs::write(path, json) {
@@ -180,16 +245,31 @@ fn save_published_topics(path: &std::path::Path, topics: &HashMap<String, HashSe
     }
 }
 
+/// How often a `publish_property` call that only touches `last_seen_unix` (i.e.
+/// not a brand new property, which already triggers a save) is allowed to flush
+/// `state_file` to disk. Bounds the I/O cost of tracking presence to one write per
+/// device per interval instead of one per property publish, at the cost of a
+/// same-order staleness window in the persisted timestamp if the process dies
+/// without a clean disconnect (see `clear_retained`/`detach_session` callers, which
+/// always save immediately) — acceptable for a value only ever read to answer
+/// "roughly how long has this device been gone," not "exactly when."
+const LAST_SEEN_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Shared sink for the real MQTT control-plane connection (filled by rusthinq-cloud).
 pub struct MqttSink {
     pub config: MqttConfig,
-    /// `id -> property names ever published via publish_property`, so a permanently
-    /// gone device's retained topics can be cleared later (`clear_retained`) even
-    /// though property names are otherwise unknown to this crate. Persisted to
-    /// `config.state_file` (if set) so a daemon restart doesn't forget what an
-    /// already-connected device published in a previous run.
-    published_topics: Mutex<HashMap<String, HashSet<String>>>,
+    /// `id -> (property names ever published, last publish_property timestamp)`, so
+    /// a permanently gone device's retained topics can be cleared later
+    /// (`clear_retained`) even though property names are otherwise unknown to this
+    /// crate, and so it can be found in the first place (`known_devices`) even while
+    /// offline. Persisted to `config.state_file` (if set) so a daemon restart
+    /// doesn't forget what an already-connected device published in a previous run.
+    published_topics: Mutex<HashMap<String, DeviceTopicState>>,
     state_file: Option<std::path::PathBuf>,
+    /// Rate-gates disk flushes triggered purely by a `last_seen_unix` update (see
+    /// `LAST_SEEN_FLUSH_INTERVAL`) — a new-property publish or `clear_retained`
+    /// still flush unconditionally.
+    last_seen_flushed_at: Mutex<Instant>,
     /// Callback to publish raw MQTT: (topic, payload, retain)
     pub publish_fn: Mutex<Option<PublishFn>>,
     pub set_handlers: Mutex<Vec<SetHandler>>,
@@ -208,6 +288,14 @@ impl MqttSink {
             config,
             published_topics: Mutex::new(published_topics),
             state_file,
+            // checked_sub rather than a bare `-`: Instant has no fixed epoch to go
+            // negative past, and subtracting a Duration longer than the process has
+            // been alive can panic on some platforms' clock backends.
+            last_seen_flushed_at: Mutex::new(
+                Instant::now()
+                    .checked_sub(LAST_SEEN_FLUSH_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            ),
             publish_fn: Mutex::new(None),
             set_handlers: Mutex::new(Vec::new()),
             discovery_handlers: Mutex::new(Vec::new()),
@@ -298,14 +386,24 @@ impl MqttSink {
 
 impl MqttConnection for MqttSink {
     fn publish_property(&self, id: &str, property: &str, value: &str) {
-        let is_new_property = self
-            .published_topics
-            .lock()
-            .entry(id.to_string())
-            .or_default()
-            .insert(property.to_string());
-        if is_new_property && let Some(path) = &self.state_file {
-            save_published_topics(path, &self.published_topics.lock());
+        let is_new_property = {
+            let mut topics = self.published_topics.lock();
+            let entry = topics.entry(id.to_string()).or_default();
+            entry.last_seen_unix = now_unix();
+            entry.properties.insert(property.to_string())
+        };
+        if let Some(path) = &self.state_file {
+            let due_for_last_seen_flush = {
+                let mut flushed_at = self.last_seen_flushed_at.lock();
+                let due = flushed_at.elapsed() >= LAST_SEEN_FLUSH_INTERVAL;
+                if due {
+                    *flushed_at = Instant::now();
+                }
+                due
+            };
+            if is_new_property || due_for_last_seen_flush {
+                save_published_topics(path, &self.published_topics.lock());
+            }
         }
         let topic = format!("{}/{}/{}", self.config.rusthinq_prefix, id, property);
         self.do_publish(&topic, value.as_bytes(), true);
@@ -326,12 +424,12 @@ impl MqttConnection for MqttSink {
     }
 
     fn clear_retained(&self, id: &str) {
-        let properties = self.published_topics.lock().remove(id);
+        let state = self.published_topics.lock().remove(id);
         if let Some(path) = &self.state_file {
             save_published_topics(path, &self.published_topics.lock());
         }
-        if let Some(properties) = properties {
-            for property in properties {
+        if let Some(state) = state {
+            for property in state.properties {
                 let topic = format!("{}/{}/{}", self.config.rusthinq_prefix, id, property);
                 self.do_publish(&topic, b"", true);
             }
@@ -344,6 +442,14 @@ impl MqttConnection for MqttSink {
 
     fn device_topic(&self, id: &str) -> String {
         format!("{}/{id}", self.config.rusthinq_prefix)
+    }
+
+    fn known_devices(&self) -> Vec<(String, i64)> {
+        self.published_topics
+            .lock()
+            .iter()
+            .map(|(id, state)| (id.clone(), state.last_seen_unix))
+            .collect()
     }
 }
 
@@ -541,6 +647,52 @@ mod mqtt_sink_tests {
             vec![("rusthinq/dev1/power".to_string(), Vec::new(), true)],
             "a restarted sink must still know what a previous run published, via the state file"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #9: a device with no live connection is otherwise invisible everywhere
+    /// -- `known_devices` is what lets a caller (devlist.rs) list it anyway.
+    #[test]
+    fn known_devices_reports_every_tracked_id_with_its_last_seen_time() {
+        use crate::mqtt::MqttConnection;
+        let sink = MqttSink::new(test_cfg());
+        let before = now_unix();
+        sink.publish_property("dev1", "power", "ON");
+        sink.publish_property("dev2", "power", "OFF");
+
+        let mut known = sink.known_devices();
+        known.sort();
+        assert_eq!(known.len(), 2);
+        for (id, last_seen) in &known {
+            assert!(["dev1", "dev2"].contains(&id.as_str()));
+            assert!(*last_seen >= before);
+        }
+
+        sink.clear_retained("dev1");
+        let known = sink.known_devices();
+        assert_eq!(known.len(), 1, "clear_retained must drop the id from known_devices too");
+        assert_eq!(known[0].0, "dev2");
+    }
+
+    /// A `state_file` written before `last_seen_unix` existed (`id -> [prop, ...]`)
+    /// must still load -- otherwise upgrading rusthinq would silently drop every
+    /// `clear_retained` property mapping a running deployment already had on disk.
+    #[test]
+    fn load_published_topics_migrates_the_pre_last_seen_file_shape() {
+        let path = std::env::temp_dir().join(format!(
+            "rusthinq-mqtt-state-migrate-test-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, r#"{"dev1":["power","temperature"]}"#).unwrap();
+
+        let loaded = load_published_topics(&path);
+        assert_eq!(loaded.len(), 1);
+        let state = &loaded["dev1"];
+        assert_eq!(state.last_seen_unix, 0, "no timestamp existed in the old shape");
+        assert!(state.properties.contains("power"));
+        assert!(state.properties.contains("temperature"));
 
         let _ = std::fs::remove_file(&path);
     }

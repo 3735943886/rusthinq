@@ -39,18 +39,41 @@ impl DeviceListPublisher {
 
     fn snapshot(&self) -> Value {
         let mut all = serde_json::Map::new();
-        for (id, dev) in self.manager.all() {
+        let live = self.manager.all();
+        for (id, dev) in &live {
             all.insert(
                 id.clone(),
                 json!({
-                    "name": self.bridge.as_ref().and_then(|b| b.name(&id)),
+                    "name": self.bridge.as_ref().and_then(|b| b.name(id)),
                     "model": dev.meta.model_id,
                     "modelName": dev.meta.model_name,
                     "deviceType": dev.meta.device_type,
                     "swVersion": dev.meta.sw_version,
                     "platform": dev.platform.as_str(),
-                    "mapped": self.device_bridge.has_device(&id),
-                    "bridged": self.bridge.as_ref().map(|b| b.status_for(&id)).unwrap_or(false),
+                    "mapped": self.device_bridge.has_device(id),
+                    "bridged": self.bridge.as_ref().map(|b| b.status_for(id)).unwrap_or(false),
+                    "online": true,
+                }),
+            );
+        }
+        // A device rusthinq has published properties for before but isn't currently
+        // connected is otherwise invisible everywhere — `DeviceManager::all()` above
+        // is live-connections-only, so a disconnected id (even one that's gone for
+        // good) would simply vanish from this snapshot with nothing left to notice
+        // or clean it up. List it too, with whatever `MqttSink` still knows about it
+        // once disconnected: just an id and a last-seen time, no model/type (that's
+        // only ever known from the live protocol handshake). See `device_control.rs`
+        // for the matching `forget` command that actually removes one of these.
+        for (id, last_seen_unix) in self.mqtt.known_devices() {
+            if live.contains_key(&id) {
+                continue;
+            }
+            all.insert(
+                id.clone(),
+                json!({
+                    "name": self.bridge.as_ref().and_then(|b| b.name(&id)),
+                    "online": false,
+                    "lastSeenUnix": last_seen_unix,
                 }),
             );
         }
@@ -182,5 +205,51 @@ mod tests {
         let raw = mqtt.retained("devices").unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["devices"], json!({}));
+    }
+
+    /// Issue #9: a device that published properties before but isn't connected right
+    /// now must still show up in the snapshot (as `online: false`), not vanish the
+    /// moment it disconnects.
+    #[test]
+    fn known_but_offline_devices_are_listed_alongside_live_ones() {
+        use rusthinq_core::mqtt::MqttConnection;
+
+        let mqtt = MockMqttConnection::new();
+        mqtt.publish_property("dev-gone", "power", "ON"); // no live connection at all
+        let manager = DeviceManager::new();
+        manager.accept(dummy_dev("dev-1"));
+        let device_bridge = DeviceBridge::new(mqtt.clone());
+        let publisher = DeviceListPublisher::new(mqtt.clone(), manager, device_bridge, None);
+
+        publisher.publish();
+
+        let raw = mqtt.retained("devices").unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["devices"]["dev-1"]["online"], true);
+        assert_eq!(v["devices"]["dev-gone"]["online"], false);
+        assert!(v["devices"]["dev-gone"]["lastSeenUnix"].as_i64().unwrap() > 0);
+        // Offline entries carry no model/type -- that's only ever known live.
+        assert!(v["devices"]["dev-gone"].get("model").is_none());
+    }
+
+    /// A live connection always wins over stale `known_devices` bookkeeping for the
+    /// same id -- e.g. right after a reconnect, before the old entry's ever cleared.
+    #[test]
+    fn a_live_connection_is_not_shadowed_by_its_own_known_devices_entry() {
+        use rusthinq_core::mqtt::MqttConnection;
+
+        let mqtt = MockMqttConnection::new();
+        mqtt.publish_property("dev-1", "power", "ON");
+        let manager = DeviceManager::new();
+        manager.accept(dummy_dev("dev-1"));
+        let device_bridge = DeviceBridge::new(mqtt.clone());
+        let publisher = DeviceListPublisher::new(mqtt.clone(), manager, device_bridge, None);
+
+        publisher.publish();
+
+        let raw = mqtt.retained("devices").unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["devices"]["dev-1"]["online"], true);
+        assert_eq!(v["devices"]["dev-1"]["model"], "RAC_056905_WW");
     }
 }

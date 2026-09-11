@@ -26,6 +26,7 @@ Payload shape:
   "bridgeLoggedIn": true,
   "devices": {
     "<id>": {
+      "online": true,
       "model": "...",
       "modelName": "...",
       "deviceType": "...",
@@ -33,13 +34,22 @@ Payload shape:
       "platform": "thinq1 | thinq2",
       "mapped": true,
       "bridged": false
+    },
+    "<offline-id>": {
+      "online": false,
+      "lastSeenUnix": 1234567890
     }
   }
 }
 ```
 
-- `mapped`: a local device-type handler is wired up for it (Rhai script / raw bus / etc).
-- `bridged`: **live** — there's currently a forwarding session to the real LG cloud for it (see [bridge on/off semantics](#bridge-onoff-per-device) below).
+- `online`: whether this id has a live connection right now. An `online: false`
+  entry is a device rusthinq has published properties for before but hasn't seen
+  since — it carries only `lastSeenUnix` (unix seconds of its last publish), never
+  `model`/`platform`/etc, since those are only ever known live. See
+  [forgetting a device](#forgetting-a-device-gone-for-good) below to remove one.
+- `mapped`: a local device-type handler is wired up for it (Rhai script / raw bus / etc). Only present for `online: true` entries.
+- `bridged`: **live** — there's currently a forwarding session to the real LG cloud for it (see [bridge on/off semantics](#bridge-onoff-per-device) below). Only present for `online: true` entries.
 - `bridgeLoggedIn`: `null` if the `bridge` feature wasn't built at all.
 
 ## Bridge on/off (per device)
@@ -102,6 +112,22 @@ mosquitto_pub -h localhost -t 'rusthinq/bridge/logout/set' -m ''
 Current logged-in state doesn't need its own poll topic — it's always in
 `rusthinq/devices` as `bridgeLoggedIn`.
 
+## Forgetting a device (gone for good)
+
+For a device that's never coming back (thrown away, factory-reset, replaced) —
+listed in `rusthinq/devices` as `"online": false` with a `lastSeenUnix` that's
+only getting older. This clears its retained MQTT state (so it drops out of
+`rusthinq/devices` entirely) and, if the `bridge` feature is built, its saved LG
+pairing state too — same effect as `bridge/disable/set`, plus the MQTT cleanup.
+Works whether or not the device is currently connected.
+
+```bash
+mosquitto_pub -h localhost -t 'rusthinq/<id>/forget/set' -m ''
+
+# outcome:
+mosquitto_sub -h localhost -t 'rusthinq/<id>/forget/status' -v
+```
+
 ## Quick reference
 
 | Topic | Direction | Payload | Effect |
@@ -115,7 +141,10 @@ Current logged-in state doesn't need its own poll topic — it's always in
 | `rusthinq/bridge/login/complete/set` | subscribed | full redirected URL | finish LG OAuth login |
 | `rusthinq/bridge/logout/set` | subscribed | ignored | clear LG credentials, detach every bridge session |
 | `rusthinq/bridge/status` | published | text | login/logout outcome |
+| `rusthinq/<id>/forget/set` | subscribed | ignored | clear retained MQTT state (+ saved bridge pairing, if built) for an id, live or not |
+| `rusthinq/<id>/forget/status` | published | text | forget outcome |
 
 Source of truth for the exact topic strings and payload handling:
-`crates/rusthinq-cloud/src/bridge_control.rs` (doc comment at the top) and
+`crates/rusthinq-cloud/src/bridge_control.rs` (doc comment at the top),
+`crates/rusthinq-cloud/src/device_control.rs`, and
 `crates/rusthinq-cloud/src/devlist.rs`.

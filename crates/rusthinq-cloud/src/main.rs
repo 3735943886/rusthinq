@@ -7,6 +7,7 @@ mod bridge_control;
 mod bridge_handle;
 mod certs;
 mod device_bridge;
+mod device_control;
 mod devlist;
 mod devmgr;
 mod mqtt_broker;
@@ -195,6 +196,17 @@ async fn main() -> Result<()> {
         manager.clone(),
         device_bridge.clone(),
         lg_bridge.clone(),
+    );
+
+    // "Forget device" — clears retained MQTT state (and saved bridge pairing state,
+    // if any) for an id regardless of whether it's currently connected. Unlike
+    // bridge_control.rs below, always registered: it doesn't need the `bridge`
+    // feature to be useful (see device_control.rs).
+    device_control::register(
+        &mqtt_sink,
+        mqtt_dyn.clone(),
+        lg_bridge.clone(),
+        device_list.clone(),
     );
 
     // A bridge session can attach or detach from a path nothing else here awaits —
