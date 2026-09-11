@@ -335,10 +335,19 @@ impl DeviceBridge {
                         },
                     );
                 }
-                // The device is now permanently gone (this survived the grace period
-                // with no same-id replacement) — clear whatever retained property
-                // topics it ever published, so they don't sit in the broker forever.
-                bridge_task.mqtt.clear_retained(&id_task);
+                // This survived the grace period with no same-id replacement, so the
+                // local handler is torn down -- but retained MQTT state is *not*
+                // cleared here anymore (it used to be, on the theory that 2s without
+                // a reconnect means "permanently gone"). A device that's actually
+                // coming back later (travel router down overnight, a power outage)
+                // would otherwise lose its whole retained state for no reason, and
+                // one that's genuinely gone for good would vanish from
+                // known_devices()/devlist.rs's snapshot within seconds -- before a
+                // human ever gets to see it as "online: false" and decide to forget
+                // it (issue #9's whole point). `MqttSink` still knows this id from
+                // `published_topics`/`known_devices()`, so it keeps showing up as
+                // offline with a last-seen time; `device_control.rs`'s explicit
+                // `forget` is now the only thing that calls `clear_retained`.
                 bridge_task.t2_adapters.lock().remove(&id_task);
                 bridge_task.t1_adapters.lock().remove(&id_task);
             });
@@ -470,5 +479,37 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(handler.drop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #9 regression: this grace-period drop used to also call
+    /// `mqtt.clear_retained(id)`, which wiped the device out of
+    /// `MqttSink::known_devices()` within seconds of any real disconnect -- long
+    /// before a human could ever see it listed as `online: false` in
+    /// `devlist.rs`'s snapshot and decide whether to forget it. Retained state (and
+    /// `known_devices()`) must survive this drop; only an explicit `forget`
+    /// (device_control.rs) clears it now.
+    #[tokio::test]
+    async fn close_with_no_replacement_does_not_clear_retained_mqtt_state() {
+        let mqtt = MockMqttConnection::new();
+        mqtt.publish_property("dev-1", "power", "ON");
+        let bridge = DeviceBridge::new_with_grace(mqtt.clone(), Duration::from_millis(50));
+
+        let dev = dummy_dev("dev-1");
+        let handler = FakeDeviceHandler::new("dev-1");
+        bridge.new_device_with_handler(dev.clone(), handler.clone());
+
+        dev.notify_close();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(handler.drop_calls.load(Ordering::SeqCst), 1, "still drops locally");
+
+        assert!(
+            mqtt.device("dev-1").is_some(),
+            "retained MQTT properties must survive the grace-period drop"
+        );
+        assert_eq!(
+            mqtt.known_devices().len(),
+            1,
+            "the id must still be known (and thus listable as offline) after the drop"
+        );
     }
 }

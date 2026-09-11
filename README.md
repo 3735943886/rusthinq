@@ -35,8 +35,11 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
   exponential backoff (both to the local broker and to LG's cloud in bridge mode);
   a device handler panicking doesn't take down the process or other devices
   (`panic_guard`); a device dropping and reconnecting within a short grace period
-  doesn't flap its published availability state; permanently-removed devices have
-  their retained MQTT state cleaned up automatically.
+  doesn't flap its published availability state. A device that stops connecting
+  altogether keeps its retained MQTT state (in case it's coming back) but shows up
+  in `<rusthinq_prefix>/devices` as `online: false` with a last-seen time, and stays
+  there — nothing clears it automatically — until you explicitly forget it (see
+  [Forgetting a device](docs/mqtt-control.md#forgetting-a-device-gone-for-good)).
 - **The core has zero knowledge of any specific downstream integration.**
   `rusthinq-core` and `rusthinq-devices` only know "a device has properties and emits
   events" — nothing here hardcodes discovery topics or payload shapes for any
