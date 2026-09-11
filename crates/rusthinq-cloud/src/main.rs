@@ -10,6 +10,7 @@ mod device_bridge;
 mod device_control;
 mod devlist;
 mod devmgr;
+mod known_devices;
 mod mqtt_broker;
 mod mqtt_client;
 mod raw_bus;
@@ -121,6 +122,10 @@ async fn main() -> Result<()> {
             .to_string_lossy()
             .into(),
     );
+    // Same "always on, not opt-in" treatment as state_file above, and for the same
+    // reason: this is the only record of a device that's ever connected but isn't
+    // right now, not a feature someone chooses to turn on.
+    let known_devices_path = config_dir.join("known_devices.json");
 
     let enabled: std::collections::HashMap<String, bool> =
         config.log.iter().map(|k| (k.clone(), true)).collect();
@@ -144,6 +149,7 @@ async fn main() -> Result<()> {
     logging::log("status", &["CA certificate ready"]);
 
     let manager = devmgr::DeviceManager::new();
+    let known_devices = known_devices::KnownDevices::new(Some(known_devices_path));
 
     // Rhai device scripting (see rusthinq_devices::scripting) — only exists at all
     // when [devices] is configured, same opt-in-by-presence pattern as [bridge]/
@@ -206,6 +212,7 @@ async fn main() -> Result<()> {
         manager.clone(),
         device_bridge.clone(),
         lg_bridge.clone(),
+        known_devices.clone(),
     );
 
     // "Forget device" — clears retained MQTT state (and saved bridge pairing state,
@@ -217,6 +224,7 @@ async fn main() -> Result<()> {
         mqtt_dyn.clone(),
         lg_bridge.clone(),
         device_list.clone(),
+        known_devices.clone(),
     );
 
     // A bridge session can attach or detach from a path nothing else here awaits —
@@ -241,6 +249,22 @@ async fn main() -> Result<()> {
         br.start_name_refresh_loop();
     }
 
+    // A `[bridge].storage_path` id the account's device list no longer has, found
+    // by `Bridge`'s own reconciliation (live-session detach, or a one-time sweep
+    // of already-saved state at the first poll) — see `known_devices.rs`'s
+    // `note_orphaned` doc comment. This is how a device that's gone for good ends
+    // up visible (`online: false`) and forgettable even when this process never
+    // saw it connect at all.
+    #[cfg(feature = "bridge")]
+    if let Some(ref br) = lg_bridge {
+        let known_devices = known_devices.clone();
+        let device_list = device_list.clone();
+        br.set_on_storage_orphaned_hook(Arc::new(move |id| {
+            known_devices.note_orphaned(id);
+            device_list.publish();
+        }));
+    }
+
     // Retained, but only ever *written* on a device connect/disconnect above — if the
     // broker itself loses its retained store (e.g. restarted) around the same time this
     // MQTT client reconnects, nothing else would put the snapshot back until the next
@@ -258,7 +282,9 @@ async fn main() -> Result<()> {
         let mqtt_dyn = mqtt_dyn.clone();
         let device_list = device_list.clone();
         let raw_prefix = config.mqtt.raw_prefix.clone();
+        let known_devices = known_devices.clone();
         manager.on_new_device(move |dev| {
+            known_devices.note_connected(&dev.id, &dev.meta, dev.platform);
             if let Some(ref raw_prefix) = raw_prefix {
                 raw_bus::attach(&mqtt_dyn, &dev, raw_prefix);
             }
@@ -272,7 +298,11 @@ async fn main() -> Result<()> {
     }
     {
         let device_list = device_list.clone();
-        manager.on_drop_device(move |_id| device_list.publish());
+        let known_devices = known_devices.clone();
+        manager.on_drop_device(move |id| {
+            known_devices.note_disconnected(id);
+            device_list.publish();
+        });
     }
 
     // Bridge enable/disable, and LG account login/logout, all over MQTT — see

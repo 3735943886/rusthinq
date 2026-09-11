@@ -34,6 +34,8 @@ type StatusCallback = Box<dyn FnMut(&str) + Send>;
 type NoteUrlsHook = Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 /// See `on_session_change` on [`Bridge`] and `set_on_session_change_hook`.
 type SessionChangeHook = Arc<dyn Fn() + Send + Sync>;
+/// See `on_storage_orphaned` on [`Bridge`] and `set_on_storage_orphaned_hook`.
+type OrphanHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Minimal local device view for bridge enable/disable (avoids cyclic deps on cloud).
 pub trait LocalDevice: Send + Sync {
@@ -120,6 +122,18 @@ pub struct Bridge {
     /// account wouldn't reach a subscriber until some unrelated event (a device
     /// connecting, a bridge enable/disable) happened to republish next.
     on_names_changed: Mutex<Option<SessionChangeHook>>,
+    /// The account's device ids as of the previous successful `refresh_names`
+    /// poll. `None` before the first one (since process start), which is what
+    /// tells `reconcile_storage_with_account` to do its one-time full sweep of
+    /// everything already in `storage` instead of a cheap diff against nothing.
+    last_account_ids: Mutex<Option<HashSet<String>>>,
+    /// Fired once per id `reconcile_storage_with_account` finds orphaned (in
+    /// `storage`/a live session but no longer in the account) — `id` only, no
+    /// metadata (this crate doesn't have any beyond the raw AWS IoT state blob).
+    /// `rusthinq-cloud` wires this to its own connection-level "known devices"
+    /// ledger so the id shows up as offline/forgettable, without this crate
+    /// depending on that concept at all.
+    on_storage_orphaned: Mutex<Option<OrphanHook>>,
 }
 
 impl Bridge {
@@ -135,6 +149,8 @@ impl Bridge {
             device_names: Mutex::new(HashMap::new()),
             name_refresh_notify: tokio::sync::Notify::new(),
             on_names_changed: Mutex::new(None),
+            last_account_ids: Mutex::new(None),
+            on_storage_orphaned: Mutex::new(None),
         })
     }
 
@@ -153,6 +169,18 @@ impl Bridge {
     fn notify_session_change(&self) {
         if let Some(hook) = self.on_session_change.lock().clone() {
             hook();
+        }
+    }
+
+    /// Install a hook run once per id `reconcile_storage_with_account` finds
+    /// orphaned — see `on_storage_orphaned` above.
+    pub fn set_on_storage_orphaned_hook(&self, hook: OrphanHook) {
+        *self.on_storage_orphaned.lock() = Some(hook);
+    }
+
+    fn notify_storage_orphaned(&self, id: &str) {
+        if let Some(hook) = self.on_storage_orphaned.lock().clone() {
+            hook(id);
         }
     }
 
@@ -232,30 +260,69 @@ impl Bridge {
             })
             .collect();
         self.set_device_names(names);
-        self.detach_deregistered_sessions(&account_ids).await;
+        self.reconcile_storage_with_account(&account_ids);
         Ok(())
     }
 
-    /// A device removed from the LG account (deleted via the official app) while
-    /// still locally connected otherwise leaves a zombie bridge session: nothing
-    /// local ever closes, so `connect_thinq2`'s reconnect loop just retries forever
-    /// against a now-invalid registration, and `enable()`'s live-session
-    /// short-circuit (`self.sessions.lock().contains_key(&id)`) makes a manual
-    /// re-registration attempt silently no-op instead of doing a fresh OTP -> pair ->
-    /// addDevice cycle. `run_name_refresh_loop` already polls the account's device
-    /// list on a timer for names — reuse that same poll to catch this: any live
-    /// session whose id is no longer in the account gets `disable()`'d, which clears
-    /// saved state + want_enabled so the next `enable()` re-registers for real.
-    async fn detach_deregistered_sessions(&self, account_ids: &HashSet<String>) {
-        let live_ids: Vec<String> = self.sessions.lock().keys().cloned().collect();
-        for id in live_ids {
-            if !account_ids.contains(&id) {
-                tracing::warn!(
-                    "{id}: no longer in the LG account's device list -- treating the \
-                     bridge session as deregistered and disabling"
-                );
-                let _ = self.disable(&id).await;
+    /// A device removed from the LG account (deleted via the official app) leaves
+    /// state behind on two levels this reconciles against the account's current
+    /// device list, called from every `refresh_names` poll (so: once immediately
+    /// at process start, then every 15 minutes):
+    ///
+    /// - a **live** bridge session: nothing local ever closes it on its own, so
+    ///   `connect_thinq2`'s reconnect loop just retries forever against a
+    ///   now-invalid registration, and `enable()`'s live-session short-circuit
+    ///   (`self.sessions.lock().contains_key(&id)`) makes a manual re-registration
+    ///   attempt silently no-op instead of doing a fresh OTP -> pair -> addDevice
+    ///   cycle. Detached here (session stopped, `want_enabled` cleared) so a
+    ///   subsequent `enable()` re-registers for real.
+    /// - **saved state with no live session at all** — a device that's been gone
+    ///   since before this process even started, or whose local connection never
+    ///   came back: nothing else ever notices this one, since it never goes
+    ///   through the live-session path above.
+    ///
+    /// Neither case deletes anything here — this only detaches/notifies;
+    /// `storage`'s `device_<id>.json` is left alone so it can still be inspected,
+    /// and erasing it is `disable()`'s job (a human forgetting it explicitly, or a
+    /// direct `bridge/disable/set`), not an automatic side effect of noticing the
+    /// account doesn't have it anymore.
+    fn reconcile_storage_with_account(&self, account_ids: &HashSet<String>) {
+        let live_ids: HashSet<String> = self.sessions.lock().keys().cloned().collect();
+
+        let mut orphaned: HashSet<String> = HashSet::new();
+        let mut last = self.last_account_ids.lock();
+        match last.as_ref() {
+            None => {
+                // First successful poll since this process started: sweep
+                // everything already in `storage`, not just live sessions, so a
+                // device gone before this process even started is found too --
+                // cheap re-diffing against every later poll only needs to compare
+                // account snapshots (below), not re-list the directory every time.
+                for id in self.storage.list_device_ids() {
+                    if !account_ids.contains(&id) {
+                        orphaned.insert(id);
+                    }
+                }
             }
+            Some(prev) => {
+                for id in prev.difference(account_ids) {
+                    orphaned.insert(id.clone());
+                }
+            }
+        }
+        *last = Some(account_ids.clone());
+        drop(last);
+
+        for id in &orphaned {
+            if live_ids.contains(id) {
+                tracing::warn!(
+                    "{id}: no longer in the LG account's device list -- detaching \
+                     the live bridge session (saved state kept; forget it to erase)"
+                );
+                self.detach_session(id);
+                self.want_enabled.lock().remove(id);
+            }
+            self.notify_storage_orphaned(id);
         }
     }
 
@@ -1163,9 +1230,12 @@ mod lifecycle_tests {
     }
 
     /// Issue #8: a device deleted from the LG account while still locally connected
-    /// must not keep a zombie bridge session around forever.
+    /// must not keep a zombie bridge session around forever. Detaching must not
+    /// delete `storage`'s saved state though -- that's `disable()`/forget's job now
+    /// (see `reconcile_storage_with_account`'s doc comment), not an automatic side
+    /// effect of noticing the account doesn't have it anymore.
     #[tokio::test]
-    async fn detach_deregistered_sessions_disables_sessions_missing_from_the_account() {
+    async fn reconcile_detaches_live_sessions_missing_from_the_account_but_keeps_storage() {
         let bridge = test_bridge();
         let (kept, gone) = ("dev-kept", "dev-gone");
         for id in [kept, gone] {
@@ -1183,15 +1253,83 @@ mod lifecycle_tests {
         assert!(bridge.status_for(gone));
 
         let account_ids: HashSet<String> = [kept.to_string()].into_iter().collect();
-        bridge.detach_deregistered_sessions(&account_ids).await;
+        bridge.reconcile_storage_with_account(&account_ids);
 
         assert!(bridge.status_for(kept), "kept device must stay live");
         assert!(
             !bridge.status_for(gone),
-            "device missing from the account must be disabled"
+            "device missing from the account must be detached"
         );
         assert!(!bridge.want_enabled.lock().contains(gone));
-        assert!(bridge.storage.get_device_state_json(gone).is_none());
+        assert!(
+            bridge.storage.get_device_state_json(gone).is_some(),
+            "saved state must survive -- only an explicit forget/disable erases it"
+        );
+    }
+
+    /// The other half of issue #9: a device with saved state but *no* live session
+    /// at all (gone since before this process started, or its local connection
+    /// never came back) is only ever found by sweeping `storage` directly -- the
+    /// live-session path above never sees it. This only happens on the first poll
+    /// since process start (`last_account_ids` still `None`).
+    #[tokio::test]
+    async fn reconcile_first_poll_sweeps_storage_for_ids_with_no_live_session() {
+        let bridge = test_bridge();
+        bridge
+            .storage
+            .set_device_state_json("dev-orphan", Some(mock_saved_state()));
+        // Deliberately never enabled/connected -- no live session, no want_enabled.
+
+        let orphaned = Arc::new(Mutex::new(Vec::new()));
+        let o = orphaned.clone();
+        bridge.set_on_storage_orphaned_hook(Arc::new(move |id| o.lock().push(id.to_string())));
+
+        bridge.reconcile_storage_with_account(&HashSet::new());
+
+        assert_eq!(orphaned.lock().clone(), vec!["dev-orphan".to_string()]);
+        assert!(
+            bridge.storage.get_device_state_json("dev-orphan").is_some(),
+            "sweeping must not itself delete anything"
+        );
+    }
+
+    /// After the first poll, later polls must diff against the *previous account
+    /// snapshot* rather than re-sweeping `storage` -- an id already known gone
+    /// (and thus already reported once) must not fire the hook again on a later
+    /// poll where nothing changed.
+    #[tokio::test]
+    async fn reconcile_later_polls_diff_against_the_previous_account_snapshot() {
+        let bridge = test_bridge();
+        bridge
+            .storage
+            .set_device_state_json("dev-a", Some(mock_saved_state()));
+        bridge
+            .storage
+            .set_device_state_json("dev-b", Some(mock_saved_state()));
+
+        let orphaned = Arc::new(Mutex::new(Vec::new()));
+        let o = orphaned.clone();
+        bridge.set_on_storage_orphaned_hook(Arc::new(move |id| o.lock().push(id.to_string())));
+
+        // First poll: both present in the account -- nothing orphaned yet.
+        let both: HashSet<String> = ["dev-a".to_string(), "dev-b".to_string()]
+            .into_iter()
+            .collect();
+        bridge.reconcile_storage_with_account(&both);
+        assert!(orphaned.lock().is_empty());
+
+        // Second poll: dev-a dropped out of the account.
+        let just_b: HashSet<String> = ["dev-b".to_string()].into_iter().collect();
+        bridge.reconcile_storage_with_account(&just_b);
+        assert_eq!(orphaned.lock().clone(), vec!["dev-a".to_string()]);
+
+        // Third poll: nothing changed since the second -- must not re-fire for dev-a.
+        bridge.reconcile_storage_with_account(&just_b);
+        assert_eq!(
+            orphaned.lock().clone(),
+            vec!["dev-a".to_string()],
+            "an already-reported orphan must not fire again on an unchanged poll"
+        );
     }
 
     #[tokio::test]

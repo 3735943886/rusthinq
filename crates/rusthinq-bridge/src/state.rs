@@ -24,6 +24,12 @@ pub trait BridgeState: Send + Sync {
     fn set_credentials(&self, credentials: Option<Credentials>);
     fn get_device_state_json(&self, id: &str) -> Option<serde_json::Value>;
     fn set_device_state_json(&self, id: &str, state: Option<serde_json::Value>);
+    /// Every device id with a stored state file, regardless of whether this
+    /// process has ever seen it live this run — the only way to discover a
+    /// `device_<id>.json` that's just been sitting there since before this
+    /// process started. Used once, by `Bridge::reconcile_storage_with_account`'s
+    /// first poll (see its doc comment).
+    fn list_device_ids(&self) -> Vec<String>;
 }
 
 /// File-backed storage matching TypeScript `JSONStorage`.
@@ -88,6 +94,22 @@ impl BridgeState for JsonStorage {
                 let _ = fs::remove_file(path);
             }
         }
+    }
+
+    fn list_device_ids(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.base_path) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name();
+                name.to_str()?
+                    .strip_prefix("device_")?
+                    .strip_suffix(".json")
+                    .map(str::to_string)
+            })
+            .collect()
     }
 }
 
