@@ -218,6 +218,11 @@ impl Bridge {
         let mut client = thinq_api::Client::new(creds.env.clone());
         client.auth(&creds.refresh_token).await?;
         let devices = client.list_devices().await?;
+        let account_ids: HashSet<String> = devices
+            .iter()
+            .filter_map(|d| d.get("deviceId").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect();
         let names: HashMap<String, String> = devices
             .iter()
             .filter_map(|d| {
@@ -227,7 +232,31 @@ impl Bridge {
             })
             .collect();
         self.set_device_names(names);
+        self.detach_deregistered_sessions(&account_ids).await;
         Ok(())
+    }
+
+    /// A device removed from the LG account (deleted via the official app) while
+    /// still locally connected otherwise leaves a zombie bridge session: nothing
+    /// local ever closes, so `connect_thinq2`'s reconnect loop just retries forever
+    /// against a now-invalid registration, and `enable()`'s live-session
+    /// short-circuit (`self.sessions.lock().contains_key(&id)`) makes a manual
+    /// re-registration attempt silently no-op instead of doing a fresh OTP -> pair ->
+    /// addDevice cycle. `run_name_refresh_loop` already polls the account's device
+    /// list on a timer for names — reuse that same poll to catch this: any live
+    /// session whose id is no longer in the account gets `disable()`'d, which clears
+    /// saved state + want_enabled so the next `enable()` re-registers for real.
+    async fn detach_deregistered_sessions(&self, account_ids: &HashSet<String>) {
+        let live_ids: Vec<String> = self.sessions.lock().keys().cloned().collect();
+        for id in live_ids {
+            if !account_ids.contains(&id) {
+                tracing::warn!(
+                    "{id}: no longer in the LG account's device list -- treating the \
+                     bridge session as deregistered and disabling"
+                );
+                let _ = self.disable(&id).await;
+            }
+        }
     }
 
     /// Replaces the cached names and fires `on_names_changed`, but only if they
@@ -1131,6 +1160,38 @@ mod lifecycle_tests {
 
         assert_eq!(bridge.name("dev-1"), None);
         assert!(*fired.lock());
+    }
+
+    /// Issue #8: a device deleted from the LG account while still locally connected
+    /// must not keep a zombie bridge session around forever.
+    #[tokio::test]
+    async fn detach_deregistered_sessions_disables_sessions_missing_from_the_account() {
+        let bridge = test_bridge();
+        let (kept, gone) = ("dev-kept", "dev-gone");
+        for id in [kept, gone] {
+            bridge
+                .storage
+                .set_device_state_json(id, Some(mock_saved_state()));
+            bridge.want_enabled.lock().insert(id.to_string());
+            let local = MockLocal::new(id, "thinq2");
+            bridge
+                .enable(local.clone() as Arc<dyn LocalDevice>, Some("401"), None)
+                .await
+                .unwrap();
+        }
+        assert!(bridge.status_for(kept));
+        assert!(bridge.status_for(gone));
+
+        let account_ids: HashSet<String> = [kept.to_string()].into_iter().collect();
+        bridge.detach_deregistered_sessions(&account_ids).await;
+
+        assert!(bridge.status_for(kept), "kept device must stay live");
+        assert!(
+            !bridge.status_for(gone),
+            "device missing from the account must be disabled"
+        );
+        assert!(!bridge.want_enabled.lock().contains(gone));
+        assert!(bridge.storage.get_device_state_json(gone).is_none());
     }
 
     #[tokio::test]
