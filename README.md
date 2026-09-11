@@ -185,9 +185,11 @@ dashboard (`gui` feature + `[gui]` config, off by default) described next.
 ### Web dashboard (optional)
 
 `rusthinq-gui` is a small Axum HTTP/WebSocket server that renders a browser dashboard
-(device list, per-device bridge enable/disable, LG account login/logout, and a
-per-device raw wire-traffic monitor page) on top of the same MQTT topics documented in
-[`docs/mqtt-control.md`](docs/mqtt-control.md). It's off by default and needs both:
+(device list — including known-but-offline devices, with a "forget this device"
+action for one that's gone for good — per-device bridge enable/disable, LG account
+login/logout, and a per-device raw wire-traffic monitor page) on top of the same MQTT
+topics documented in [`docs/mqtt-control.md`](docs/mqtt-control.md). It's off by
+default and needs both:
 
 - the `rusthinq-cloud` binary built with `--features gui`, and
 - a `[gui]` section in `config.toml` (see the commented-out example there):

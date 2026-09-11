@@ -54,6 +54,7 @@ pub async fn serve(
         .route("/device", get(ws_device))
         .route("/bridge/{id}/enable", post(bridge_enable))
         .route("/bridge/{id}/disable", post(bridge_disable))
+        .route("/forget/{id}", post(forget_device))
         .route("/thinq_login", get(thinq_login))
         .route("/thinq_login_accept", post(thinq_login_accept))
         .route("/thinq_logout", post(thinq_logout));
@@ -424,6 +425,27 @@ async fn bridge_disable(Path(id): Path<String>, State(state): State<AppState>) -
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Erases a device regardless of whether it's currently connected -- the GUI-side
+/// counterpart of `<prefix>/<id>/forget/set` (device_control.rs). Unlike
+/// bridge_enable/disable above, this id may not be a live `ConnectedDevice` at all
+/// (that's the whole point -- see the `online: false` entries `devlist.rs` now
+/// publishes), so this only ever publishes/awaits MQTT, never touches `state.shared`.
+async fn forget_device(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    let events_rx = state.mqtt.subscribe_events();
+    let topic = format!("{}/{}/forget/set", state.mqtt.prefix, id);
+    let _ = state
+        .mqtt
+        .client
+        .publish(topic, QoS::AtLeastOnce, false, b"".to_vec())
+        .await;
+
+    let status_topic = state.mqtt.forget_status_topic(&id);
+    // device_control.rs's handler can't fail either -- always ends in "forgotten" --
+    // same reasoning as bridge_disable above for answering 204 on a timeout too.
+    await_terminal(events_rx, &status_topic, |m| m == "forgotten").await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[derive(Deserialize)]
 struct LoginQuery {
     #[serde(rename = "countryCode")]
@@ -606,6 +628,25 @@ mod tests {
         reply_bridge_status(&state, "dev-1", "disabled", Duration::from_millis(200)).await;
 
         let resp = bridge_disable(Path("dev-1".to_string()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn forget_device_answers_204_once_forgotten_status_arrives() {
+        let Some(broker) = TestBroker::start() else {
+            return;
+        };
+        let state = connected_state(&broker).await;
+        let client = state.mqtt.client.clone();
+        let topic = state.mqtt.forget_status_topic("dev-gone");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = client
+                .publish(topic, QoS::AtLeastOnce, false, b"forgotten".to_vec())
+                .await;
+        });
+
+        let resp = forget_device(Path("dev-gone".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 

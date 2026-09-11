@@ -83,6 +83,34 @@ class DeviceEntry {
         td.title = this.id
         children.push(td)
 
+        if (this.remoteState.online === false) {
+            // Known but not currently connected (see devlist.rs) -- there's nothing
+            // but an id and a last-seen time for it, so there's no model/platform to
+            // show and no bridge session to toggle. Offer to forget it instead of
+            // the monitor link, which needs a live connection too.
+            td = document.createElement('td')
+            td.className = 'dev-model'
+            td.colSpan = 3
+            td.innerHTML = `<i class="material-icons tiny" style="vertical-align:bottom">wifi_off</i> Offline${formatLastSeen(this.remoteState.lastSeenUnix)}`
+            children.push(td)
+
+            td = document.createElement('td')
+            td.className = 'dev-actions'
+            td.innerHTML = `
+                <span class="tooltipped" style="display: inline-block" data-position="bottom" data-tooltip="Forget this device -- clears its saved state; it won't be listed again unless it reconnects">
+                    <a class="btn waves-effect waves-light red" href="#"><i class="material-icons">delete_forever</i></a>
+                </span>`
+            children.push(td)
+
+            this.row.replaceChildren(...children)
+            Array.from(this.row.getElementsByClassName('tooltipped')).forEach((e) => M.Tooltip.init(e))
+            td.querySelector('a').onclick = async (ev) => {
+                ev.preventDefault()
+                await fetchWrapper(`forget/${this.id}`, {}, { method: 'POST' })
+            }
+            return
+        }
+
         td = document.createElement('td')
         td.className = 'dev-model'
         let model = this.remoteState.model
@@ -192,6 +220,9 @@ class DeviceEntry {
     }
 
     refreshUI() {
+        // Offline rows have no bridge switch/spinner at all -- see updateDom's early
+        // return above.
+        if (this.remoteState.online === false) return
         if (this.bridgeBusy) {
             this.bridgeDiv.classList.add('hide')
             this.spinner.classList.remove('hide')
@@ -329,6 +360,25 @@ window.addEventListener('pageshow', (ev) => {
 
 function get(id) {
     return document.getElementById(id)
+}
+
+// `lastSeenUnix` is 0 for a device whose state predates last-seen tracking
+// (mqtt.rs's migration from the pre-#9 state-file shape) -- nothing meaningful to
+// show then, so this leaves it out rather than claiming "last seen 1970".
+function formatLastSeen(lastSeenUnix) {
+    if (!lastSeenUnix) return ''
+    const seconds = Math.max(0, Date.now() / 1000 - lastSeenUnix)
+    const units = [
+        ['d', 86400],
+        ['h', 3600],
+        ['m', 60],
+    ]
+    for (const [suffix, secondsPerUnit] of units) {
+        if (seconds >= secondsPerUnit) {
+            return ` — last seen ${Math.floor(seconds / secondsPerUnit)}${suffix} ago`
+        }
+    }
+    return ' — last seen just now'
 }
 
 async function fetchWrapper(path, body, options) {

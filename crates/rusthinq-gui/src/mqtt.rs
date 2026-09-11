@@ -46,6 +46,10 @@ impl Handle {
         format!("{}/{}/bridge/status", self.prefix, id)
     }
 
+    pub fn forget_status_topic(&self, id: &str) -> String {
+        format!("{}/{}/forget/status", self.prefix, id)
+    }
+
     pub fn account_topic(&self, suffix: &str) -> String {
         format!("{}/bridge/{}", self.prefix, suffix)
     }
@@ -108,6 +112,10 @@ async fn run_event_loop(
                 // different shape, see bridge_control.rs's doc comment.
                 let _ = client
                     .subscribe(format!("{prefix}/+/bridge/status"), QoS::AtLeastOnce)
+                    .await;
+                // `<prefix>/<id>/forget/status` -- see device_control.rs.
+                let _ = client
+                    .subscribe(format!("{prefix}/+/forget/status"), QoS::AtLeastOnce)
                     .await;
             }
             Ok(Event::Incoming(Incoming::Publish(p))) => {
