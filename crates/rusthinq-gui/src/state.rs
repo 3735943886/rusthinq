@@ -42,6 +42,7 @@ impl Shared {
             "mqtt": raw.get("mqtt").cloned().unwrap_or(Value::Bool(false)),
             "bridge": bridge,
             "devices": raw.get("devices").cloned().unwrap_or_else(|| json!({})),
+            "revision": rusthinq_core::version::REVISION,
         });
         // `send` (unlike `send_replace`) is a no-op when there are no receivers
         // yet -- e.g. the very first `<prefix>/devices` message arriving before any
@@ -64,7 +65,12 @@ impl Shared {
 }
 
 fn default_snapshot() -> Value {
-    json!({ "mqtt": false, "bridge": Value::Null, "devices": {} })
+    json!({
+        "mqtt": false,
+        "bridge": Value::Null,
+        "devices": {},
+        "revision": rusthinq_core::version::REVISION,
+    })
 }
 
 #[cfg(test)]

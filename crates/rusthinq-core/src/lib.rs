@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod mqtt;
 pub mod panic_guard;
 pub mod thinq;
+pub mod version;
 
 pub use metadata::Metadata;
 pub use mqtt::{MockMqttConnection, MqttConnection};
