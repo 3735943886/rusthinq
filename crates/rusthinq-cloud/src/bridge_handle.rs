@@ -17,6 +17,9 @@ impl Bridge {
     pub fn status_for(&self, _id: &str) -> bool {
         false
     }
+    pub fn is_paired(&self, _id: &str) -> bool {
+        false
+    }
     pub fn is_logged_in(&self) -> bool {
         false
     }

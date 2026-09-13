@@ -199,6 +199,16 @@ impl Bridge {
         self.sessions.lock().contains_key(id)
     }
 
+    /// True if `id` has saved pairing state (cert/key/MQTT endpoint from `pair()`),
+    /// regardless of whether a live session is currently up for it. Unlike
+    /// `status_for`, this stays true across a disconnect -- it's what
+    /// `on_local_device`'s auto-restore checks, and what the dashboard uses to tell
+    /// "paired but not currently relaying" (device offline, or its session died
+    /// while still connected) apart from "never bridged at all".
+    pub fn is_paired(&self, id: &str) -> bool {
+        self.storage.get_device_state_json(id).is_some()
+    }
+
     pub fn storage(&self) -> &Arc<dyn BridgeState> {
         &self.storage
     }

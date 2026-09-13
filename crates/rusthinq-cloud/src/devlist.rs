@@ -56,6 +56,10 @@ impl DeviceListPublisher {
                     "platform": dev.platform.as_str(),
                     "mapped": self.device_bridge.has_device(id),
                     "bridged": self.bridge.as_ref().map(|b| b.status_for(id)).unwrap_or(false),
+                    // Distinct from "bridged": stays true across a disconnect, or a
+                    // live session dying while still connected -- see
+                    // Bridge::is_paired's doc comment.
+                    "bridgePaired": self.bridge.as_ref().map(|b| b.is_paired(id)).unwrap_or(false),
                     "online": true,
                 }),
             );
@@ -85,6 +89,13 @@ impl DeviceListPublisher {
                     "deviceType": known.meta.device_type,
                     "swVersion": known.meta.sw_version,
                     "platform": known.platform,
+                    // Whether LG-cloud pairing state still exists for a device that's
+                    // currently unreachable locally -- see Bridge::is_paired's doc
+                    // comment. True here means the bridge will auto-resume
+                    // (`Bridge::on_local_device`) the moment this device reconnects;
+                    // false means it was disabled/forgotten while offline (or never
+                    // bridged), and reconnecting brings it back as local-only.
+                    "bridgePaired": self.bridge.as_ref().map(|b| b.is_paired(&id)).unwrap_or(false),
                     "online": false,
                     "lastSeenUnix": known.last_seen_unix,
                 }),
@@ -310,5 +321,85 @@ mod tests {
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["devices"]["dev-1"]["online"], true);
         assert_eq!(v["devices"]["dev-1"]["model"], "RAC_056905_WW");
+    }
+
+    /// `bridgePaired` distinguishes "has saved LG-cloud pairing state" from
+    /// `bridged` ("has a live relay session right now") -- a device can be online
+    /// with saved state but no live session (its bridge connection died, or never
+    /// came back up on reconnect), which is a different, worse situation than never
+    /// having been bridged at all.
+    #[test]
+    #[cfg(feature = "bridge")]
+    fn bridge_paired_is_true_for_an_online_device_with_saved_state_but_no_live_session() {
+        use rusthinq_bridge::JsonStorage;
+        use rusthinq_bridge::state::BridgeState;
+
+        let dir = std::env::temp_dir().join("rusthinq-devlist-test-bridge-paired-online");
+        let storage = Arc::new(JsonStorage::new(&dir));
+        storage.set_device_state_json("dev-1", Some(json!({"some": "state"})));
+        let bridge = Bridge::new(storage);
+
+        let mqtt = MockMqttConnection::new();
+        let manager = DeviceManager::new();
+        manager.accept(dummy_dev("dev-1"));
+        let device_bridge = DeviceBridge::new(mqtt.clone());
+        let publisher = DeviceListPublisher::new(
+            mqtt.clone(),
+            manager,
+            device_bridge,
+            Some(bridge),
+            empty_known_devices(),
+        );
+
+        publisher.publish();
+
+        let raw = mqtt.retained("devices").unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["devices"]["dev-1"]["bridged"], false);
+        assert_eq!(v["devices"]["dev-1"]["bridgePaired"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same distinction while the device is offline: `bridgePaired` says whether
+    /// reconnecting will auto-resume the bridge (`Bridge::on_local_device`) or bring
+    /// it back as local-only (disabled/forgotten while offline, or never bridged).
+    #[test]
+    #[cfg(feature = "bridge")]
+    fn bridge_paired_is_true_for_an_offline_device_with_saved_state() {
+        use rusthinq_bridge::JsonStorage;
+        use rusthinq_bridge::state::BridgeState;
+
+        let dir = std::env::temp_dir().join("rusthinq-devlist-test-bridge-paired-offline");
+        let storage = Arc::new(JsonStorage::new(&dir));
+        storage.set_device_state_json("dev-gone", Some(json!({"some": "state"})));
+        let bridge = Bridge::new(storage);
+
+        let mqtt = MockMqttConnection::new();
+        let manager = DeviceManager::new();
+        let device_bridge = DeviceBridge::new(mqtt.clone());
+        let known_devices = empty_known_devices();
+        known_devices.note_connected(
+            "dev-gone",
+            &Metadata::new("MODEL", "MODEL", "1.0"),
+            Platform::Thinq2,
+        );
+        known_devices.note_disconnected("dev-gone");
+        let publisher = DeviceListPublisher::new(
+            mqtt.clone(),
+            manager,
+            device_bridge,
+            Some(bridge),
+            known_devices,
+        );
+
+        publisher.publish();
+
+        let raw = mqtt.retained("devices").unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["devices"]["dev-gone"]["online"], false);
+        assert_eq!(v["devices"]["dev-gone"]["bridgePaired"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -91,7 +91,13 @@ class DeviceEntry {
             td = document.createElement('td')
             td.className = 'dev-model'
             td.colSpan = 3
-            td.innerHTML = `<i class="material-icons tiny" style="vertical-align:bottom">wifi_off</i> Offline${formatLastSeen(this.remoteState.lastSeenUnix)}`
+            // Still paired: the bridge will auto-resume for this device the moment it
+            // reconnects, with no action needed here -- worth saying so in the same
+            // merged cell rather than adding a column just for this.
+            const bridgeNote = this.remoteState.bridgePaired
+                ? ` <i class="material-icons tiny tooltipped" data-position="bottom" data-tooltip="Still paired with the LG cloud -- bridging resumes automatically once this device reconnects" style="vertical-align:bottom">cloud_queue</i>`
+                : ''
+            td.innerHTML = `<i class="material-icons tiny" style="vertical-align:bottom">wifi_off</i> Offline${formatLastSeen(this.remoteState.lastSeenUnix)}${bridgeNote}`
             children.push(td)
 
             td = document.createElement('td')
@@ -133,8 +139,17 @@ class DeviceEntry {
         // column layout entirely, and a fixed width there would push the row wide again.
         td = document.createElement('td')
         td.className = 'dev-bridge'
+        // Paired but not live while the device itself is online: the switch alone would look
+        // identical to "never bridged", hiding a real problem -- the LG-cloud session died, or
+        // never came back up after this device reconnected (see Bridge::is_paired's doc comment
+        // in rusthinq-bridge). One small icon next to the existing switch says so without a new
+        // column.
+        const bridgeWarning =
+            !this.remoteState.bridged && this.remoteState.bridgePaired
+                ? `<i class="material-icons tiny tooltipped" data-position="bottom" data-tooltip="Paired with the LG cloud but not currently relaying" style="vertical-align:middle; color:#e65100">cloud_off</i> `
+                : ''
         td.innerHTML = `
-            <div class="switch">
+            ${bridgeWarning}<div class="switch">
                 <label>Off <input type="checkbox"> <span class="lever"></span>On</label>
             </div>
             <div class="hide preloader-wrapper verysmall active">
