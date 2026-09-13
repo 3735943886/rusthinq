@@ -51,6 +51,8 @@ pub async fn serve(
         .route("/monitor", get(monitor_html))
         .route("/monitor.js", get(monitor_js))
         .route("/dark.css", get(dark_css))
+        .route("/logo.svg", get(logo_svg))
+        .route("/favicon.png", get(favicon_png))
         .route("/ws", get(ws_panel))
         .route("/device", get(ws_device))
         .route("/bridge/{id}/enable", post(bridge_enable))
@@ -130,6 +132,18 @@ async fn monitor_js() -> Response {
 
 async fn dark_css() -> Response {
     css(include_str!("../assets/dark.css"))
+}
+
+async fn logo_svg() -> Response {
+    ([("content-type", "image/svg+xml")], include_str!("../assets/logo.svg")).into_response()
+}
+
+async fn favicon_png() -> Response {
+    (
+        [("content-type", "image/png")],
+        include_bytes!("../assets/favicon.png").as_slice(),
+    )
+        .into_response()
 }
 
 fn html(body: &'static str) -> Response {
