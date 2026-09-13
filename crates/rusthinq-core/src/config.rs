@@ -29,13 +29,28 @@ pub struct MqttConfig {
     pub state_file: Option<String>,
 }
 
+/// Either a bare port number (used verbatim, e.g. in a `mqttServer`/`apiServer` URL a
+/// device is told to use) or a full URL a reverse proxy sits behind, given verbatim
+/// instead of being derived from `hostname` + a port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AdvertiseSpec {
+    Port(u16),
+    Url(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PortSpec {
     Number(u16),
     Full {
-        bind: u16,
-        advertise: u16,
+        /// Absent means don't bind this port at all — e.g. HTTPS terminated by a
+        /// reverse proxy in front of rusthinq, with only `advertise` set so devices
+        /// still get told the right endpoint.
+        #[serde(default)]
+        bind: Option<u16>,
+        #[serde(default)]
+        advertise: Option<AdvertiseSpec>,
         #[serde(default)]
         address: Option<String>,
     },
@@ -43,8 +58,10 @@ pub enum PortSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Port {
-    pub bind: u16,
-    pub advertise: u16,
+    pub bind: Option<u16>,
+    /// `None` means derive from `bind` (and, for an appliance-facing port, the
+    /// connection's own hostname/scheme) rather than advertise anything fixed.
+    pub advertise: Option<AdvertiseSpec>,
     pub address: Option<String>,
 }
 
@@ -52,8 +69,8 @@ impl From<PortSpec> for Port {
     fn from(p: PortSpec) -> Self {
         match p {
             PortSpec::Number(n) => Port {
-                bind: n,
-                advertise: n,
+                bind: Some(n),
+                advertise: None,
                 address: None,
             },
             PortSpec::Full {
@@ -65,6 +82,21 @@ impl From<PortSpec> for Port {
                 advertise,
                 address,
             },
+        }
+    }
+}
+
+impl Port {
+    /// What to tell a connecting device this port is reachable at: an explicit
+    /// `advertise` URL verbatim, `scheme://hostname:port` for an explicit advertise
+    /// port number, or the same derived from `hostname` + `bind` (falling back to
+    /// `default_port` if unbound, e.g. a reverse proxy in front) when `advertise`
+    /// isn't set at all.
+    pub fn advertise_url(&self, scheme: &str, hostname: &str, default_port: u16) -> String {
+        match &self.advertise {
+            Some(AdvertiseSpec::Url(u)) => u.clone(),
+            Some(AdvertiseSpec::Port(p)) => format!("{scheme}://{hostname}:{p}"),
+            None => format!("{scheme}://{hostname}:{}", self.bind.unwrap_or(default_port)),
         }
     }
 }
@@ -86,17 +118,19 @@ pub struct DevicesConfig {
     pub watch: bool,
 }
 
-/// `gui_port`'s shape: either a bare port number (binds `0.0.0.0`, same as every
-/// other listener in this file until `bind_address` in rusthinq-cloud's `main.rs`
-/// started honoring it) or `{ bind, address }` to restrict it to one interface --
-/// e.g. a LAN-only address instead of every interface this host has, including
-/// ones a VPN or container network expose. Deliberately not `PortSpec`
-/// (`https_port`/`mqtts_port` above): those also carry `advertise`, which only
-/// means something for an appliance-facing port a client gets told about (`/route`,
-/// a pairing response) -- nothing here ever advertises `gui_port` to anyone.
+/// A port that's just bound and never advertised to anyone: `gui_port`'s shape
+/// (either a bare port number, binding `0.0.0.0`, or `{ bind, address }` to restrict
+/// it to one interface -- e.g. a LAN-only address instead of every interface this
+/// host has, including ones a VPN or container network expose), and also used for
+/// `http_port` (an optional unencrypted listener alongside `https_port`, for a
+/// reverse proxy that terminates TLS itself). Deliberately not `PortSpec`
+/// (`https_port`/`mqtts_port` above): those also carry
+/// `advertise`, which only means something for an appliance-facing port a client
+/// gets told about (`/route`, a pairing response) -- none of these are ever
+/// advertised to anyone, they're just where rusthinq happens to listen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum GuiPortSpec {
+pub enum PlainPortSpec {
     Number(u16),
     Full {
         bind: u16,
@@ -105,7 +139,7 @@ pub enum GuiPortSpec {
     },
 }
 
-impl GuiPortSpec {
+impl PlainPortSpec {
     pub fn port(&self) -> u16 {
         match self {
             Self::Number(n) => *n,
@@ -127,8 +161,8 @@ impl GuiPortSpec {
 /// client, same as any other tool would -- nothing here is a second control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiConfig {
-    /// See [`GuiPortSpec`].
-    pub gui_port: GuiPortSpec,
+    /// See [`PlainPortSpec`].
+    pub gui_port: PlainPortSpec,
     /// HTTP Basic Auth, checked on every request when both are set (named after
     /// `mqtt_user`/`mqtt_pass` above). Left unset, the dashboard is unauthenticated
     /// -- it binds `0.0.0.0` (or `gui_port`'s `address`, if narrowed) and can
@@ -148,6 +182,16 @@ pub struct RawConfig {
     pub ca_cert_file: String,
     pub https_port: PortSpec,
     pub mqtts_port: PortSpec,
+    /// Optional unencrypted HTTP listener alongside `https_port`, for a reverse proxy
+    /// that terminates TLS itself and forwards plain HTTP here. Absent by default —
+    /// same opt-in-by-presence pattern as `[bridge]`/`[devices]`; without it there's
+    /// no plaintext surface at all.
+    #[serde(default)]
+    pub http_port: Option<PlainPortSpec>,
+    /// Despite the name (kept for config-file compatibility), this is already a
+    /// plain, unencrypted HTTP listener in rusthinq — there's no separate
+    /// `thinq1_http_port` because there's no TLS on this port to offer an
+    /// alternative to.
     #[serde(default)]
     pub thinq1_https_port: Option<PortSpec>,
     #[serde(default)]
@@ -182,6 +226,7 @@ pub struct Config {
     pub ca_cert_file: String,
     pub https_port: Port,
     pub mqtts_port: Port,
+    pub http_port: Option<PlainPortSpec>,
     pub thinq1_https_port: Port,
     pub thinq1_port: Port,
     pub mqtt_enabled: bool,
@@ -230,14 +275,15 @@ pub fn normalize(raw: RawConfig) -> Config {
         ca_cert_file: raw.ca_cert_file,
         https_port: raw.https_port.into(),
         mqtts_port: raw.mqtts_port.into(),
+        http_port: raw.http_port,
         thinq1_https_port: raw.thinq1_https_port.map(Into::into).unwrap_or(Port {
-            bind: 46030,
-            advertise: 46030,
+            bind: Some(46030),
+            advertise: None,
             address: None,
         }),
         thinq1_port: raw.thinq1_port.map(Into::into).unwrap_or(Port {
-            bind: 47878,
-            advertise: 47878,
+            bind: Some(47878),
+            advertise: None,
             address: None,
         }),
         mqtt_enabled: raw.mqtt_enabled.unwrap_or(true),
@@ -283,8 +329,8 @@ mqtt_pass = ""
 "#;
         let cfg = parse_config_text(text).unwrap();
         assert_eq!(cfg.hostname, "rusthinq.local");
-        assert_eq!(cfg.https_port.bind, 443);
-        assert_eq!(cfg.thinq1_https_port.bind, 46030);
+        assert_eq!(cfg.https_port.bind, Some(443));
+        assert_eq!(cfg.thinq1_https_port.bind, Some(46030));
         assert!(cfg.mqtt_enabled);
         assert_eq!(cfg.mqtt.raw_prefix, None);
     }
@@ -305,8 +351,112 @@ mqtt_user = ""
 mqtt_pass = ""
 "#;
         let cfg = parse_config_text(text).unwrap();
-        assert_eq!(cfg.https_port.bind, 4433);
-        assert_eq!(cfg.https_port.advertise, 443);
+        assert_eq!(cfg.https_port.bind, Some(4433));
+        assert_eq!(cfg.https_port.advertise, Some(AdvertiseSpec::Port(443)));
+    }
+
+    #[test]
+    fn advertise_can_be_a_full_url() {
+        let text = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = { bind = 443, advertise = "https://other.machine:8443" }
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        let cfg = parse_config_text(text).unwrap();
+        assert_eq!(
+            cfg.https_port.advertise,
+            Some(AdvertiseSpec::Url("https://other.machine:8443".to_string()))
+        );
+        assert_eq!(
+            cfg.https_port.advertise_url("https", "x", 443),
+            "https://other.machine:8443"
+        );
+    }
+
+    #[test]
+    fn omitting_bind_leaves_a_port_unbound_but_still_advertised() {
+        let text = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = { advertise = 443 }
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        let cfg = parse_config_text(text).unwrap();
+        assert_eq!(cfg.https_port.bind, None);
+        assert_eq!(cfg.https_port.advertise_url("https", "x", 443), "https://x:443");
+    }
+
+    #[test]
+    fn advertise_url_derives_from_bind_when_unset() {
+        let text = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 4433
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        let cfg = parse_config_text(text).unwrap();
+        assert_eq!(cfg.https_port.advertise, None);
+        assert_eq!(cfg.https_port.advertise_url("https", "x", 443), "https://x:4433");
+    }
+
+    #[test]
+    fn http_port_is_absent_by_default_and_settable() {
+        let without = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        let cfg = parse_config_text(without).unwrap();
+        assert!(cfg.http_port.is_none());
+
+        let with = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+http_port = { bind = 80, address = "127.0.0.1" }
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+mqtt_user = ""
+mqtt_pass = ""
+"#;
+        let cfg = parse_config_text(with).unwrap();
+        let http = cfg.http_port.unwrap();
+        assert_eq!(http.port(), 80);
+        assert_eq!(http.address(), Some("127.0.0.1"));
     }
 
     #[test]

@@ -63,8 +63,8 @@ async fn route(State(state): State<T2HttpState>, headers: HeaderMap) -> Json<Val
     Json(json!({
         "resultCode": "0000",
         "result": {
-            "apiServer": format!("https://{host}:{}", state.config.https_port.advertise),
-            "mqttServer": format!("ssl://{host}:{}", state.config.mqtts_port.advertise),
+            "apiServer": state.config.https_port.advertise_url("https", &host, 443),
+            "mqttServer": state.config.mqtts_port.advertise_url("ssl", &host, 8883),
         }
     }))
 }

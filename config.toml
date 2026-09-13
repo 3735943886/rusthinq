@@ -13,9 +13,25 @@ ca_cert_file = "ca.cert" # created on first run if missing
 #   https_port = { bind = 4433, advertise = 443 }
 #   https_port = { bind = 4433, address = "192.168.0.111", advertise = 443 }
 #   https_port = 443
+# `advertise` can also be a full URL instead of just a port, used verbatim -- for a
+# reverse proxy on its own hostname/scheme in front of rusthinq:
+#   https_port = { bind = 4433, advertise = "https://rusthinq.example.com" }
+# Omitting `bind` entirely doesn't listen on that port at all -- for a reverse proxy
+# that terminates HTTPS itself and only needs rusthinq to answer the plain HTTP it
+# forwards (see `http_port` below), while still advertising the right HTTPS endpoint
+# to devices:
+#   https_port = { advertise = 443 }
 # Diverging from the defaults (443 & 8883) may reduce device compatibility.
 https_port = 443
 mqtts_port = 8883
+
+# Optional unencrypted HTTP listener alongside https_port, for a reverse proxy that
+# terminates TLS itself and forwards plain HTTP here. Absent by default -- no
+# plaintext surface exists unless this is set. Takes the same { bind, address } form
+# as gui_port below (no `advertise` -- it answers the same routes as https_port,
+# which is what decides what devices are told).
+# http_port = 80
+# http_port = { bind = 80, address = "127.0.0.1" }
 
 # Used internally for legacy ThinQ1 devices. The defaults should be kept unless
 # there's a specific reason to change them; same { bind, advertise, address } form

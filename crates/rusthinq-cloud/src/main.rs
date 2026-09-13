@@ -64,6 +64,12 @@ fn bind_address(port: &Port) -> String {
     port.address.clone().unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
+/// For the startup banner: a bound port's number, or "off" for one left unbound
+/// (e.g. HTTPS terminated by a reverse proxy in front of rusthinq).
+fn port_display(bind: Option<u16>) -> String {
+    bind.map_or_else(|| "off".to_string(), |p| p.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -136,8 +142,11 @@ async fn main() -> Result<()> {
     logging::log(
         "status",
         &[&format!(
-            "rusthinq-cloud starting hostname={} https={} mqtts={}",
-            config.hostname, config.https_port.bind, config.mqtts_port.bind,
+            "rusthinq-cloud {} starting hostname={} https={} mqtts={}",
+            rusthinq_core::version::REVISION,
+            config.hostname,
+            port_display(config.https_port.bind),
+            port_display(config.mqtts_port.bind),
         )],
     );
 
@@ -407,9 +416,10 @@ async fn main() -> Result<()> {
     };
 
     // MQTTS
-    if let Some(ssl_acceptor) = device_tls.clone() {
+    if let Some(ssl_acceptor) = device_tls.clone()
+        && let Some(port) = config.mqtts_port.bind
+    {
         let b = broker.clone();
-        let port = config.mqtts_port.bind;
         let address = bind_address(&config.mqtts_port);
         tokio::spawn(async move {
             // Outer loop: an `accept()` failure (not a per-connection TLS failure,
@@ -456,13 +466,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Built unconditionally: the plain `http_port` listener below needs it even
+    // when `https_port` itself is unbound (a reverse proxy terminating TLS).
+    let ca_arc = Arc::new(ca.clone());
+    let cfg_arc = Arc::new(config.clone());
+    let t2_router = thinq2::provisioning::routes(cfg_arc, ca_arc);
+
     // HTTPS ThinQ2 provisioning (/route, certificate, …)
-    if let Some(ssl_acceptor) = device_tls.clone() {
-        let port = config.https_port.bind;
+    if let Some(ssl_acceptor) = device_tls.clone()
+        && let Some(port) = config.https_port.bind
+    {
         let address = bind_address(&config.https_port);
-        let ca = Arc::new(ca.clone());
-        let cfg = Arc::new(config.clone());
-        let router = thinq2::provisioning::routes(cfg, ca.clone());
+        let router = t2_router.clone();
         let firmware_hosts = firmware_hosts.clone();
         tokio::spawn(async move {
             // Outer loop: rebind if `accept()` itself ever fails, instead of
@@ -556,9 +571,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Optional plain HTTP alongside HTTPS ThinQ2 provisioning, for a reverse proxy
+    // that terminates TLS itself and forwards plain HTTP here (anszom/rethink#174).
+    // Absent by default -- no plaintext surface exists unless `http_port` is set.
+    if let Some(spec) = &config.http_port {
+        let port = spec.port();
+        let address = spec.address().unwrap_or("0.0.0.0").to_string();
+        let router = t2_router.clone();
+        tokio::spawn(async move {
+            loop {
+                let listener = bind_with_retry("HTTP", &address, port).await;
+                logging::log("status", &[&format!("HTTP listening on {address}:{port}")]);
+                if let Err(e) = axum::serve(listener, router.clone()).await {
+                    tracing::error!("HTTP ended: {e} (rebinding)");
+                }
+            }
+        });
+    }
+
     // ThinQ1 HTTP
-    {
-        let port = config.thinq1_https_port.bind;
+    if let Some(port) = config.thinq1_https_port.bind {
         let address = bind_address(&config.thinq1_https_port);
         let meta = thinq1::http::device_metadata_store();
         let router = thinq1::http::routes(meta.clone());
@@ -584,8 +616,7 @@ async fn main() -> Result<()> {
     }
 
     // ThinQ1 device TCP port
-    {
-        let port = config.thinq1_port.bind;
+    if let Some(port) = config.thinq1_port.bind {
         let address = bind_address(&config.thinq1_port);
         let meta = thinq1::http::device_metadata_store();
         let acceptor = thinq1::device::DeviceAcceptor::new(meta, manager.clone());
