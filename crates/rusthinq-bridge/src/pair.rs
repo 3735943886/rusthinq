@@ -203,8 +203,12 @@ pub async fn pair_thinq2(
         .ok_or_else(|| anyhow::anyhow!("missing mqttServer"))?
         .to_string();
 
+    // Fetched from the region-correct `api_server` (not the fixed `IOT_BASE_URL`),
+    // matching the actual device's behavior: `common.lgthinq.com` returns a root
+    // certificate that only matches some regions' servers (anszom/rethink#commit
+    // 980b42e).
     let ca_resp = api_fetch_json(
-        &format!("{IOT_BASE_URL}/route/certificate?name=aws-iot"),
+        &format!("{api_server}/route/certificate?name=aws-iot"),
         "GET",
         &[("accept", "application/json")],
         None,

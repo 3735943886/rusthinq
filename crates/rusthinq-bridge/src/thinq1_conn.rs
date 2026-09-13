@@ -209,13 +209,14 @@ async fn connect_once(
     device_type: Option<&str>,
     extra_trust_root: Option<CertificateDer<'static>>,
 ) -> anyhow::Result<(ReadHalf<TlsHalf>, WriteHalf<TlsHalf>)> {
-    let _ = reqwest::Client::builder()
+    let total_device_info_url = format!(
+        "{}/lgehadm/api/Device/TotalDeviceInfoSvc",
+        state.http_server.trim_end_matches('/')
+    );
+    if let Err(e) = reqwest::Client::builder()
         .timeout(RTI_CONNECT_TIMEOUT)
         .build()?
-        .post(format!(
-            "{}/lgehadm/api/Device/TotalDeviceInfoSvc",
-            state.http_server.trim_end_matches('/')
-        ))
+        .post(&total_device_info_url)
         .header("Accept", "text/xml")
         .header("content-type", "text/xml;charset=utf-8")
         .header("x-lgedm-userid", "lgehadmUser")
@@ -232,7 +233,13 @@ async fn connect_once(
              <elementValue>Y</elementValue></elementList></itemList></lgedmRoot>"
         ))
         .send()
-        .await;
+        .await
+    {
+        rusthinq_core::logging::log(
+            "bridge",
+            &[&format!("Failed to fetch {total_device_info_url}: {e}")],
+        );
+    }
 
     rusthinq_core::logging::log(
         "bridge",

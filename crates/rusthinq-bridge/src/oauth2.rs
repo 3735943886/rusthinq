@@ -70,6 +70,16 @@ pub async fn signed_request(
             )
             .body(b.to_string());
     }
+    match send_and_parse(req).await {
+        Ok(val) => Ok(val),
+        Err(e) => {
+            rusthinq_core::logging::log("bridge", &[&format!("Failed to fetch {url}: {e}")]);
+            Err(e)
+        }
+    }
+}
+
+async fn send_and_parse(req: reqwest::RequestBuilder) -> anyhow::Result<serde_json::Value> {
     let resp = req.send().await?;
     let val = resp.json().await?;
     Ok(val)

@@ -137,6 +137,7 @@ impl Client {
                     return Ok(out.get("result").cloned().unwrap_or(Value::Null));
                 }
                 Err(e) => {
+                    rusthinq_core::logging::log("bridge", &[&format!("Error fetching {url}: {e}")]);
                     last_err = Some(e);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
