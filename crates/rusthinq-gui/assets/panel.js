@@ -287,9 +287,9 @@ function connect() {
     ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
             const json = JSON.parse(ev.data)
-            if (typeof json.revision === 'string') {
+            if (typeof json.version === 'string') {
                 // one in the header bar, one under the title on a narrow screen
-                document.querySelectorAll('.revision').forEach((el) => (el.innerText = json.revision))
+                document.querySelectorAll('.version').forEach((el) => (el.innerText = 'v' + json.version))
             }
 
             if (typeof json.mqtt === 'boolean') {

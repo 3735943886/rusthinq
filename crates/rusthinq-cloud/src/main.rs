@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
         "status",
         &[&format!(
             "rusthinq-cloud {} starting hostname={} https={} mqtts={}",
-            rusthinq_core::version::REVISION,
+            rusthinq_core::version::VERSION,
             config.hostname,
             port_display(config.https_port.bind),
             port_display(config.mqtts_port.bind),

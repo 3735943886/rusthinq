@@ -354,7 +354,7 @@ fn main() {
                     json!({
                         "protocolVersion": "2024-11-05",
                         "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "rusthinq-mcp", "version": "0.1.0" }
+                        "serverInfo": { "name": "rusthinq-mcp", "version": env!("CARGO_PKG_VERSION") }
                     }),
                 );
             }
