@@ -260,9 +260,12 @@ impl Client {
         // temporary override for this call
         let saved = self.headers.clone();
         self.headers = h;
-        let _ = self
+        if let Err(e) = self
             .api_fetch(&format!("{thinq2}/service/users/client"), "POST", None)
-            .await;
+            .await
+        {
+            rusthinq_core::logging::log("bridge", &[&format!("Register client failed: {e}")]);
+        }
         self.headers = saved;
 
         let homes = self
