@@ -32,6 +32,12 @@ pub struct Thinq1Handle {
     device_id: String,
     last_state: Arc<rusthinq_util::sync::Mutex<Option<Vec<u8>>>>,
     stopped: Arc<AtomicBool>,
+    /// Wakes `run_session`'s `tokio::select!` the instant `stop()` is called. Without
+    /// this, `stopped` was only re-checked when the select loop woke on its own —
+    /// incoming socket data or an outgoing write — so a quiet appliance's only
+    /// guaranteed wakeup was the 60s keep-alive tick, leaving the old TLS session to
+    /// LG's real RTI server open for up to a minute after `stop()`.
+    stop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Thinq1Handle {
@@ -58,6 +64,7 @@ impl Thinq1Handle {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.stop_notify.notify_one();
     }
 }
 
@@ -96,6 +103,7 @@ async fn connect_thinq1_impl(
     let (from_lg_tx, from_lg_rx) = mpsc::unbounded_channel();
     let is_live = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(tokio::sync::Notify::new());
     let last_state = Arc::new(rusthinq_util::sync::Mutex::new(None::<Vec<u8>>));
 
     // Alive, every 60s for the life of the handle (reconnects reuse the same
@@ -130,6 +138,7 @@ async fn connect_thinq1_impl(
         device_id: device_id.to_string(),
         last_state: last_state.clone(),
         stopped: stopped.clone(),
+        stop_notify: stop_notify.clone(),
     };
 
     let state = state.clone();
@@ -182,6 +191,7 @@ async fn connect_thinq1_impl(
                 &write_tx,
                 &from_lg_tx,
                 &stopped,
+                &stop_notify,
             )
             .await;
             if stopped.load(Ordering::SeqCst) {
@@ -290,6 +300,7 @@ async fn run_session(
     write_tx: &mpsc::UnboundedSender<Vec<u8>>,
     from_lg_tx: &mpsc::UnboundedSender<serde_json::Value>,
     stopped: &AtomicBool,
+    stop_notify: &tokio::sync::Notify,
 ) {
     let mut splitter = Splitter::new(1_000_000);
     let mut buf = [0u8; 8192];
@@ -298,6 +309,12 @@ async fn run_session(
             return;
         }
         tokio::select! {
+            // Otherwise `stopped` above is only re-checked when the socket or
+            // write_rx happens to wake this select on its own — for a quiet
+            // appliance, that could be up to 60s away (the next keep-alive tick).
+            _ = stop_notify.notified() => {
+                return;
+            }
             res = reader.read(&mut buf) => {
                 match res {
                     Ok(0) | Err(_) => {
@@ -520,6 +537,65 @@ mod reconnect_tests {
             accept_count.load(Ordering::SeqCst),
             2,
             "client must reconnect after the upstream drops the connection"
+        );
+    }
+
+    /// #28: `stop()` only set an `AtomicBool` that `run_session`'s select loop re-checked
+    /// solely when it woke on its own -- incoming data or an outgoing write. For a quiet
+    /// session, the only guaranteed wakeup was the 60s keep-alive tick, so the old TLS
+    /// session to LG's real RTI server could stay open for up to a minute after `stop()`.
+    #[tokio::test]
+    async fn stop_closes_the_connection_promptly_instead_of_waiting_for_keepalive() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acceptor, cert_der) = test_tls_acceptor();
+
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut buf = [0u8; 512];
+            // Drain the initial "Alive" frame, then wait to observe the client
+            // side actually closing the connection.
+            loop {
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        let _ = closed_tx.send(());
+                        return;
+                    }
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let state = Thinq1DeviceState {
+            rti_server: format!("localhost:{port}"),
+            http_server: "http://127.0.0.1:1".to_string(),
+        };
+
+        let (handle, _from_lg) =
+            connect_thinq1_impl(&state, "dev-stop-test", "MODEL", None, Some(cert_der))
+                .await
+                .expect("initial connect must succeed");
+
+        // Let run_session actually drain the initial "Alive" frame and settle into
+        // select with nothing pending — the point of this test is that stop() wakes
+        // a select that's already idling, not one that hasn't started yet.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        handle.stop();
+
+        let closed = tokio::time::timeout(Duration::from_secs(3), closed_rx).await;
+        assert!(
+            closed.is_ok(),
+            "stop() must close the TLS session within a few seconds, not leave it open \
+             until the next 60s keep-alive tick"
         );
     }
 }
