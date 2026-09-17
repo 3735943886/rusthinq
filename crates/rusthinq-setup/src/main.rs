@@ -196,13 +196,6 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
     let mut stream = connect_tls(host, 5500).await?;
     println!("TLS connection established");
 
-    let mut send = |obj: serde_json::Value| -> Result<()> {
-        // can't easily do this with mut closure and async — use helper below
-        let _ = obj;
-        Ok(())
-    };
-    let _ = &mut send;
-
     async fn write_json(
         stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
         obj: &serde_json::Value,
