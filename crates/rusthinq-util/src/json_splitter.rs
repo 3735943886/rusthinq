@@ -24,6 +24,13 @@ pub struct Splitter {
     state: u8,
     depth: i32,
     buf: Vec<u8>,
+    /// Set on the first error and never cleared — mirrors
+    /// [`crate::length_prefixed_frame::Splitter`]'s `failed` flag. Without this, an
+    /// error (too many closing tokens, or a value that looked complete by brace depth
+    /// but didn't actually parse) left `buf` untouched, so a caller that kept feeding
+    /// bytes after an error would keep pushing onto `buf` forever with nothing ever
+    /// clearing it.
+    failed: bool,
 }
 
 impl Default for Splitter {
@@ -38,11 +45,18 @@ impl Splitter {
             state: 0,
             depth: 0,
             buf: Vec::new(),
+            failed: false,
         }
     }
 
-    /// Feed one byte. On complete top-level JSON value, returns Some(Value).
+    /// Feed one byte. On complete top-level JSON value, returns Some(Value). Once an
+    /// error has occurred, every further call is a no-op returning `Ok(None)` — this
+    /// splitter cannot resync on its own, so nothing accumulates in `buf` past that
+    /// point.
     pub fn feed(&mut self, byte: u8) -> Result<Option<Value>, JsonSplitError> {
+        if self.failed {
+            return Ok(None);
+        }
         self.buf.push(byte);
         let mut result = None;
 
@@ -55,12 +69,20 @@ impl Splitter {
                 // ] }
                 self.depth -= 1;
                 if self.depth < 0 {
+                    self.failed = true;
+                    self.buf.clear();
                     return Err(JsonSplitError::TooManyClosing);
                 }
                 if self.depth == 0 {
                     let s = String::from_utf8_lossy(&self.buf);
-                    let val: Value = serde_json::from_str(&s)
-                        .map_err(|e| JsonSplitError::Parse(e.to_string()))?;
+                    let val: Value = match serde_json::from_str(&s) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.failed = true;
+                            self.buf.clear();
+                            return Err(JsonSplitError::Parse(e.to_string()));
+                        }
+                    };
                     self.buf.clear();
                     result = Some(val);
                 }
@@ -155,5 +177,29 @@ mod tests {
             }
         }
         assert_eq!(err, Some(JsonSplitError::TooManyClosing));
+    }
+
+    /// #33: an error used to leave `buf` untouched and there was no latched failure
+    /// state, so a caller that kept feeding bytes after an error would keep pushing
+    /// onto `buf` forever with nothing ever clearing it. Mirrors
+    /// `length_prefixed_frame::Splitter`'s `failed` flag.
+    #[test]
+    fn error_latches_and_clears_the_buffer_instead_of_accumulating_forever() {
+        let mut split = Splitter::new();
+        for byte in b"{}}" {
+            let _ = split.feed(*byte);
+        }
+        assert!(
+            split.buf.is_empty(),
+            "buf must be cleared once the splitter has failed"
+        );
+
+        for _ in 0..10_000 {
+            assert_eq!(split.feed(b'{').unwrap(), None);
+        }
+        assert!(
+            split.buf.is_empty(),
+            "a failed splitter must never accumulate bytes fed to it afterward"
+        );
     }
 }

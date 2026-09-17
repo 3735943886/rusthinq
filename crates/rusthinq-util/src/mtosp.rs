@@ -45,6 +45,12 @@ pub struct Splitter {
     prev: u8,
     total: i32,
     buf: Vec<u8>,
+    /// Set on the first error and never cleared — mirrors
+    /// [`crate::length_prefixed_frame::Splitter`]'s `failed` flag. Without this, a bad
+    /// byte returned `Err` but left `state`/`buf` exactly as they were, so a caller that
+    /// kept feeding bytes after an error (to resync past one or two bad ones, say) would
+    /// keep pushing onto `buf` forever with nothing ever clearing it.
+    failed: bool,
 }
 
 impl Default for Splitter {
@@ -60,17 +66,25 @@ impl Splitter {
             prev: 0,
             total: 0,
             buf: Vec::new(),
+            failed: false,
         }
     }
 
-    /// Feed one byte. On complete frame, returns Some(xml_payload).
+    /// Feed one byte. On complete frame, returns Some(xml_payload). Once an error has
+    /// occurred, every further call is a no-op returning `Ok(None)` — this splitter
+    /// cannot resync on its own, so nothing accumulates in `buf` past that point.
     pub fn feed(&mut self, byte: u8) -> Result<Option<String>, MtospError> {
+        if self.failed {
+            return Ok(None);
+        }
         self.buf.push(byte);
         let mut result = None;
 
         match self.state {
             0 => {
                 if byte != 0xaa {
+                    self.failed = true;
+                    self.buf.clear();
                     return Err(MtospError::InvalidHeader);
                 }
                 self.state = 1;
@@ -91,12 +105,16 @@ impl Splitter {
             }
             4 => {
                 if crc16(&self.buf) != 0 {
+                    self.failed = true;
+                    self.buf.clear();
                     return Err(MtospError::InvalidChecksum);
                 }
                 self.state = 5;
             }
             5 => {
                 if byte != 0xbb {
+                    self.failed = true;
+                    self.buf.clear();
                     return Err(MtospError::InvalidTrailer);
                 }
                 self.state = 0;
@@ -148,6 +166,30 @@ mod tests {
     fn bad_header_byte() {
         let mut split = Splitter::new();
         assert_eq!(split.feed(0x00).unwrap_err(), MtospError::InvalidHeader);
+    }
+
+    /// #33: an error used to leave `buf` untouched and `failed` didn't exist at all, so
+    /// a caller that kept feeding bytes after an error (attempting to resync past a bad
+    /// byte or two, say) would keep pushing onto `buf` forever with nothing ever
+    /// clearing it. Mirrors `length_prefixed_frame::Splitter`'s `failed` flag.
+    #[test]
+    fn error_latches_and_clears_the_buffer_instead_of_accumulating_forever() {
+        let mut split = Splitter::new();
+        assert_eq!(split.feed(0x00).unwrap_err(), MtospError::InvalidHeader);
+        assert!(
+            split.buf.is_empty(),
+            "buf must be cleared once the splitter has failed"
+        );
+
+        // Keep feeding well past any real frame's size — none of it must accumulate,
+        // and no further Err (or Some) should surface once latched.
+        for _ in 0..10_000 {
+            assert_eq!(split.feed(0xaa).unwrap(), None);
+        }
+        assert!(
+            split.buf.is_empty(),
+            "a failed splitter must never accumulate bytes fed to it afterward"
+        );
     }
 
     #[test]
