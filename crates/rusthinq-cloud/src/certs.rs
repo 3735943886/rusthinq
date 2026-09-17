@@ -434,6 +434,78 @@ pub async fn sign_csr(ca: &Ca, csr_pem: &str) -> Result<String> {
         .to_string())
 }
 
+/// Cap on `openssl` child processes [`sign_csr_gated`] lets run at once. `/device/{id}
+/// /certificate` (this gate's only caller) is reachable by anyone who completes the
+/// legacy TLS handshake -- `device_ssl_acceptor` sets `SslVerifyMode::NONE` -- with no
+/// other check in front of it, so nothing but this cap stood between that endpoint and
+/// unbounded PID/FD exhaustion from a flood of requests, or just one device stuck in a
+/// reconnect/re-provisioning loop.
+const MAX_CONCURRENT_SIGNS: usize = 4;
+
+/// How long a signed cert is reused for a repeat of the exact same device+CSR, instead
+/// of spawning `openssl` again. A device stuck in a reconnect loop resends the identical
+/// CSR it already has a valid cert for; there is no reason to re-sign it every time.
+const SIGN_DEDUPE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Bounds and dedupes concurrent [`sign_csr`] calls -- see [`MAX_CONCURRENT_SIGNS`] and
+/// [`SIGN_DEDUPE_WINDOW`]. One instance is shared (via `Arc`) across every request the
+/// HTTPS provisioning routes handle.
+pub struct CsrGate {
+    permits: tokio::sync::Semaphore,
+    recent: Mutex<HashMap<(String, u64), (std::time::Instant, String)>>,
+}
+
+impl CsrGate {
+    pub fn new() -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIGNS),
+            recent: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for CsrGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn hash_csr(csr_pem: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    csr_pem.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// [`sign_csr`], but bounded by `gate`'s concurrency cap and short-circuited when
+/// `device_id` already re-sent the same CSR within [`SIGN_DEDUPE_WINDOW`].
+pub async fn sign_csr_gated(
+    ca: &Ca,
+    device_id: &str,
+    csr_pem: &str,
+    gate: &CsrGate,
+) -> Result<String> {
+    let key = (device_id.to_string(), hash_csr(csr_pem));
+    let now = std::time::Instant::now();
+    {
+        let mut recent = gate.recent.lock();
+        recent.retain(|_, (issued, _)| now.duration_since(*issued) < SIGN_DEDUPE_WINDOW);
+        if let Some((_, pem)) = recent.get(&key) {
+            return Ok(pem.clone());
+        }
+    }
+    let _permit = gate
+        .permits
+        .acquire()
+        .await
+        .context("CSR signing gate closed")?;
+    let pem = sign_csr(ca, csr_pem).await?;
+    gate.recent
+        .lock()
+        .insert(key, (std::time::Instant::now(), pem.clone()));
+    Ok(pem)
+}
+
 /// Test-only helpers shared across this crate — real (non-mock) CA material without
 /// the tens-of-seconds cost of `load_or_create`'s `openssl req -newkey rsa:4096` path.
 #[cfg(test)]
@@ -554,6 +626,97 @@ mod tests {
     fn cert_covers_hostname_rejects_unparseable_input() {
         assert!(!cert_covers_hostname("not a cert", "anything"));
         assert!(!cert_covers_hostname("", "anything"));
+    }
+
+    fn test_csr_pem() -> String {
+        let key = KeyPair::generate().expect("generate CSR key");
+        let params =
+            CertificateParams::new(vec!["device.local".to_string()]).expect("build CSR params");
+        params
+            .serialize_request(&key)
+            .expect("serialize CSR")
+            .pem()
+            .expect("CSR to PEM")
+    }
+
+    /// #26: `/device/{id}/certificate` spawned a real `openssl` subprocess per request
+    /// with no cap and no dedupe, reachable by anyone who completes the (verify-none)
+    /// legacy TLS handshake -- a device stuck in a reconnect loop, or a flood of
+    /// requests, could exhaust host PIDs/FDs.
+    #[tokio::test]
+    async fn sign_csr_gated_reuses_a_recent_signature_for_the_same_device_and_csr() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let gate = CsrGate::new();
+        let csr = test_csr_pem();
+
+        let first = sign_csr_gated(&ca, "dev-1", &csr, &gate)
+            .await
+            .expect("first sign must succeed");
+        let second = sign_csr_gated(&ca, "dev-1", &csr, &gate)
+            .await
+            .expect("second sign must succeed");
+        assert_eq!(
+            first, second,
+            "a device re-sending the exact CSR it already has a cert for must get the \
+             cached signature back, not a freshly (re-)signed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_csr_gated_does_not_share_a_cached_signature_across_devices() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let gate = CsrGate::new();
+        let csr = test_csr_pem();
+
+        let a = sign_csr_gated(&ca, "dev-a", &csr, &gate)
+            .await
+            .expect("dev-a sign must succeed");
+        let b = sign_csr_gated(&ca, "dev-b", &csr, &gate)
+            .await
+            .expect("dev-b sign must succeed");
+        assert_ne!(
+            a, b,
+            "two different devices must not share one cached signature even if their \
+             CSRs happen to be byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_csr_gated_blocks_until_a_permit_is_free() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let gate = CsrGate::new();
+        let csr = test_csr_pem();
+
+        // Hold every permit the gate has, so a fresh (uncached) sign has nowhere to go.
+        let held = gate
+            .permits
+            .acquire_many(MAX_CONCURRENT_SIGNS as u32)
+            .await
+            .expect("must be able to acquire every permit up front");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            sign_csr_gated(&ca, "dev-blocked", &csr, &gate),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "sign_csr_gated must not spawn openssl while every permit is held"
+        );
+
+        drop(held);
+        let unblocked = tokio::time::timeout(
+            Duration::from_secs(10),
+            sign_csr_gated(&ca, "dev-blocked", &csr, &gate),
+        )
+        .await;
+        assert!(
+            matches!(unblocked, Ok(Ok(_))),
+            "sign_csr_gated must proceed once a permit is released"
+        );
     }
 
     /// Handshake as a client presenting `sni`, trusting `ca`; returns the leaf the server

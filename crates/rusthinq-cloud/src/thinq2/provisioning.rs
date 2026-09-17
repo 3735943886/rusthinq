@@ -1,6 +1,6 @@
 //! ThinQ2 HTTPS provisioning routes (/route, certificates).
 
-use crate::certs::{Ca, is_plausible_hostname, sign_csr};
+use crate::certs::{Ca, CsrGate, is_plausible_hostname, sign_csr_gated};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -15,10 +15,15 @@ use std::sync::Arc;
 pub struct T2HttpState {
     pub config: Arc<Config>,
     pub ca: Arc<Ca>,
+    pub csr_gate: Arc<CsrGate>,
 }
 
 pub fn routes(config: Arc<Config>, ca: Arc<Ca>) -> Router {
-    let state = T2HttpState { config, ca };
+    let state = T2HttpState {
+        config,
+        ca,
+        csr_gate: Arc::new(CsrGate::new()),
+    };
     Router::new()
         .route("/route", get(route))
         .route("/route/certificate", get(route_certificate))
@@ -105,14 +110,14 @@ struct CsrBody {
 /// shows up later as some unrelated failure on the appliance.
 async fn device_certificate(
     State(state): State<T2HttpState>,
-    Path(_device_id): Path<String>,
+    Path(device_id): Path<String>,
     Json(body): Json<CsrBody>,
 ) -> Response {
     if !body.csr.contains("CERTIFICATE REQUEST") {
         tracing::warn!("device_certificate: request carried no CSR");
         return Json(json!({ "resultCode": "9999" })).into_response();
     }
-    match sign_csr(&state.ca, &body.csr).await {
+    match sign_csr_gated(&state.ca, &device_id, &body.csr, &state.csr_gate).await {
         Ok(pem) => Json(json!({
             "resultCode": "0000",
             "result": { "certificatePem": pem }
@@ -248,6 +253,7 @@ mod tests {
         T2HttpState {
             config: Arc::new(test_config(false)),
             ca: Arc::new(ca),
+            csr_gate: Arc::new(CsrGate::new()),
         }
     }
 
