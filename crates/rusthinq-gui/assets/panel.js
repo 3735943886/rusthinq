@@ -28,14 +28,15 @@ let bridge_status = false
 // regardless of the device itself. Set from the first `features` snapshot.
 let deviceMappingCapable = false
 
-// Renders one arrow in the Browser<->rusthinq-gui<->MQTT chain: `connected` true/false
-// draws it as a green "up" link or a broken-link icon; `null` (not known yet, e.g.
-// before the very first status arrives) draws the same "unknown" icon the other status
-// fields start as.
+// Renders one link in the Browser<->rusthinq<->MQTT chain: `connected` true/false
+// draws a matching pair -- a green "link" icon when up, a red "link_off" (broken
+// chain) icon when not -- rather than an arrow character that would only change
+// color; `null` (not known yet, e.g. before the very first status arrives) draws
+// the same "unknown" icon the other status fields start as.
 function setConnArrow(id, connected) {
     const el = get(id)
     if (connected === true) {
-        el.innerHTML = '↔'
+        el.innerHTML = `<i class="tiny material-icons green-text" style="vertical-align:middle">link</i>`
         el.className = 'conn-arrow conn-ok'
     } else if (connected === false) {
         el.innerHTML = `<i class="tiny material-icons red-text" style="vertical-align:middle">link_off</i>`
