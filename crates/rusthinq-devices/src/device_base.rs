@@ -461,7 +461,17 @@ impl TlvDeviceCore {
         };
 
         let num = match &value {
-            PropertyValue::Int(i) => *i as u32,
+            // `as u32` on an out-of-range i64 wraps (two's complement), turning e.g. a
+            // -1 "invalid"/"unset" sentinel into 4294967295 instead of being rejected.
+            // `try_from` catches that instead of silently sending a huge unsigned value
+            // to the appliance.
+            PropertyValue::Int(i) => match u32::try_from(*i) {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!("Attempting to set property {prop} to out-of-range value {i}");
+                    return;
+                }
+            },
             PropertyValue::Num(n) => *n as u32,
             PropertyValue::Str(s) => match s.parse::<u32>() {
                 Ok(n) => n,
@@ -621,6 +631,38 @@ mod tests {
         assert!(
             !thinq.outbox().is_empty(),
             "expected at least one periodic re-query to have been sent"
+        );
+    }
+
+    /// #35: `PropertyValue::Int(i) as u32` silently wraps a negative `i` via two's
+    /// complement (e.g. -1i64 as u32 -> 4294967295) instead of being rejected.
+    /// Currently unreachable (no native device handler exists yet in this fork to
+    /// produce a negative `write_xform` sentinel), but latent for whoever adds the
+    /// first one.
+    #[test]
+    fn set_property_rejects_an_out_of_range_negative_int_instead_of_wrapping() {
+        use rusthinq_core::MockMqttConnection;
+        use rusthinq_core::thinq::MockThinq2Device;
+
+        let mqtt = MockMqttConnection::new();
+        let thinq = MockThinq2Device::new("dev-1", rusthinq_core::Metadata::new("X", "X", "1.0"));
+        let core = TlvDeviceCore::new(mqtt, thinq);
+
+        // Simulates a native handler whose write_xform hands back an
+        // "invalid"/"unset" sentinel as a negative Int.
+        let field = FieldDefinition {
+            write_xform: Some(Box::new(|_| Some(PropertyValue::Int(-1)))),
+            ..FieldDefinition::new("comp", "prop").with_id(0x1234)
+        };
+        core.add_field(field);
+
+        core.set_property("comp-prop", "anything");
+
+        assert_eq!(
+            core.raw_clip_state.lock().get(&0x1234),
+            None,
+            "an out-of-range Int must be rejected, not wrapped into a huge u32 and sent \
+             to the appliance"
         );
     }
 }
