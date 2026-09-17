@@ -48,6 +48,7 @@ axum = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
+x509-parser = { workspace = true }
 # Device-facing HTTPS/MQTTS need legacy CBC-SHA / TLS1.0 for RTK_RTL8711am (PR#131).
 # rustls deliberately omits those suites; OpenSSL matches the Node device_tls profile.
 # vendored: builds OpenSSL from source instead of linking the build host's

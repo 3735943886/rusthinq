@@ -40,12 +40,15 @@ pub fn load_or_create(hostname: &str, key_path: &Path, cert_path: &Path) -> Resu
 fn try_load(hostname: &str, key_path: &Path, cert_path: &Path) -> Result<Ca> {
     let key_pem = fs::read_to_string(key_path).context("read ca key")?;
     let cert_pem = fs::read_to_string(cert_path).context("read ca cert")?;
-    // Soft check: CN should match hostname (best-effort; PEM subject parse is light).
-    if !cert_pem.contains(hostname) {
-        // Still accept if openssl subject encoding differs; only force recreate when empty.
-        if cert_pem.is_empty() {
-            bail!("empty cert");
-        }
+    if !cert_covers_hostname(&cert_pem, hostname) {
+        rusthinq_core::logging::log(
+            "status",
+            &[&format!(
+                "Existing CA certificate at {} does not cover hostname {hostname:?}; recreating it",
+                cert_path.display()
+            )],
+        );
+        bail!("CA certificate subject/SAN does not match hostname {hostname:?}");
     }
     Ok(Ca {
         key_pem,
@@ -53,6 +56,39 @@ fn try_load(hostname: &str, key_path: &Path, cert_path: &Path) -> Result<Ca> {
         key_path: key_path.to_path_buf(),
         cert_path: cert_path.to_path_buf(),
     })
+}
+
+/// Whether `cert_pem`'s subject CommonName or a subjectAltName DNSName equals
+/// `hostname` exactly. Both the openssl path (`-subj "/CN={hostname}"`, no SAN) and
+/// the rcgen path (CN plus a DNSName SAN) set the CA up this way, so either match is
+/// accepted. A cert that fails to parse counts as not matching, forcing recreation
+/// rather than silently trusting unreadable bytes.
+fn cert_covers_hostname(cert_pem: &str, hostname: &str) -> bool {
+    let Ok(ders) = rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    let Some(der) = ders.first() else {
+        return false;
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+        return false;
+    };
+    let cn_matches = cert
+        .subject()
+        .iter_common_name()
+        .any(|cn| cn.as_str() == Ok(hostname));
+    let san_matches = cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|san| {
+            san.value
+                .general_names
+                .iter()
+                .any(|name| matches!(name, x509_parser::extensions::GeneralName::DNSName(n) if *n == hostname))
+        });
+    cn_matches || san_matches
 }
 
 fn create_with_openssl(hostname: &str, key_path: &Path, cert_path: &Path) -> Result<()> {
@@ -474,6 +510,50 @@ mod tests {
         assert!(!is_plausible_hostname("10.1.1.45"));
         assert!(!is_plausible_hostname("::1"));
         assert!(!is_plausible_hostname("2001:db8::1"));
+    }
+
+    /// #25: the hostname-mismatch check in `try_load` used to be inert — it only
+    /// bailed when the cert PEM was empty, so a CA created for one hostname kept
+    /// being loaded and served under a different configured hostname forever, with
+    /// no recreation and no warning.
+    #[test]
+    fn try_load_accepts_a_cert_whose_cn_and_san_match_hostname() {
+        let (key_path, cert_path) = temp_ca_paths();
+        fast_test_ca("rusthinq.local", &key_path, &cert_path);
+        assert!(try_load("rusthinq.local", &key_path, &cert_path).is_ok());
+    }
+
+    #[test]
+    fn try_load_rejects_a_cert_created_for_a_different_hostname() {
+        let (key_path, cert_path) = temp_ca_paths();
+        fast_test_ca("old-hostname.local", &key_path, &cert_path);
+        assert!(
+            try_load("new-hostname.local", &key_path, &cert_path).is_err(),
+            "changing the configured hostname must force recreation instead of \
+             silently reusing the stale CA under the new name"
+        );
+    }
+
+    #[test]
+    fn cert_covers_hostname_matches_cn_only_certs_like_the_openssl_path() {
+        // Mimics `openssl req -subj "/CN={hostname}"`: CN set, no SAN extension —
+        // unlike create_with_rcgen's CA, which also sets a DNSName SAN.
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "cn-only.local");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        assert!(cert_covers_hostname(&cert.pem(), "cn-only.local"));
+        assert!(!cert_covers_hostname(&cert.pem(), "other.local"));
+    }
+
+    #[test]
+    fn cert_covers_hostname_rejects_unparseable_input() {
+        assert!(!cert_covers_hostname("not a cert", "anything"));
+        assert!(!cert_covers_hostname("", "anything"));
     }
 
     /// Handshake as a client presenting `sni`, trusting `ca`; returns the leaf the server
