@@ -686,11 +686,7 @@ impl Bridge {
                 if stop_l.load(Ordering::SeqCst) {
                     return;
                 }
-                let h = h.clone();
-                let data = buf.to_vec();
-                tokio::spawn(async move {
-                    let _ = h.send_from_local(&data).await;
-                });
+                h.send_from_local(buf);
             }));
 
             // The appliance's answer to a cmd the cloud relayed down (e.g.

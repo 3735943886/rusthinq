@@ -31,3 +31,4 @@ rustls-native-certs = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
+bytes = { workspace = true }
