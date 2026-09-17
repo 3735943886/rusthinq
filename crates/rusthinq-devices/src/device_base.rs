@@ -443,11 +443,11 @@ impl TlvDeviceCore {
     pub fn set_property(&self, prop: &str, mqtt_value: &str) {
         let def = self.fields_by_ha.lock().get(prop).cloned();
         let Some(def) = def else {
-            eprintln!("Attempting to set property {prop} which is not writable");
+            tracing::warn!("Attempting to set unknown property {prop}");
             return;
         };
         if !def.writable {
-            eprintln!("Attempting to set property {prop} which is not writable");
+            tracing::warn!("Attempting to set read-only property {prop}");
             return;
         }
 
