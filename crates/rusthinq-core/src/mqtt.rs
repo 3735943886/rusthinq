@@ -230,7 +230,7 @@ fn load_published_topics(path: &std::path::Path) -> HashMap<String, DeviceTopicS
 fn save_published_topics(path: &std::path::Path, topics: &HashMap<String, DeviceTopicState>) {
     match serde_json::to_string(topics) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
+            if let Err(e) = crate::atomic_file::write(path, json.as_bytes()) {
                 tracing::warn!(
                     target: "rusthinq_mqtt",
                     error = %e,

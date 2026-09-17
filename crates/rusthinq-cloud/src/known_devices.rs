@@ -133,7 +133,7 @@ impl KnownDevices {
         let entries = self.entries.lock();
         match serde_json::to_string(&*entries) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = rusthinq_core::atomic_file::write(path, json.as_bytes()) {
                     tracing::warn!(
                         error = %e,
                         path = %path.display(),
@@ -149,10 +149,25 @@ impl KnownDevices {
 }
 
 fn load(path: &std::path::Path) -> HashMap<String, KnownDevice> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "known-devices state file is corrupt, starting from an empty ledger"
+            );
+            HashMap::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::default(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to read known-devices state, starting from an empty ledger"
+            );
+            HashMap::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +239,31 @@ mod tests {
         let all = restarted.all();
         assert_eq!(all.len(), 1);
         assert_eq!(all["dev-1"].meta.model_id, "MODEL_A");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A truncated/corrupt state file (what a crash mid-`fs::write` used to be able
+    /// to leave behind before `save` switched to `atomic_file::write`) must start
+    /// the ledger empty rather than panicking, and a subsequent save must fully
+    /// replace it.
+    #[test]
+    fn corrupt_state_file_loads_as_empty_and_a_save_replaces_it_cleanly() {
+        let path = std::env::temp_dir().join(format!(
+            "rusthinq-known-devices-corrupt-test-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"{\"dev-1\":{\"last_seen").unwrap();
+
+        let known = KnownDevices::new(Some(path.clone()));
+        assert!(known.all().is_empty());
+
+        let meta = Metadata::new("MODEL_A", "Model A", "1.0");
+        known.note_connected("dev-1", &meta, Platform::Thinq2);
+
+        let restarted = KnownDevices::new(Some(path.clone()));
+        assert_eq!(restarted.all()["dev-1"].meta.model_id, "MODEL_A");
 
         let _ = std::fs::remove_file(&path);
     }

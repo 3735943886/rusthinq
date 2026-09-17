@@ -53,16 +53,55 @@ impl JsonStorage {
     }
 
     fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-        let data = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                rusthinq_core::logging::log(
+                    "bridge",
+                    &[&format!("Failed to read {}: {e} (treating as absent)", path.display())],
+                );
+                return None;
+            }
+        };
+        serde_json::from_str(&data)
+            .inspect_err(|e| {
+                rusthinq_core::logging::log(
+                    "bridge",
+                    &[&format!(
+                        "{} is corrupt, treating as absent: {e}",
+                        path.display()
+                    )],
+                );
+            })
+            .ok()
     }
 
     fn write_json<T: Serialize>(path: &Path, value: &T) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            rusthinq_core::logging::log(
+                "bridge",
+                &[&format!("Failed to create {}: {e}", parent.display())],
+            );
+            return;
         }
-        if let Ok(s) = serde_json::to_string(value) {
-            let _ = fs::write(path, s);
+        match serde_json::to_string(value) {
+            Ok(s) => {
+                if let Err(e) = rusthinq_core::atomic_file::write(path, s.as_bytes()) {
+                    rusthinq_core::logging::log(
+                        "bridge",
+                        &[&format!("Failed to persist {}: {e}", path.display())],
+                    );
+                }
+            }
+            Err(e) => {
+                rusthinq_core::logging::log(
+                    "bridge",
+                    &[&format!("Failed to serialize state for {}: {e}", path.display())],
+                );
+            }
         }
     }
 }
@@ -139,6 +178,38 @@ mod tests {
             .expect("must parse the TypeScript-shaped oauth2.json");
         assert_eq!(creds.refresh_token, "abc123");
         assert_eq!(creds.env.country_code, "KR");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A truncated/corrupt state file (the shape a crash mid-write used to be able
+    /// to leave behind before `write_json` switched to `atomic_file::write`) must
+    /// read back as "no credentials" rather than panicking — and a write afterward
+    /// must fully replace it, not merge with the garbage.
+    #[test]
+    fn corrupt_oauth2_json_reads_as_absent_and_a_write_replaces_it_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusthinq-bridge-state-corrupt-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("oauth2.json"), b"{\"refreshToken\":\"abc123\",\"e").unwrap();
+
+        let storage = JsonStorage::new(&dir);
+        assert!(storage.get_credentials().is_none());
+
+        storage.set_credentials(Some(Credentials {
+            refresh_token: "new-token".to_string(),
+            env: Environment {
+                country_code: "KR".to_string(),
+                language_code: None,
+            },
+        }));
+        let creds = storage
+            .get_credentials()
+            .expect("write after corruption must be readable");
+        assert_eq!(creds.refresh_token, "new-token");
 
         let _ = fs::remove_dir_all(&dir);
     }

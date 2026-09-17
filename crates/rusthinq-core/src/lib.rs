@@ -4,6 +4,7 @@
 //! integration's conventions live here. See `rusthinq-devices` for device
 //! state/protocol base classes.
 
+pub mod atomic_file;
 pub mod config;
 pub mod logging;
 pub mod metadata;
