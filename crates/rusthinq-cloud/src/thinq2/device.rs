@@ -373,7 +373,20 @@ impl DeviceAcceptor {
 
     fn disconnected(&self, client_id: u64) {
         if let Some(dev) = self.devices.lock().remove(&client_id) {
-            self.clients_by_id.lock().remove(&dev.id);
+            // Only remove the id -> client mapping if it still points at *this*
+            // client: a fast reconnect for the same device id can already have
+            // rebound it to the replacement client via complete_provisioning
+            // before this stale disconnect fires (async, after TCP teardown
+            // propagates) -- removing unconditionally would delete the
+            // *replacement's* live entry instead, leaking it (nothing would then
+            // recognize a third reconnect needs to destroy_client() that
+            // still-open replacement). Same identity-before-removing guard as
+            // DeviceManager::accept's close handler uses for `devices`.
+            let mut clients_by_id = self.clients_by_id.lock();
+            if clients_by_id.get(&dev.id) == Some(&client_id) {
+                clients_by_id.remove(&dev.id);
+            }
+            drop(clients_by_id);
             dev.notify_close();
         }
     }
@@ -914,4 +927,95 @@ mod tests {
         );
     }
 
+    async fn complete_provisioning_for(port: u16, did: &str) {
+        let client = connect_fake_device(port, did).await;
+        let deploy = serde_json::json!({
+            "did": did, "mid": 1, "kind": "MODEL", "cmd": "deploy", "type": 0,
+            "data": { "appInfo": {}, "platformInfo": {} },
+        });
+        client
+            .publish(
+                format!("clip/provisioning/devices/{did}"),
+                QoS::AtMostOnce,
+                false,
+                deploy.to_string(),
+            )
+            .await
+            .unwrap();
+        let ack = serde_json::json!({
+            "did": did, "mid": 2, "cmd": "completeProvisioning_ack", "type": 1,
+        });
+        client
+            .publish(
+                format!("clip/message/devices/{did}"),
+                QoS::AtMostOnce,
+                false,
+                ack.to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The exact race #23 was filed for: a fast reconnect for the same device id
+    /// correctly rebinds `clients_by_id[did]` to the new client via
+    /// `complete_provisioning` (which also `destroy_client()`s the old one), but the
+    /// *old* client's disconnect event fires asynchronously, after its socket is
+    /// actually torn down -- arriving *after* the rebind. `disconnected` used to
+    /// delete `clients_by_id[did]` unconditionally on any client's disconnect,
+    /// wiping the replacement's brand new live entry even though the replacement
+    /// never disconnected. Nothing then recognizes a third reconnect needs to
+    /// `destroy_client()` that still-open replacement -- a leaked session.
+    #[tokio::test]
+    async fn a_superseded_clients_stale_disconnect_does_not_evict_the_replacement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = Arc::new(Broker::new());
+        let manager = DeviceManager::new();
+        let acceptor =
+            DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let broker = broker.clone();
+                    tokio::spawn(async move { broker.accept_tcp(stream).await });
+                }
+            });
+        }
+
+        let did = "dev-reconnect-race";
+
+        complete_provisioning_for(port, did).await;
+        let client_id_a = wait_for(|| acceptor.clients_by_id.lock().get(did).copied()).await;
+
+        // A fast reconnect: a second client for the same device id completes
+        // provisioning (rebinding clients_by_id[did] and destroy_client()-ing A)
+        // before A's own disconnect has necessarily been processed yet.
+        complete_provisioning_for(port, did).await;
+        let client_id_b = wait_for(|| {
+            acceptor
+                .clients_by_id
+                .lock()
+                .get(did)
+                .copied()
+                .filter(|id| *id != client_id_a)
+        })
+        .await;
+        assert_ne!(client_id_a, client_id_b);
+
+        // A's socket was closed by the destroy_client(old) call inside the second
+        // complete_provisioning above; give its disconnect event, which fires
+        // asynchronously, every chance to arrive and be processed.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            acceptor.clients_by_id.lock().get(did).copied(),
+            Some(client_id_b),
+            "the replacement client's live entry must survive the superseded \
+             client's stale disconnect"
+        );
+    }
 }
