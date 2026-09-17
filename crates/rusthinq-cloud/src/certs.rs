@@ -284,10 +284,21 @@ impl SniCache {
         }
         let (cert, key) = mint_leaf(&self.ca, hostname).ok()?;
         let ctx = Arc::new(context_from_leaf(&cert, &key, &self.ca_x509).ok()?);
-        self.certs
-            .lock()
-            .entry(hostname.to_string())
-            .or_insert_with(|| ctx.clone());
+        // Re-check both conditions under the lock: while minting (the slow part, done
+        // unlocked above so concurrent SNI callbacks for other names aren't serialized
+        // behind it) a concurrent winner may have already inserted this exact hostname,
+        // or filled the cache with other entries. Without this re-check, several
+        // concurrent ClientHellos for distinct never-seen hostnames could all pass the
+        // first (unlocked-at-mint-time) length check and all insert, overshooting
+        // MAX_SNI_CERTS by up to (concurrency - 1).
+        let mut cache = self.certs.lock();
+        if let Some(existing) = cache.get(hostname) {
+            return Some(existing.clone());
+        }
+        if cache.len() >= MAX_SNI_CERTS {
+            return None;
+        }
+        cache.insert(hostname.to_string(), ctx.clone());
         Some(ctx)
     }
 }
@@ -797,6 +808,49 @@ mod tests {
         assert!(cache.get_or_mint("overflow.example.com").is_none());
         // An already-cached name still resolves (from cache, not a new mint).
         assert!(cache.get_or_mint("host0.example.com").is_some());
+
+        let _ = fs::remove_dir_all(cert_path.parent().unwrap());
+    }
+
+    /// #29: the cache-full check happened under the lock, but the lock was released
+    /// before the slow mint_leaf/context_from_leaf call and only re-acquired to insert.
+    /// Several concurrent misses for distinct never-seen hostnames could all pass that
+    /// check while the one remaining slot was still free, then all insert, overshooting
+    /// MAX_SNI_CERTS by up to (concurrency - 1).
+    #[test]
+    fn get_or_mint_does_not_overshoot_the_cap_under_concurrent_misses() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let cache = Arc::new(SniCache::new(ca).expect("build SNI cache"));
+
+        // Fill every slot but one.
+        for i in 0..MAX_SNI_CERTS - 1 {
+            assert!(
+                cache.get_or_mint(&format!("host{i}.example.com")).is_some(),
+                "mint #{i} should succeed while under the cap"
+            );
+        }
+
+        // Race real OS threads for the single remaining slot with distinct
+        // never-before-seen hostnames, so each one is a genuine cache miss that has to
+        // mint (the slow, unlocked part the TOCTOU window lives in).
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let cache = cache.clone();
+                std::thread::spawn(move || cache.get_or_mint(&format!("race{i}.example.com")))
+            })
+            .collect();
+        for t in threads {
+            let _ = t.join().unwrap();
+        }
+
+        assert!(
+            cache.certs.lock().len() <= MAX_SNI_CERTS,
+            "cache must never exceed MAX_SNI_CERTS ({}) even when concurrent misses race \
+             the single remaining slot; got {}",
+            MAX_SNI_CERTS,
+            cache.certs.lock().len()
+        );
 
         let _ = fs::remove_dir_all(cert_path.parent().unwrap());
     }
