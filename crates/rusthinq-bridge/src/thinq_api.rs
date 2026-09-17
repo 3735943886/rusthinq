@@ -43,6 +43,22 @@ pub struct RegistrationPlan {
     pub alias: String,
 }
 
+/// The first `max_bytes` bytes of `s`, backing off to the nearest earlier char
+/// boundary if `max_bytes` would otherwise land inside a multi-byte character —
+/// a raw `&s[..max_bytes]` panics in that case. LG device ids are hex/MAC-derived
+/// (so this never actually backs off in practice), but the id is device-reported
+/// and a future device family with a different id format could trip a raw slice.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Decide the plan from the home's current device list (see [`Client::list_devices`]).
 pub fn registration_plan(home_devices: &[Value], device_id: &str) -> RegistrationPlan {
     let registered = home_devices
@@ -53,7 +69,7 @@ pub fn registration_plan(home_devices: &[Value], device_id: &str) -> Registratio
         alias: registered
             .and_then(|d| d.get("alias").and_then(|v| v.as_str()))
             .map(str::to_string)
-            .unwrap_or_else(|| format!("Rusthinq {}", &device_id[..device_id.len().min(8)])),
+            .unwrap_or_else(|| format!("Rusthinq {}", truncate_at_char_boundary(device_id, 8))),
     }
 }
 
@@ -449,6 +465,26 @@ mod tests {
         let plan = registration_plan(&[], "my-device");
         assert!(plan.remove_first);
         assert_eq!(plan.alias, "Rusthinq my-devic");
+    }
+
+    /// #31: the fallback alias used to slice `&device_id[..device_id.len().min(8)]`
+    /// directly -- a raw byte-index slice on a `&str`, which panics if byte 8 doesn't
+    /// land on a UTF-8 character boundary. LG ids are hex/MAC-derived so this never
+    /// triggered in practice, but the id is device-reported and unguarded.
+    #[test]
+    fn registration_plan_truncates_a_multibyte_device_id_at_a_char_boundary() {
+        // Byte offset 8 falls inside the 3-byte '€' character (which spans bytes
+        // 7..10), so a raw `&device_id[..8]` panics; truncation must back off to the
+        // boundary at byte 7 instead.
+        let device_id = "abcdefg\u{20AC}hij";
+        let plan = registration_plan(&[], device_id);
+        assert!(plan.remove_first);
+        assert_eq!(plan.alias, "Rusthinq abcdefg");
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_passes_through_a_short_string_unchanged() {
+        assert_eq!(truncate_at_char_boundary("short", 8), "short");
     }
 
     /// #27: api_fetch's retry loop only retried `req.send().await` failures. A
