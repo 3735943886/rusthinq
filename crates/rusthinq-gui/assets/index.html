@@ -78,6 +78,22 @@
                 width: 1.5em;
             }
 
+            /* The Browser<->rusthinq-gui<->MQTT chain: each arrow *is* the status
+               indicator for the link on that side of it, rather than a separate
+               leading icon per line -- green (connected) or a broken-link icon (not)
+               are both easier to read in place, between the two things the arrow
+               already names, than a row of icons above a row of labels. */
+            .conn-arrow {
+                display: inline-block;
+                font-weight: bold;
+                font-size: 1.1em;
+                vertical-align: middle;
+                padding: 0 0.15em;
+            }
+            .conn-arrow.conn-ok {
+                color: #43a047;
+            }
+
             /* The status line and the login/logout button used to stack on their own
                lines (a couple of <br>s between them) even though there is plenty of
                horizontal room next to the status text -- that's vertical space this
@@ -217,8 +233,8 @@
         </nav>
         <div class="container">
             <h4 class="header orange-text">Connectivity</h4>
-            <span id="status_rethink" class="status_field"></span>Browser 🡘 rusthinq-gui<br />
-            <span id="status_mqtt" class="status_field"></span>rusthinq-gui 🡘 MQTT<br />
+            Browser <span id="conn_ws" class="conn-arrow"></span> rusthinq-gui
+            <span id="conn_mqtt" class="conn-arrow"></span> MQTT
         </div>
 
         <div class="container hide-when-offline">

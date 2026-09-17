@@ -103,6 +103,7 @@ async fn run_event_loop(
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 backoff.reset();
                 tracing::info!("rusthinq-gui MQTT connection established");
+                state.set_gui_mqtt_connected(true);
                 let _ = client.subscribe(&devices_topic, QoS::AtLeastOnce).await;
                 // Account-level topics (`<prefix>/bridge/status`, `.../login-url`)...
                 let _ = client
@@ -126,6 +127,7 @@ async fn run_event_loop(
             }
             Ok(_) => {}
             Err(e) => {
+                state.set_gui_mqtt_connected(false);
                 let delay = backoff.next_delay();
                 tracing::warn!("rusthinq-gui MQTT error: {e} (retrying in {delay:?})");
                 tokio::time::sleep(delay).await;

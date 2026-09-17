@@ -3,18 +3,35 @@
 //! broadcast to every `/ws` connection via a `watch` channel (each new subscriber
 //! gets the current value immediately, then every update after).
 
+use rusthinq_util::sync::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 
 pub struct Shared {
     tx: watch::Sender<Value>,
+    /// Last raw payload from devlist.rs's retained `<prefix>/devices` topic (or the
+    /// empty default before the first one arrives), kept separately from `tx`'s
+    /// already-translated value so `recompute` can rebuild the full snapshot when
+    /// *either* a new payload arrives *or* `gui_mqtt_connected` changes on its own --
+    /// the latter has nothing to do with devlist.rs and would otherwise have no way
+    /// to reach the broadcast snapshot without re-deriving everything else in it.
+    last_raw: Mutex<Value>,
+    /// Whether rusthinq-gui's *own* MQTT client (`mqtt.rs`, a separate connection to
+    /// the same broker from devlist.rs's `self.mqtt` on the rusthinq-cloud side) is
+    /// currently connected. Set by `mqtt.rs`'s event loop directly -- this is the
+    /// one piece of "Connectivity" state that never comes from a devlist.rs payload,
+    /// since a payload can only arrive at all while this connection is already up.
+    gui_mqtt_connected: AtomicBool,
 }
 
 impl Shared {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             tx: watch::channel(default_snapshot()).0,
+            last_raw: Mutex::new(json!({})),
+            gui_mqtt_connected: AtomicBool::new(false),
         })
     }
 
@@ -34,12 +51,28 @@ impl Shared {
         let Ok(raw) = serde_json::from_slice::<Value>(payload) else {
             return;
         };
+        *self.last_raw.lock() = raw;
+        self.recompute();
+    }
+
+    /// Called by `mqtt.rs`'s event loop on every connect/disconnect of rusthinq-gui's
+    /// own MQTT client -- see `gui_mqtt_connected`'s doc comment.
+    pub fn set_gui_mqtt_connected(&self, connected: bool) {
+        self.gui_mqtt_connected.store(connected, Ordering::SeqCst);
+        self.recompute();
+    }
+
+    /// Rebuilds the broadcast snapshot from `last_raw` + `gui_mqtt_connected` and
+    /// sends it to every `/ws` subscriber.
+    fn recompute(&self) {
+        let raw = self.last_raw.lock().clone();
         let bridge = raw
             .get("bridgeLoggedIn")
             .filter(|v| !v.is_null())
             .map(|logged_in| json!({ "loggedIn": logged_in }));
         let translated = json!({
             "mqtt": raw.get("mqtt").cloned().unwrap_or(Value::Bool(false)),
+            "guiMqtt": self.gui_mqtt_connected.load(Ordering::SeqCst),
             "bridge": bridge,
             "devices": raw.get("devices").cloned().unwrap_or_else(|| json!({})),
             "version": rusthinq_core::version::VERSION,
@@ -72,6 +105,7 @@ impl Shared {
 fn default_snapshot() -> Value {
     json!({
         "mqtt": false,
+        "guiMqtt": false,
         "bridge": Value::Null,
         "devices": {},
         "version": rusthinq_core::version::VERSION,
@@ -119,6 +153,30 @@ mod tests {
         let shared = Shared::new();
         shared.set_snapshot(br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{}}"#);
         assert_eq!(shared.current()["features"], json!({}));
+    }
+
+    /// `guiMqtt` reflects rusthinq-gui's own MQTT connection (set directly by
+    /// `mqtt.rs`, never part of a devlist.rs payload) -- distinct from `mqtt`,
+    /// which is rusthinq-cloud's own connection as reported by devlist.rs. Setting
+    /// it must broadcast on its own, without needing a `set_snapshot` call, and
+    /// must survive one.
+    #[test]
+    fn set_gui_mqtt_connected_updates_independently_of_devlist_payloads() {
+        let shared = Shared::new();
+        assert_eq!(shared.current()["guiMqtt"], json!(false));
+
+        shared.set_gui_mqtt_connected(true);
+        assert_eq!(shared.current()["guiMqtt"], json!(true));
+
+        // A devlist.rs payload (which knows nothing about guiMqtt) must not reset it.
+        shared.set_snapshot(br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{}}"#);
+        assert_eq!(shared.current()["guiMqtt"], json!(true));
+        assert_eq!(shared.current()["mqtt"], json!(true));
+
+        shared.set_gui_mqtt_connected(false);
+        assert_eq!(shared.current()["guiMqtt"], json!(false));
+        // Unrelated fields from the last devlist.rs payload must still be there.
+        assert_eq!(shared.current()["mqtt"], json!(true));
     }
 
     #[test]

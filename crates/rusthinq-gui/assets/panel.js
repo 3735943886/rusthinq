@@ -28,8 +28,26 @@ let bridge_status = false
 // regardless of the device itself. Set from the first `features` snapshot.
 let deviceMappingCapable = false
 
-get('status_rethink').innerHTML = STATUS_UNKNOWN
-get('status_mqtt').innerHTML = STATUS_UNKNOWN
+// Renders one arrow in the Browser<->rusthinq-gui<->MQTT chain: `connected` true/false
+// draws it as a green "up" link or a broken-link icon; `null` (not known yet, e.g.
+// before the very first status arrives) draws the same "unknown" icon the other status
+// fields start as.
+function setConnArrow(id, connected) {
+    const el = get(id)
+    if (connected === true) {
+        el.innerHTML = '↔'
+        el.className = 'conn-arrow conn-ok'
+    } else if (connected === false) {
+        el.innerHTML = `<i class="tiny material-icons red-text" style="vertical-align:middle">link_off</i>`
+        el.className = 'conn-arrow conn-error'
+    } else {
+        el.innerHTML = `<i class="tiny material-icons red-text" style="vertical-align:middle">question_mark</i>`
+        el.className = 'conn-arrow'
+    }
+}
+
+setConnArrow('conn_ws', null)
+setConnArrow('conn_mqtt', null)
 get('status_bridge').innerHTML = STATUS_UNKNOWN
 get('status_bridge_text').innerText = 'Unknown'
 
@@ -279,8 +297,9 @@ function connect() {
     ws = new WebSocket(baseUrl + 'ws')
 
     ws.onclose = () => {
-        get('status_rethink').innerHTML = STATUS_ERROR
-        get('status_mqtt').innerHTML = STATUS_UNKNOWN
+        setConnArrow('conn_ws', false)
+        // Can't know rusthinq-gui's own MQTT state without the WS that carries it.
+        setConnArrow('conn_mqtt', null)
         document.getElementsByTagName('body')[0].classList.add('offline')
         reconnectTimer = setTimeout(connect, retryDelay)
         retryDelay = 5000
@@ -288,7 +307,7 @@ function connect() {
 
     ws.onopen = () => {
         retryDelay = 250
-        get('status_rethink').innerHTML = STATUS_OK
+        setConnArrow('conn_ws', true)
         document.getElementsByTagName('body')[0].classList.remove('offline')
     }
 
@@ -316,8 +335,14 @@ function connect() {
                 deviceMappingCapable = !!(json.features.native || json.features.scripting)
             }
 
-            if (typeof json.mqtt === 'boolean') {
-                get('status_mqtt').innerHTML = json.mqtt ? STATUS_OK : STATUS_ERROR
+            // `guiMqtt` is rusthinq-gui's own MQTT connection (mqtt.rs) -- what the
+            // "<-> MQTT" link in the chain actually means. `mqtt` (rusthinq-cloud's own
+            // connection, reported inside the same devlist.rs payload this arrives in)
+            // is deliberately not shown here: it can only ever be seen at all once
+            // rusthinq-gui's own connection is already up, so it says nothing extra
+            // about *this* link.
+            if (typeof json.guiMqtt === 'boolean') {
+                setConnArrow('conn_mqtt', json.guiMqtt)
             }
 
             if (typeof json.devices === 'object') {
