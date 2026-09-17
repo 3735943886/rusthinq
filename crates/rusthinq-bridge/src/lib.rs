@@ -167,7 +167,14 @@ impl Bridge {
     }
 
     fn notify_session_change(&self) {
-        if let Some(hook) = self.on_session_change.lock().clone() {
+        // Bind to a `let` first: the lock guard from `.lock()` is a temporary in the
+        // `if let` scrutinee, and Rust extends a scrutinee temporary's lifetime to the
+        // whole `if let` body -- writing `if let Some(hook) = self.on_session_change.lock().clone() { hook() }`
+        // would hold the lock across the hook call, and a hook that re-enters this same
+        // mutex (directly, or by re-registering a hook) would deadlock every future
+        // caller forever. See `detach_session`'s identical fix for `sessions`.
+        let hook = self.on_session_change.lock().clone();
+        if let Some(hook) = hook {
             hook();
         }
     }
@@ -179,7 +186,10 @@ impl Bridge {
     }
 
     fn notify_storage_orphaned(&self, id: &str) {
-        if let Some(hook) = self.on_storage_orphaned.lock().clone() {
+        // Same lock-before-hook-call hazard as `notify_session_change` above -- see
+        // its comment and `detach_session`'s original fix for this bug class.
+        let hook = self.on_storage_orphaned.lock().clone();
+        if let Some(hook) = hook {
             hook(id);
         }
     }
@@ -350,7 +360,10 @@ impl Bridge {
     }
 
     fn notify_names_changed(&self) {
-        if let Some(hook) = self.on_names_changed.lock().clone() {
+        // Same lock-before-hook-call hazard as `notify_session_change` above -- see
+        // its comment and `detach_session`'s original fix for this bug class.
+        let hook = self.on_names_changed.lock().clone();
+        if let Some(hook) = hook {
             hook();
         }
     }
@@ -1106,6 +1119,41 @@ mod lifecycle_tests {
             panic!("detach_session must not deadlock when its own hook re-locks sessions");
         };
         assert!(!bridge.status_for(id));
+    }
+
+    /// Same bug class as `detach_session_does_not_deadlock_when_the_hook_relocks_sessions`
+    /// above, for the three `notify_*` helpers that were fixed alongside it:
+    /// `notify_session_change`, `notify_storage_orphaned`, `notify_names_changed`. Each
+    /// hook here re-registers itself, re-locking the same mutex `notify_*` is about to
+    /// call it out from under -- before the fix this deadlocked every one of these.
+    #[tokio::test]
+    async fn notify_helpers_do_not_deadlock_when_their_own_hook_re_registers_itself() {
+        let bridge = test_bridge();
+
+        let b = bridge.clone();
+        bridge.set_on_session_change_hook(Arc::new(move || {
+            b.set_on_session_change_hook(Arc::new(|| {}));
+        }));
+        let b = bridge.clone();
+        bridge.set_on_storage_orphaned_hook(Arc::new(move |_id| {
+            b.set_on_storage_orphaned_hook(Arc::new(|_| {}));
+        }));
+        let b = bridge.clone();
+        bridge.set_on_names_changed_hook(Arc::new(move || {
+            b.set_on_names_changed_hook(Arc::new(|| {}));
+        }));
+
+        let handle = tokio::spawn(async move {
+            bridge.notify_session_change();
+            bridge.notify_storage_orphaned("dev-x");
+            bridge.notify_names_changed();
+            bridge
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "a notify_* helper must not deadlock when its own hook re-registers itself"
+        );
     }
 
     /// The race devmgr.rs's own `accept()` comment warns about: "on ThinQ2 reconnect
