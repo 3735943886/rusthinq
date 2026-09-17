@@ -183,6 +183,35 @@ pub fn scripted_t1_factory(
     }
 }
 
+/// Shared by `build_t1`/`build_t2`: compile-or-broken-stub, then construct the
+/// `ScriptedDevice`. `wire` hooks up whatever local-device callbacks the caller's
+/// concrete `thinq` type offers (`on_data` for both, plus T1's `on_response`) —
+/// it's the only part that actually differs between the two.
+fn build_scripted_device(
+    mqtt: Arc<dyn MqttConnection>,
+    id: String,
+    meta: Metadata,
+    path: &std::path::Path,
+    device: DeviceHandle,
+    wire: impl FnOnce(&Arc<ScriptedDevice>),
+) -> Arc<dyn DeviceHandler> {
+    match cache::get_or_compile(path) {
+        Ok(ast_slot) => {
+            let handler = Arc::new(ScriptedDevice {
+                id,
+                meta,
+                mqtt,
+                device,
+                ast_slot,
+                state: Dynamic::from_map(rhai::Map::new()).into_shared(),
+            });
+            wire(&handler);
+            handler
+        }
+        Err(error) => Arc::new(BrokenScript { id, mqtt, error }),
+    }
+}
+
 /// Build a `ScriptedDevice` from an already-resolved `.rhai` path, bypassing
 /// `rhai_dir`/model_id lookup entirely — used by the factories above (which resolve
 /// the path from the configured `rhai_dir` first) and by `harness.rs` (which lets a
@@ -195,24 +224,19 @@ pub(crate) fn build_t2(
     path: &std::path::Path,
 ) -> Arc<dyn DeviceHandler> {
     let id = thinq.id().to_string();
-    match cache::get_or_compile(path) {
-        Ok(ast_slot) => {
-            let handler = Arc::new(ScriptedDevice {
-                id,
-                meta,
-                mqtt,
-                device: DeviceHandle::T2(thinq.clone()),
-                ast_slot,
-                state: Dynamic::from_map(rhai::Map::new()).into_shared(),
-            });
+    build_scripted_device(
+        mqtt,
+        id,
+        meta,
+        path,
+        DeviceHandle::T2(thinq.clone()),
+        |handler| {
             let for_data = handler.clone();
             thinq.on_data(Box::new(move |data: &[u8]| {
                 for_data.call("on_data", vec![Dynamic::from_blob(data.to_vec())]);
             }));
-            handler
-        }
-        Err(error) => Arc::new(BrokenScript { id, mqtt, error }),
-    }
+        },
+    )
 }
 
 pub(crate) fn build_t1(
@@ -222,16 +246,13 @@ pub(crate) fn build_t1(
     path: &std::path::Path,
 ) -> Arc<dyn DeviceHandler> {
     let id = thinq.id().to_string();
-    match cache::get_or_compile(path) {
-        Ok(ast_slot) => {
-            let handler = Arc::new(ScriptedDevice {
-                id,
-                meta,
-                mqtt,
-                device: DeviceHandle::T1(thinq.clone()),
-                ast_slot,
-                state: Dynamic::from_map(rhai::Map::new()).into_shared(),
-            });
+    build_scripted_device(
+        mqtt,
+        id,
+        meta,
+        path,
+        DeviceHandle::T1(thinq.clone()),
+        |handler| {
             let for_data = handler.clone();
             thinq.on_data(Box::new(move |data: &[u8]| {
                 for_data.call("on_data", vec![Dynamic::from_blob(data.to_vec())]);
@@ -240,10 +261,8 @@ pub(crate) fn build_t1(
             thinq.on_response(Box::new(move |body: &serde_json::Value| {
                 for_response.call("on_response", vec![Dynamic::from(body.to_string())]);
             }));
-            handler
-        }
-        Err(error) => Arc::new(BrokenScript { id, mqtt, error }),
-    }
+        },
+    )
 }
 
 #[cfg(test)]
