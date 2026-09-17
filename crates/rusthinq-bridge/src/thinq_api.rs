@@ -125,17 +125,32 @@ impl Client {
                 req = req.json(b);
             }
             match req.send().await {
-                Ok(resp) => {
-                    let out: Value = resp.json().await?;
-                    let code = out.get("resultCode").and_then(|v| v.as_str()).unwrap_or("");
-                    if code != "0000" {
-                        anyhow::bail!(
-                            "thinq error {code}: {}",
-                            out.get("result").cloned().unwrap_or(Value::Null)
-                        );
+                // A malformed/truncated body is exactly what a transient network blip
+                // produces on an otherwise-200 response, so it's retried the same as a
+                // send() failure below — not `?`-propagated immediately, which would
+                // defeat this loop's whole purpose for that failure class. A non-"0000"
+                // `resultCode` is an application-level error, not a transient one, so
+                // that still bails out immediately rather than retrying.
+                Ok(resp) => match resp.json::<Value>().await {
+                    Ok(out) => {
+                        let code = out.get("resultCode").and_then(|v| v.as_str()).unwrap_or("");
+                        if code != "0000" {
+                            anyhow::bail!(
+                                "thinq error {code}: {}",
+                                out.get("result").cloned().unwrap_or(Value::Null)
+                            );
+                        }
+                        return Ok(out.get("result").cloned().unwrap_or(Value::Null));
                     }
-                    return Ok(out.get("result").cloned().unwrap_or(Value::Null));
-                }
+                    Err(e) => {
+                        rusthinq_core::logging::log(
+                            "bridge",
+                            &[&format!("Error parsing response body from {url}: {e}")],
+                        );
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                },
                 Err(e) => {
                     rusthinq_core::logging::log("bridge", &[&format!("Error fetching {url}: {e}")]);
                     last_err = Some(e);
@@ -434,5 +449,67 @@ mod tests {
         let plan = registration_plan(&[], "my-device");
         assert!(plan.remove_first);
         assert_eq!(plan.alias, "Rusthinq my-devic");
+    }
+
+    /// #27: api_fetch's retry loop only retried `req.send().await` failures. A
+    /// malformed/truncated JSON body -- exactly what a real network blip produces on
+    /// an otherwise-200 response -- hit `resp.json().await?` and propagated
+    /// immediately via `?`, bypassing the retry loop the doc comment says exists for
+    /// exactly this kind of transient failure.
+    #[tokio::test]
+    async fn api_fetch_retries_a_malformed_json_body_and_succeeds_once_it_is_valid() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // Truncated/malformed on the first two attempts, a valid body on the
+                // third -- reproducing a transient blip that heals on retry.
+                let body = if n < 2 {
+                    "{\"resultCode\":\"0000\",\"result\":{"
+                } else {
+                    r#"{"resultCode":"0000","result":{"ok":true}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let env = Environment {
+            country_code: "KR".to_string(),
+            language_code: None,
+        };
+        let client = Client::new(env);
+        let url = format!("http://127.0.0.1:{port}/test");
+
+        let result = client.api_fetch(&url, "GET", None).await;
+        assert_eq!(
+            result.unwrap(),
+            json!({"ok": true}),
+            "must succeed once the body is valid JSON instead of giving up on the \
+             first malformed one"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "must have retried both malformed-body attempts before the valid one"
+        );
     }
 }
