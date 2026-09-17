@@ -105,6 +105,18 @@ impl DeviceListPublisher {
             "mqtt": self.mqtt.is_connected(),
             "bridgeLoggedIn": self.bridge.as_ref().map(|b| b.is_logged_in()),
             "devices": Value::Object(all),
+            // Which of this *binary's* optional features were actually compiled in --
+            // `rusthinq-gui` talks to rusthinq-cloud only over MQTT and has no other way
+            // to know. Used for two things on the dashboard: showing the running
+            // build's features next to its version, and deciding whether a device's "no
+            // native or script handler" warning means anything -- with both `native` and
+            // `scripting` off, *every* device would show it regardless of the device
+            // itself, which is not a per-device signal at that point.
+            "features": {
+                "bridge": cfg!(feature = "bridge"),
+                "native": cfg!(feature = "native"),
+                "scripting": cfg!(feature = "scripting"),
+            },
         })
     }
 
@@ -170,6 +182,35 @@ mod tests {
         // No bridge configured at all -- can't have a ThinQ-account name for anything.
         assert_eq!(v["devices"]["dev-1"]["name"], Value::Null);
         assert_eq!(v["bridgeLoggedIn"], Value::Null);
+    }
+
+    /// `rusthinq-gui` has no other way to learn which of this binary's optional
+    /// features are actually compiled in -- it talks to rusthinq-cloud only over
+    /// MQTT. Checked against the same `cfg!` the snapshot itself uses (not a
+    /// hardcoded value) so this catches a typo'd key name or a swapped value, not
+    /// just a change in which features happen to be on for this test run.
+    #[test]
+    fn snapshot_reports_compiled_in_features() {
+        let mqtt = MockMqttConnection::new();
+        let manager = DeviceManager::new();
+        let device_bridge = DeviceBridge::new(mqtt.clone());
+        let publisher = DeviceListPublisher::new(
+            mqtt.clone(),
+            manager,
+            device_bridge,
+            None,
+            empty_known_devices(),
+        );
+
+        publisher.publish();
+
+        let raw = mqtt
+            .retained("devices")
+            .expect("devices topic must be retained");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["features"]["bridge"], cfg!(feature = "bridge"));
+        assert_eq!(v["features"]["native"], cfg!(feature = "native"));
+        assert_eq!(v["features"]["scripting"], cfg!(feature = "scripting"));
     }
 
     #[test]

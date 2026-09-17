@@ -22,6 +22,11 @@ const STATUS_OK = `<i class="tiny material-icons green-text">check</i>`
 const STATUS_ERROR = `<i class="tiny material-icons red-text">error</i>`
 const STATUS_UNKNOWN = `<i class="tiny material-icons red-text">question_mark</i>`
 let bridge_status = false
+// Whether this build could possibly map *any* device (native or scripting
+// compiled in) -- gates the per-device "no native or script handler" warning,
+// which means nothing when neither is on: every device would show it then,
+// regardless of the device itself. Set from the first `features` snapshot.
+let deviceMappingCapable = false
 
 get('status_rethink').innerHTML = STATUS_UNKNOWN
 get('status_mqtt').innerHTML = STATUS_UNKNOWN
@@ -120,11 +125,14 @@ class DeviceEntry {
         td = document.createElement('td')
         td.className = 'dev-model'
         let model = this.remoteState.model
-        if (!this.remoteState.mapped) {
+        if (!this.remoteState.mapped && deviceMappingCapable) {
             // "mapped" just means registry.rs found a native or .rhai handler for this
             // modelId -- it says nothing about whether some other tool is driving the
             // device over the raw bus instead (rusthinq has no way to know that, MQTT
             // pub/sub doesn't expose who's subscribed), so this can't claim "unsupported".
+            // Only shown when this build could possibly have mapped it (native or
+            // scripting compiled in) -- with both off, *every* device is unmapped
+            // regardless of the device itself, so the warning would say nothing.
             model += ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No native or script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`
         }
         td.innerHTML = model
@@ -290,6 +298,22 @@ function connect() {
             if (typeof json.version === 'string') {
                 // one in the header bar, one under the title on a narrow screen
                 document.querySelectorAll('.version').forEach((el) => (el.innerText = 'v' + json.version))
+            }
+
+            if (typeof json.features === 'object' && json.features !== null) {
+                const enabled = Object.entries(json.features)
+                    .filter(([, v]) => v)
+                    .map(([k]) => k)
+                const tooltip =
+                    enabled.length > 0
+                        ? `Build features: ${enabled.join(', ')}`
+                        : 'Build features: none (bridge/native/scripting all off)'
+                document.querySelectorAll('.version').forEach((el) => {
+                    M.Tooltip.getInstance(el)?.destroy()
+                    el.setAttribute('data-tooltip', tooltip)
+                    M.Tooltip.init(el, { position: 'bottom' })
+                })
+                deviceMappingCapable = !!(json.features.native || json.features.scripting)
             }
 
             if (typeof json.mqtt === 'boolean') {

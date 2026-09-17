@@ -78,6 +78,21 @@
                 width: 1.5em;
             }
 
+            /* The status line and the login/logout button used to stack on their own
+               lines (a couple of <br>s between them) even though there is plenty of
+               horizontal room next to the status text -- that's vertical space this
+               section, and the page's overall scroll length, didn't need to spend.
+               Only one button is ever visible ('hide' toggles the other), so this is
+               just status-left, button-right on one line; flex-wrap keeps it usable if
+               a narrow screen genuinely can't fit both. */
+            .bridge-status-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                flex-wrap: wrap;
+                gap: 0.5rem 1rem;
+            }
+
             .preloader-wrapper.verysmall {
                 width: 24px;
                 height: 24px;
@@ -188,10 +203,12 @@
                     rusthinq <span class="hide-on-med-and-down">management panel</span>
                 </a>
                 <!-- On a phone the brand sits in the middle of the bar, and a version string on the
-                     right would run into it, so there it goes under the title. -->
-                <span class="version version-under-title hide-on-med-and-up"></span>
+                     right would run into it, so there it goes under the title. Both carry a tooltip
+                     (filled in once the first `/ws` snapshot arrives) naming which optional build
+                     features (bridge/native/scripting) are actually compiled into this binary. -->
+                <span class="version version-under-title hide-on-med-and-up tooltipped" data-position="bottom"></span>
                 <ul class="right hide-on-small-only">
-                    <li><span class="version"></span></li>
+                    <li><span class="version tooltipped" data-position="bottom"></span></li>
                 </ul>
                 <a href="#" id="btn_dark_toggle" class="right" title="Toggle dark mode">
                     <i class="material-icons">brightness_6</i>
@@ -224,24 +241,25 @@
 
         <div class="container hide-when-offline">
             <h4 class="header orange-text">Bridge mode</h4>
-            <span id="status_bridge" class="status_field"></span>Status: <span id="status_bridge_text"></span
-            ><br /><br />
-            <button
-                id="btn_thinq_login"
-                class="hide btn waves-effect waves-light modal-trigger"
-                data-target="thinq_login"
-            >
-                Log into your LG account <i class="material-icons right">login</i>
-            </button>
-            <button
-                id="btn_thinq_logout"
-                class="hide btn waves-effect waves-light modal-trigger tooltipped"
-                data-target="thinq_logout"
-                data-position="bottom"
-                data-tooltip="This will disable bridge mode for all your devices."
-            >
-                logout<i class="material-icons right">logout</i>
-            </button>
+            <div class="bridge-status-row">
+                <span><span id="status_bridge" class="status_field"></span>Status: <span id="status_bridge_text"></span></span>
+                <button
+                    id="btn_thinq_login"
+                    class="hide btn waves-effect waves-light modal-trigger"
+                    data-target="thinq_login"
+                >
+                    Log into your LG account <i class="material-icons right">login</i>
+                </button>
+                <button
+                    id="btn_thinq_logout"
+                    class="hide btn waves-effect waves-light modal-trigger tooltipped"
+                    data-target="thinq_logout"
+                    data-position="bottom"
+                    data-tooltip="This will disable bridge mode for all your devices."
+                >
+                    logout<i class="material-icons right">logout</i>
+                </button>
+            </div>
         </div>
 
         <div id="thinq_login" class="modal">

@@ -43,6 +43,11 @@ impl Shared {
             "bridge": bridge,
             "devices": raw.get("devices").cloned().unwrap_or_else(|| json!({})),
             "version": rusthinq_core::version::VERSION,
+            // Passed through verbatim from devlist.rs's snapshot -- which of
+            // rusthinq-cloud's optional features are actually compiled into *this*
+            // running binary. rusthinq-gui talks to it only over MQTT and has no
+            // other way to know.
+            "features": raw.get("features").cloned().unwrap_or_else(|| json!({})),
         });
         // `send` (unlike `send_replace`) is a no-op when there are no receivers
         // yet -- e.g. the very first `<prefix>/devices` message arriving before any
@@ -70,6 +75,7 @@ fn default_snapshot() -> Value {
         "bridge": Value::Null,
         "devices": {},
         "version": rusthinq_core::version::VERSION,
+        "features": {},
     })
 }
 
@@ -87,6 +93,32 @@ mod tests {
         assert_eq!(got["mqtt"], json!(true));
         assert_eq!(got["bridge"], json!({"loggedIn": true}));
         assert_eq!(got["devices"]["d1"]["model"], json!("RAC"));
+    }
+
+    /// `assets/panel.js` uses `features.native`/`features.scripting` to decide
+    /// whether a device's "no native or script handler" warning means anything --
+    /// this must survive the translation from devlist.rs's raw shape unchanged.
+    #[test]
+    fn set_snapshot_passes_through_features() {
+        let shared = Shared::new();
+        shared.set_snapshot(
+            br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{},"features":{"bridge":true,"native":false,"scripting":true}}"#,
+        );
+        let got = shared.current();
+        assert_eq!(got["features"]["bridge"], json!(true));
+        assert_eq!(got["features"]["native"], json!(false));
+        assert_eq!(got["features"]["scripting"], json!(true));
+    }
+
+    /// A raw payload from before this field existed (or one that simply omits it)
+    /// must not crash the dashboard -- fall back to an empty object rather than
+    /// `null`, so the frontend's `features.native` reads `undefined` instead of
+    /// throwing on `null.native`.
+    #[test]
+    fn set_snapshot_defaults_features_to_an_empty_object_when_absent() {
+        let shared = Shared::new();
+        shared.set_snapshot(br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{}}"#);
+        assert_eq!(shared.current()["features"], json!({}));
     }
 
     #[test]
