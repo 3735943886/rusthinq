@@ -20,6 +20,33 @@ pub struct DeviceAcceptor {
     devices: Mutex<HashMap<u64, Arc<ConnectedDevice>>>,
 }
 
+/// rethink's TS counterpart does this with `topic.replace(/^.*\/clip/, 'clip')` — a
+/// greedy regex, so it pivots on the *last* "/clip". A topic like AWS IoT's rule
+/// republish path `$aws/rules/clip_provisioning_rule/clip/provisioning/devices/<id>`
+/// contains "/clip" twice (once inside the rule name itself); pivoting on the first one
+/// leaves the rule-name fragment attached and the result never matches
+/// `clip/provisioning/devices/<id>` in `handle_mqtt`, so devices retrying over that
+/// AWS-style topic never get a response and loop forever. `rfind` matches the greedy
+/// regex.
+///
+/// A topic ending exactly in "/clip" with nothing after it (`idx + 5 == topic.len()`)
+/// has no `clip/<suffix>` to rewrite to — left as-is instead of becoming the bare string
+/// "clip", which would fail every `handle_mqtt` comparison anyway, but only by
+/// coincidence.
+fn normalize_clip_topic(topic: &str) -> String {
+    if let Some(idx) = topic.rfind("/clip") {
+        if idx + 5 == topic.len() {
+            topic.to_string()
+        } else {
+            format!("clip{}", &topic[idx + 5..])
+        }
+    } else if let Some(idx) = topic.rfind("clip/") {
+        topic[idx..].to_string()
+    } else {
+        topic.to_string()
+    }
+}
+
 impl DeviceAcceptor {
     pub fn new(
         broker: Arc<Broker>,
@@ -89,20 +116,7 @@ impl DeviceAcceptor {
     /// `pub(crate)` so `sim_device.rs` can feed it simulated CLIP traffic directly,
     /// bypassing the broker/wire-protocol layer entirely — see its module doc.
     pub(crate) fn handle_mqtt(&self, topic: &str, payload: &serde_json::Value, client_id: u64) {
-        // rethink's TS counterpart does this with `topic.replace(/^.*\/clip/, 'clip')` —
-        // a greedy regex, so it pivots on the *last* "/clip". A topic like AWS IoT's rule
-        // republish path `$aws/rules/clip_provisioning_rule/clip/provisioning/devices/<id>`
-        // contains "/clip" twice (once inside the rule name itself); pivoting on the first
-        // one leaves the rule-name fragment attached and the result never matches
-        // `clip/provisioning/devices/<id>` below, so devices retrying over that AWS-style
-        // topic never get a response and loop forever. `rfind` matches the greedy regex.
-        let topic = if let Some(idx) = topic.rfind("/clip") {
-            format!("clip{}", &topic[idx + 5..])
-        } else if let Some(idx) = topic.rfind("clip/") {
-            topic[idx..].to_string()
-        } else {
-            topic.to_string()
-        };
+        let topic = normalize_clip_topic(topic);
 
         let did = payload
             .get("did")
@@ -398,6 +412,33 @@ mod tests {
     use crate::test_support::wait_for;
     use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn normalize_clip_topic_pivots_on_the_last_clip_segment() {
+        assert_eq!(
+            normalize_clip_topic(
+                "$aws/rules/clip_provisioning_rule/clip/provisioning/devices/dev-1"
+            ),
+            "clip/provisioning/devices/dev-1"
+        );
+    }
+
+    /// #30: a topic ending exactly in "/clip" with nothing after it used to produce the
+    /// bare string "clip" (`idx + 5 == topic.len()`, so the slice after it is empty).
+    /// That never matched any `handle_mqtt` comparison anyway, but only by coincidence —
+    /// this pins down that it's left unmatched deliberately instead.
+    #[test]
+    fn normalize_clip_topic_leaves_a_bare_trailing_clip_segment_unmatched() {
+        assert_eq!(normalize_clip_topic("foo/bar/clip"), "foo/bar/clip");
+    }
+
+    #[test]
+    fn normalize_clip_topic_passes_through_a_topic_with_no_clip_segment() {
+        assert_eq!(
+            normalize_clip_topic("lime/devices/dev-1"),
+            "lime/devices/dev-1"
+        );
+    }
 
     /// Real (not mocked) local-device flow: a real `rumqttc` client speaks the same
     /// wire protocol a physical appliance would to the real `Broker`/`DeviceAcceptor`,
