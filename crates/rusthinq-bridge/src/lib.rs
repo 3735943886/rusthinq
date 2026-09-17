@@ -134,6 +134,34 @@ pub struct Bridge {
     /// ledger so the id shows up as offline/forgettable, without this crate
     /// depending on that concept at all.
     on_storage_orphaned: Mutex<Option<OrphanHook>>,
+    /// Ids currently going through `enable`'s OTP → pair → addDevice → `start_session`
+    /// flow (or an `on_local_device` auto-restore's own `start_session` call) — see
+    /// [`StartGuard`]. Not the same thing as `sessions`: an id lives here only while
+    /// *becoming* live, not once it is.
+    starting: Mutex<HashSet<String>>,
+}
+
+/// RAII marker that `id` is currently going through `enable`/`start_session`.
+/// Removes `id` from `Bridge::starting` on drop, however the holder's `.await`
+/// ends — success, error, or a panic unwinding through it.
+///
+/// Without this, two concurrent callers for the same not-yet-live id (a duplicate
+/// `enable` MQTT command racing `on_local_device`'s auto-restore, or two rapid
+/// reconnects both auto-restoring before the first has inserted into `sessions`)
+/// could both run the full await-heavy flow and both build a real upstream
+/// connection, with the loser's `start_session` insert silently overwriting the
+/// winner's `BridgedSession` — leaking the loser's live MQTT/TLS connection to LG's
+/// cloud with nothing left to `.stop()` it. Owns an `Arc<Bridge>` (not `&Bridge`) so
+/// it can be held across a `tokio::spawn`ed task, which `on_local_device` needs.
+struct StartGuard {
+    bridge: Arc<Bridge>,
+    id: String,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        self.bridge.starting.lock().remove(&self.id);
+    }
 }
 
 impl Bridge {
@@ -151,6 +179,22 @@ impl Bridge {
             on_names_changed: Mutex::new(None),
             last_account_ids: Mutex::new(None),
             on_storage_orphaned: Mutex::new(None),
+            starting: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Claims `id` for the duration of an enable/start_session flow. `None` if
+    /// another caller already holds it, meaning the caller should back off instead
+    /// of racing a second concurrent attempt for the same id.
+    fn try_begin_start(self: &Arc<Self>, id: &str) -> Option<StartGuard> {
+        let mut starting = self.starting.lock();
+        if !starting.insert(id.to_string()) {
+            return None;
+        }
+        drop(starting);
+        Some(StartGuard {
+            bridge: self.clone(),
+            id: id.to_string(),
         })
     }
 
@@ -470,6 +514,16 @@ impl Bridge {
             return Ok(true);
         }
 
+        // Serializes against a concurrent enable() (duplicate command) or an
+        // on_local_device auto-restore already in flight for this same id — see
+        // StartGuard's doc comment for the leak this prevents. Held for the rest of
+        // this function, across every await below, including the final
+        // start_session call.
+        let Some(_starting) = self.try_begin_start(&id) else {
+            report("enable already in progress for this device");
+            return Ok(false);
+        };
+
         let creds = self
             .storage
             .get_credentials()
@@ -773,9 +827,17 @@ impl Bridge {
         let Some(state) = self.storage.get_device_state_json(&id) else {
             return;
         };
+        // Same StartGuard as enable() — without it, this auto-restore could race a
+        // concurrent enable() (or another auto-restore for a second rapid
+        // reconnect) for the same id and leak an upstream connection. If another
+        // attempt already holds it, let that one finish instead of racing it.
+        let Some(guard) = self.try_begin_start(&id) else {
+            return;
+        };
         let this = self.clone();
         let id_for_log = id.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             match this.start_session(device, state).await {
                 Ok(()) => {
                     this.want_enabled.lock().insert(id);
@@ -1065,6 +1127,93 @@ mod lifecycle_tests {
             "the hook must fire again once the spawned auto-restore actually attaches \
              the session, not just at the initial enable — this is what lets a caller \
              know to republish state that was stale while the restore was in flight"
+        );
+    }
+
+    /// `try_begin_start` is the primitive `enable`/`on_local_device` build their
+    /// leak-prevention on (see `StartGuard`'s doc comment) — verify its own
+    /// claim/release semantics directly: a second claim for the same id is refused
+    /// while the first is held, an unrelated id is unaffected, and dropping the
+    /// first guard releases the id for a fresh claim.
+    #[tokio::test]
+    async fn start_guard_serializes_concurrent_claims_for_the_same_id() {
+        let bridge = test_bridge();
+        let id = "dev-guard";
+
+        let guard = bridge.try_begin_start(id).expect("first claim must succeed");
+        assert!(
+            bridge.try_begin_start(id).is_none(),
+            "a second claim for the same id must be refused while the first is held"
+        );
+        assert!(
+            bridge.try_begin_start("dev-other").is_some(),
+            "a claim for a different id must be unaffected"
+        );
+
+        drop(guard);
+        assert!(
+            bridge.try_begin_start(id).is_some(),
+            "dropping the guard must release the id for a fresh claim"
+        );
+    }
+
+    /// The race `start_session`'s unguarded pre-fix await window allowed: two
+    /// concurrent attempts to bring up the same not-yet-live id both building a
+    /// real upstream connection, with the loser's insert silently overwriting the
+    /// winner's `BridgedSession` and leaking the loser's connection. `enable` must
+    /// now refuse to even start against an id another attempt already holds,
+    /// rather than racing it.
+    #[tokio::test]
+    async fn enable_refuses_to_race_a_start_already_in_flight_for_the_same_id() {
+        let bridge = test_bridge();
+        let id = "dev-race-enable";
+        bridge
+            .storage
+            .set_device_state_json(id, Some(mock_saved_state()));
+
+        // Simulate a concurrent enable()/auto-restore already in flight for this id.
+        let _guard = bridge.try_begin_start(id).unwrap();
+
+        let local = MockLocal::new(id, "thinq2");
+        let ok = bridge
+            .enable(local.clone() as Arc<dyn LocalDevice>, Some("401"), None)
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "enable() must not race a start already in flight for this id"
+        );
+        assert!(
+            !bridge.status_for(id),
+            "no session should have been created while the guard was held"
+        );
+    }
+
+    /// Same protection as the test above, for `on_local_device`'s auto-restore path
+    /// — a second rapid reconnect (or a concurrent `enable()`) must not spawn a
+    /// second `start_session` for an id already being brought up.
+    #[tokio::test]
+    async fn on_local_device_auto_restore_refuses_to_race_a_start_already_in_flight() {
+        let bridge = test_bridge();
+        let id = "dev-race-restore";
+        bridge
+            .storage
+            .set_device_state_json(id, Some(mock_saved_state()));
+        bridge.want_enabled.lock().insert(id.to_string());
+
+        let _guard = bridge.try_begin_start(id).unwrap();
+
+        let local = MockLocal::new(id, "thinq2");
+        bridge.on_local_device(local.clone() as Arc<dyn LocalDevice>);
+
+        // Give an (incorrectly) spawned task every chance to run before asserting
+        // it didn't.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !bridge.status_for(id),
+            "auto-restore must not race a start already in flight for this id"
         );
     }
 
