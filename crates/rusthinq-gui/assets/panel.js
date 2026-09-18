@@ -27,6 +27,11 @@ let bridge_status = false
 // which means nothing when neither is on: every device would show it then,
 // regardless of the device itself. Set from the first `features` snapshot.
 let deviceMappingCapable = false
+// Whether this build has the `bridge` Cargo feature at all -- there's no LG
+// account to log into or session to toggle without it, so the bridge column
+// and the "Bridge mode" section are dropped rather than shown disabled with
+// nothing on the page explaining why. Set from the first `features` snapshot.
+let bridgeFeatureEnabled = false
 
 // Renders one link in the Browser<->rusthinq<->MQTT chain: `connected` true/false
 // draws a matching pair -- a green "link" icon when up, a red "link_off" (broken
@@ -162,81 +167,86 @@ class DeviceEntry {
         td.innerText = this.remoteState.platform
         children.push(td)
 
-        // The width lives in the stylesheet now: on a narrow screen this cell moves out of the
-        // column layout entirely, and a fixed width there would push the row wide again.
-        td = document.createElement('td')
-        td.className = 'dev-bridge'
-        // Paired but not live while the device itself is online: the switch alone would look
-        // identical to "never bridged", hiding a real problem -- the LG-cloud session died, or
-        // never came back up after this device reconnected (see Bridge::is_paired's doc comment
-        // in rusthinq-bridge). One small icon next to the existing switch says so without a new
-        // column.
-        const bridgeWarning =
-            !this.remoteState.bridged && this.remoteState.bridgePaired
-                ? `<i class="material-icons tiny tooltipped" data-position="bottom" data-tooltip="Paired with the LG cloud but not currently relaying" style="vertical-align:middle; color:#e65100">cloud_off</i> `
-                : ''
-        td.innerHTML = `
-            ${bridgeWarning}<div class="switch">
-                <label>Off <input type="checkbox"> <span class="lever"></span>On</label>
-            </div>
-            <div class="hide preloader-wrapper verysmall active">
-                <div class="spinner-layer spinner-green-only">
-                <div class="circle-clipper left">
-                    <div class="circle"></div>
-                </div><div class="gap-patch">
-                    <div class="circle"></div>
-                </div><div class="circle-clipper right">
-                    <div class="circle"></div>
+        // No LG account to log into or session to toggle without the `bridge` Cargo feature --
+        // see panel.js's `features` handling. The cell (and its column) is dropped rather than
+        // shown full of disabled switches with nothing on the page explaining why.
+        if (bridgeFeatureEnabled) {
+            // The width lives in the stylesheet now: on a narrow screen this cell moves out of
+            // the column layout entirely, and a fixed width there would push the row wide again.
+            td = document.createElement('td')
+            td.className = 'dev-bridge'
+            // Paired but not live while the device itself is online: the switch alone would look
+            // identical to "never bridged", hiding a real problem -- the LG-cloud session died, or
+            // never came back up after this device reconnected (see Bridge::is_paired's doc comment
+            // in rusthinq-bridge). One small icon next to the existing switch says so without a new
+            // column.
+            const bridgeWarning =
+                !this.remoteState.bridged && this.remoteState.bridgePaired
+                    ? `<i class="material-icons tiny tooltipped" data-position="bottom" data-tooltip="Paired with the LG cloud but not currently relaying" style="vertical-align:middle; color:#e65100">cloud_off</i> `
+                    : ''
+            td.innerHTML = `
+                ${bridgeWarning}<div class="switch">
+                    <label>Off <input type="checkbox"> <span class="lever"></span>On</label>
                 </div>
-                </div>
-            </div>`
-        children.push(td)
+                <div class="hide preloader-wrapper verysmall active">
+                    <div class="spinner-layer spinner-green-only">
+                    <div class="circle-clipper left">
+                        <div class="circle"></div>
+                    </div><div class="gap-patch">
+                        <div class="circle"></div>
+                    </div><div class="circle-clipper right">
+                        <div class="circle"></div>
+                    </div>
+                    </div>
+                </div>`
+            children.push(td)
 
-        this.bridgeSwitch = td.getElementsByTagName('input')[0]
-        this.bridgeDiv = td.getElementsByClassName('switch')[0]
-        this.spinner = td.getElementsByClassName('preloader-wrapper')[0]
+            this.bridgeSwitch = td.getElementsByTagName('input')[0]
+            this.bridgeDiv = td.getElementsByClassName('switch')[0]
+            this.spinner = td.getElementsByClassName('preloader-wrapper')[0]
 
-        const startBridge = async (deviceType) => {
-            this.bridgeBusy = true
-            this.refreshUI()
-
-            try {
-                await fetchWrapper(`bridge/${this.id}/enable`, { deviceType }, { method: 'POST' })
-                this.remoteState.bridged = true
-            } finally {
-                this.bridgeBusy = false
+            const startBridge = async (deviceType) => {
+                this.bridgeBusy = true
                 this.refreshUI()
-            }
-        }
 
-        const stopBridge = async () => {
-            this.bridgeBusy = true
-            this.refreshUI()
-
-            try {
-                await fetchWrapper(`bridge/${this.id}/disable`, {}, { method: 'POST' })
-                this.remoteState.bridged = false
-            } finally {
-                this.bridgeBusy = false
-                this.refreshUI()
-            }
-        }
-
-        this.bridgeSwitch.onchange = () => {
-            if (this.bridgeSwitch.checked) {
-                if (this.remoteState.deviceType) {
-                    startBridge(this.remoteState.deviceType)
-                } else {
-                    get('btn_devicetype_continue').onclick = () => {
-                        let devType = get('devtype-input').value
-                        devType = devType.split(' ')[0]
-                        startBridge(devType)
-                        M.Modal.getInstance(get('devicetype_query')).close()
-                    }
-                    M.Modal.getInstance(get('devicetype_query')).open()
+                try {
+                    await fetchWrapper(`bridge/${this.id}/enable`, { deviceType }, { method: 'POST' })
+                    this.remoteState.bridged = true
+                } finally {
+                    this.bridgeBusy = false
+                    this.refreshUI()
                 }
-            } else {
-                stopBridge()
+            }
+
+            const stopBridge = async () => {
+                this.bridgeBusy = true
+                this.refreshUI()
+
+                try {
+                    await fetchWrapper(`bridge/${this.id}/disable`, {}, { method: 'POST' })
+                    this.remoteState.bridged = false
+                } finally {
+                    this.bridgeBusy = false
+                    this.refreshUI()
+                }
+            }
+
+            this.bridgeSwitch.onchange = () => {
+                if (this.bridgeSwitch.checked) {
+                    if (this.remoteState.deviceType) {
+                        startBridge(this.remoteState.deviceType)
+                    } else {
+                        get('btn_devicetype_continue').onclick = () => {
+                            let devType = get('devtype-input').value
+                            devType = devType.split(' ')[0]
+                            startBridge(devType)
+                            M.Modal.getInstance(get('devicetype_query')).close()
+                        }
+                        M.Modal.getInstance(get('devicetype_query')).open()
+                    }
+                } else {
+                    stopBridge()
+                }
             }
         }
 
@@ -262,9 +272,9 @@ class DeviceEntry {
     }
 
     refreshUI() {
-        // Offline rows have no bridge switch/spinner at all -- see updateDom's early
-        // return above.
-        if (this.remoteState.online === false) return
+        // Offline rows, and any row when this build has no `bridge` feature at all, have no
+        // bridge switch/spinner to update -- see updateDom above.
+        if (this.remoteState.online === false || !bridgeFeatureEnabled) return
         if (this.bridgeBusy) {
             this.bridgeDiv.classList.add('hide')
             this.spinner.classList.remove('hide')
@@ -334,6 +344,14 @@ function connect() {
                     M.Tooltip.init(el, { position: 'bottom' })
                 })
                 deviceMappingCapable = !!(json.features.native || json.features.scripting)
+
+                bridgeFeatureEnabled = !!json.features.bridge
+                document.getElementById('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled)
+                get('devices_table').classList.toggle('no-bridge', !bridgeFeatureEnabled)
+                // A row already on the page when this arrives was built assuming the feature
+                // was on (the default before the first snapshot) -- redraw it without the
+                // bridge cell now that we know better.
+                for (const id in devices) devices[id].updateDom()
             }
 
             // `guiMqtt` is rusthinq-gui's own MQTT connection (mqtt.rs) -- what the

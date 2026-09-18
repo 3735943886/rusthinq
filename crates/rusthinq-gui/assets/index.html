@@ -43,6 +43,13 @@
                 display: none;
             }
 
+            /* This build has no `bridge` Cargo feature at all -- see panel.js's `features`
+               handling. There is no session to toggle on any row, so the column is dropped
+               rather than shown full of disabled switches with nothing explaining why. */
+            #devices_table.no-bridge .dev-bridge {
+                display: none;
+            }
+
             nav .brand-logo .logo {
                 height: 1em;
                 vertical-align: -0.1em;
@@ -191,6 +198,16 @@
                 #devices_table .dev-actions .btn {
                     padding: 0 0.75rem;
                 }
+
+                /* No bridge column to reserve a grid track for -- see the no-bridge rule above. */
+                #devices_table.no-bridge tbody tr {
+                    grid-template-columns: minmax(0, 1fr) auto;
+                    grid-template-areas:
+                        'name     actions'
+                        'model    actions'
+                        'platform actions'
+                        'id       actions';
+                }
             }
         </style>
         <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
@@ -241,7 +258,7 @@
                         <th>ID</th>
                         <th>Model</th>
                         <th>Platform</th>
-                        <th>Bridge</th>
+                        <th class="dev-bridge">Bridge</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -250,7 +267,11 @@
             </table>
         </div>
 
-        <div class="container hide-when-offline">
+        <!-- Hidden outright (not just disabled) when this build has no `bridge` Cargo feature
+             at all -- see panel.js's `features` handling. A greyed-out login button with no
+             account behind it to log into would just raise "why is this here" with no answer
+             on the page; the config.toml/README already explain the feature is opt-in. -->
+        <div id="bridge_mode_section" class="container hide-when-offline">
             <h4 class="header orange-text">Bridge mode</h4>
             <div class="bridge-status-row">
                 <span><span id="status_bridge" class="status_field"></span>Status: <span id="status_bridge_text"></span></span>
