@@ -5,15 +5,10 @@ LG app/cloud, and exposes them over MQTT. An optional **bridge** mode can still 
 traffic to LG's real cloud, useful for reverse engineering or to keep the official app
 working alongside this.
 
-This is a Rust rewrite and independent continuation of
-[anszom/rethink](https://github.com/anszom/rethink) (TypeScript/Node). The codebase
-was forked from [BluSyn/rethink's `rust-rewrite` branch](https://github.com/BluSyn/rethink/tree/rust-rewrite)
-— an earlier Rust port of the same project, since marked unmaintained by its author in
-favor of the original TypeScript upstream — and has diverged substantially since:
-a consumer-neutral core with no Home Assistant assumptions baked in (see below), MQTT
-as the only control surface in place of a dedicated management HTTP UI, and everything
-optional (LG-cloud bridge, native/Rhai device handlers, the web dashboard) gated behind
-Cargo features instead of always compiled in. Credit for the original protocol reverse
+This is a Rust rewrite of [anszom/rethink](https://github.com/anszom/rethink)
+(TypeScript/Node), based on
+[BluSyn/rethink's `rust-rewrite` branch](https://github.com/BluSyn/rethink/tree/rust-rewrite)
+— an earlier Rust port of the same project. Credit for the original protocol reverse
 engineering, device research, and reference implementation belongs to
 [Andrzej Szombierski](https://github.com/anszom) and
 [upstream's contributors](https://github.com/anszom/rethink/graphs/contributors); credit
@@ -21,10 +16,9 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
 
 ## What makes this different from upstream
 
-- **Rust only, MQTT is the one control plane.** No Node/TypeScript in the core
-  daemon. Device traffic, a retained `<rusthinq_prefix>/devices` snapshot for
-  connected-device state, (optionally) a raw wire-frame tap/inject bus for RE
-  tooling, and even LG-cloud bridge login/logout (`<rusthinq_prefix>/bridge/login/set`
+- **Rust only, MQTT is the one control plane.** Device traffic, a retained
+  `<rusthinq_prefix>/devices` snapshot for connected-device state, (optionally) a raw
+  wire-frame tap/inject bus for RE tooling, and even LG-cloud bridge login/logout (`<rusthinq_prefix>/bridge/login/set`
   etc. — see `bridge_control.rs`) all live on MQTT — no separate CLI or process needed
   for any of it. An optional web dashboard (`rusthinq-gui`, off by default — see
   [Web dashboard](#web-dashboard-optional) below) is bundled into the same binary for
@@ -190,8 +184,9 @@ dashboard (`gui` feature + `[gui]` config, off by default) described next.
 
 `rusthinq-gui` is a small Axum HTTP/WebSocket server that renders a browser dashboard
 (device list — including known-but-offline devices, with a "forget this device"
-action for one that's gone for good — per-device bridge enable/disable, LG account
-login/logout, and a per-device raw wire-traffic monitor page) on top of the same MQTT
+action for one that's gone for good, a per-device raw wire-traffic monitor page, and —
+only in a build with the `bridge` feature — per-device bridge enable/disable and LG
+account login/logout) on top of the same MQTT
 topics documented in [`docs/mqtt-control.md`](docs/mqtt-control.md). It's off by
 default and needs both:
 
@@ -223,7 +218,7 @@ gui_pass = "change-me"
 Leaving either one unset, anyone who can reach `gui_port` can enable/disable bridging,
 trigger LG account login/logout, and read raw device traffic — only reasonable on a
 trusted LAN. `gui_port` also takes the same `{ bind, address }` table form as
-`https_port`/`mqtts_port` (see [Configuration](#configuration) below), to
+`https_port`/`mqtts_port` (see [Configuration](#configuration) above), to
 restrict it to one interface instead of every one this host has:
 
 ```toml
