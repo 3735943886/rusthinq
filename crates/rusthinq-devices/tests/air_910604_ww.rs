@@ -152,3 +152,17 @@ fn the_handshake_is_the_shared_one() {
     h.feed_hex(VALUES);
     assert_eq!(h.pending_timers(), vec![("refresh".to_string(), 900000)]);
 }
+
+#[test]
+fn the_host_refuses_what_the_descriptor_forbids_before_the_script_sees_it() {
+    let h = running();
+    let before = h.sent_raw().len();
+    h.set_property("sleep_timer", "9999"); // above the maximum of 720
+    h.set_property("sleep_timer", "65"); // the step is 10
+    h.set_property("fan", "warp"); // not one of the options
+    h.set_property("pm25", "1"); // read only
+    h.set_property("nope", "1"); // not in the descriptor at all
+    assert_eq!(h.sent_raw().len(), before);
+    let reject = h.event("reject").unwrap();
+    assert!(reject.contains("unknown property"), "{reject}");
+}

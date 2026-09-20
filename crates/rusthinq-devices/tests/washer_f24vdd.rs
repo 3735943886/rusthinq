@@ -268,3 +268,17 @@ fn the_descriptor_offers_fourteen_startable_courses_and_no_downloaded_one() {
     assert_eq!(d["props"]["start"]["requires"], "remote_start");
     rusthinq_devices::scripting::set_il_prefix(None);
 }
+
+#[test]
+fn the_host_holds_start_back_until_remote_start_is_armed() {
+    let h = harness();
+    let mut disarmed = heavy_duty_wash();
+    disarmed[14] &= !0x20;
+    h.start().feed_hex(&status(disarmed));
+    h.set_property("power_off", "");
+    assert!(h.sent_raw().is_empty());
+    assert!(h.event("reject").unwrap().contains("requires remote_start"));
+    h.feed_hex(&status(heavy_duty_wash())); // armed
+    h.set_property("power_off", "");
+    assert_eq!(h.sent_raw().len(), 1);
+}

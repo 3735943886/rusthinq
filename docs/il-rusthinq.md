@@ -25,6 +25,17 @@ inputs and outputs map onto them:
 
 A runtime error in a hook is logged and also published as a `script_error` event (`<hook>: <error>`), so a broken driver is visible over MQTT; a script that fails to compile publishes the `script_error` property once instead.
 
+**Commands are validated by the host, not by each script.** When a script has published a
+descriptor (`ctx.publish_il`), `ScriptedDevice::set_property` checks every `set` against it
+before `on_set_property` runs: the property must exist and be writable, `requires` must be
+satisfied by the last value the script published for that property, and the value must fit
+its type, options, `min`/`max` and `step` (see the Commands section of the IL). A failure is a
+`reject` event (`{"prop": .., "reason": ..}`) and nothing reaches the script; a valid value
+reaches it in canonical form. The host keeps the descriptor whether or not `il_prefix` is
+set, so this does not depend on publishing. A script that publishes no descriptor is not
+checked. A `set` for a device that is not connected at all is still dropped silently, because
+the same `set` stream carries bridge control and raw injection that other handlers consume.
+
 Timers are requests: the script never sleeps or spawns anything. The host arms one thread
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
 timer never fires. `cancel_pending_work` / `drop_device` clear them all.

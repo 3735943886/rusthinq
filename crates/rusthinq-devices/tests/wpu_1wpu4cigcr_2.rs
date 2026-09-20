@@ -155,3 +155,15 @@ fn the_descriptor_is_published() {
     assert_eq!(d["props"]["default_amount"]["rw"], true);
     rusthinq_devices::scripting::set_il_prefix(None);
 }
+
+#[test]
+fn the_host_validates_selects_and_binaries_against_the_descriptor() {
+    let h = harness();
+    h.start().feed_hex(UV_DONE);
+    h.set_property("default_amount", "continuous"); // not among the writable options
+    h.set_property("auto_care", "maybe");
+    h.set_property("water_selection", "cold"); // read only
+    assert!(h.sent_raw().is_empty());
+    h.set_property("auto_care", "ON"); // normalised to true for the script
+    assert_eq!(h.sent_raw().len(), 1);
+}

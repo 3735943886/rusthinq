@@ -86,3 +86,64 @@ fn a_runtime_error_in_a_hook_is_published_as_a_script_error_event() {
     let error = h.script_error().expect("the error is surfaced");
     assert!(error.starts_with("on_set_property:"), "{error}");
 }
+
+const IL_SCRIPT: &str = r#"
+    fn publish_config(ctx) {
+        ctx.publish_il(json_stringify(#{ il: 0, props: #{
+            on: #{ type: "binary", rw: true },
+            level: #{ type: "number", rw: true, min: 0, max: 10, step: 1 },
+            fixed: #{ type: "number" },
+            armed: #{ type: "binary" },
+            fire: #{ type: "trigger", requires: "armed" }
+        } }));
+    }
+    fn on_set_property(ctx, prop, value) { ctx.publish_property("got_" + prop, value); }
+"#;
+
+#[test]
+fn a_valid_command_reaches_the_script_in_canonical_form() {
+    let (_dir, h) = harness(IL_SCRIPT);
+    h.start();
+    h.set_property("on", "OFF");
+    h.set_property("level", "7.0");
+    assert_eq!(h.property("got_on").as_deref(), Some("false"));
+    assert_eq!(h.property("got_level").as_deref(), Some("7"));
+}
+
+#[test]
+fn an_invalid_command_is_a_reject_event_and_never_reaches_the_script() {
+    let (_dir, h) = harness(IL_SCRIPT);
+    h.start();
+    h.set_property("level", "11");
+    h.set_property("fixed", "1");
+    h.set_property("missing", "1");
+    for prop in ["got_level", "got_fixed", "got_missing"] {
+        assert_eq!(h.property(prop), None, "{prop}");
+    }
+    assert_eq!(
+        h.event("reject").unwrap(),
+        r#"{"prop":"missing","reason":"unknown property"}"#
+    );
+}
+
+#[test]
+fn requires_follows_the_last_value_the_script_published() {
+    let (_dir, h) = harness(&IL_SCRIPT.replace(
+        "fn on_set_property",
+        "fn start(ctx) { ctx.publish_property(\"armed\", \"true\"); }\n    fn on_set_property",
+    ));
+    h.set_property("fire", ""); // before start: no descriptor yet, so it passes straight through
+    assert_eq!(h.property("got_fire").as_deref(), Some(""));
+    h.start(); // the script now reports armed = true
+    h.set_property("fire", "x");
+    assert_eq!(h.property("got_fire").as_deref(), Some("x"));
+}
+
+#[test]
+fn a_script_that_publishes_no_descriptor_is_not_validated() {
+    let (_dir, h) =
+        harness("fn on_set_property(ctx, prop, value) { ctx.publish_property(\"got\", value); }");
+    h.start().set_property("anything", "as-is");
+    assert_eq!(h.property("got").as_deref(), Some("as-is"));
+    assert_eq!(h.event("reject"), None);
+}

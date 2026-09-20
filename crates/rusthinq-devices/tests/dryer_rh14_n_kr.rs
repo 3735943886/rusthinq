@@ -217,3 +217,18 @@ fn the_descriptor_is_a_dryer_with_conditional_controls() {
     assert_eq!(d["props"]["energy"]["unit"], "Wh");
     rusthinq_devices::scripting::set_il_prefix(None);
 }
+
+#[test]
+fn the_host_holds_start_back_until_remote_start_is_armed() {
+    let h = harness();
+    let mut disarmed = cotton();
+    disarmed[15] = 0;
+    h.start().feed_hex(&status(disarmed));
+    h.set_property("start", "");
+    h.set_property("pause", "");
+    assert!(h.sent_raw().is_empty());
+    assert!(h.event("reject").unwrap().contains("requires remote_start"));
+    h.feed_hex(&status(cotton())); // armed
+    h.set_property("pause", "");
+    assert_eq!(h.sent_raw().len(), 1);
+}

@@ -4,7 +4,7 @@
 
 use crate::device_trait::DeviceHandler;
 use crate::scripting::cache::{self, AstSlot};
-use crate::scripting::ctx::{DeviceCtx, DeviceHandle, TimerHost};
+use crate::scripting::ctx::{DeviceCtx, DeviceHandle, HostServices, TimerHost};
 use crate::scripting::engine::engine;
 use rhai::{AST, CallFnOptions, Dynamic, EvalAltResult, Scope};
 use rusthinq_core::metadata::Metadata;
@@ -147,6 +147,9 @@ pub struct ScriptedDevice {
     /// survives across calls.
     state: Dynamic,
     timers: Arc<TimerTable>,
+    /// The descriptor the script published and the values it reported, which a command is
+    /// validated against before the script sees it (see `il.rs`).
+    il_state: Arc<crate::scripting::il::IlState>,
 }
 
 impl ScriptedDevice {
@@ -178,8 +181,11 @@ impl ScriptedDevice {
             self.mqtt.clone(),
             self.device.clone(),
             self.state.clone(),
-            Arc::new(self.timers.clone()),
-            crate::scripting::il_prefix(),
+            HostServices {
+                timers: Arc::new(self.timers.clone()),
+                il_state: self.il_state.clone(),
+                il_prefix: crate::scripting::il_prefix(),
+            },
         );
         let id = self.id.clone();
         let fn_name_owned = fn_name.to_string();
@@ -219,8 +225,22 @@ impl DeviceHandler for ScriptedDevice {
         self.timers.armed.lock().clear();
     }
 
+    /// A command is checked against the IL descriptor the script published (writable,
+    /// `requires` satisfied, the type, options, range and step) and reaches the script
+    /// already in canonical form. One that fails is reported as a `reject` event and never
+    /// reaches the script. A script that publishes no descriptor is not checked.
     fn set_property(&self, prop: &str, value: &str) {
-        self.call("on_set_property", vec![prop.into(), value.into()]);
+        match self.il_state.validate(prop, value) {
+            Ok(Some(canonical)) => {
+                self.call("on_set_property", vec![prop.into(), canonical.into()])
+            }
+            Ok(None) => self.call("on_set_property", vec![prop.into(), value.into()]),
+            Err(reason) => {
+                let body = serde_json::json!({ "prop": prop, "reason": reason });
+                self.mqtt
+                    .publish_event(&self.id, "reject", &body.to_string());
+            }
+        }
     }
 
     fn publish_config(&self) {
@@ -294,6 +314,7 @@ fn build_scripted_device(
                 ast_slot,
                 state: Dynamic::from_map(rhai::Map::new()).into_shared(),
                 timers: Arc::new(TimerTable::default()),
+                il_state: Arc::new(crate::scripting::il::IlState::default()),
             });
             let _ = handler.timers.owner.set(Arc::downgrade(&handler));
             wire(&handler);

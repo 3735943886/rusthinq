@@ -11,6 +11,7 @@ pub mod cache;
 pub mod ctx;
 pub mod engine;
 pub mod harness;
+pub mod il;
 pub mod scripted_device;
 pub mod watcher;
 

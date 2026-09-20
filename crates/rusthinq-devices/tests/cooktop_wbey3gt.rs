@@ -195,12 +195,33 @@ fn setting_a_timer_restates_the_burner_power_level() {
 }
 
 #[test]
-fn a_timer_past_the_appliance_maximum_is_clamped_not_wrapped() {
+fn a_timer_past_the_appliance_maximum_is_refused_not_clamped_or_wrapped() {
     let h = harness();
-    h.feed_hex(REMOTE_START);
+    h.start().feed_hex(REMOTE_START);
     h.set_property("right_remaining_time", "9999");
-    // 11:59, the most ControlTimerHour/Min can carry
+    // 11:59 is the most ControlTimerHour/Min can carry: the descriptor's maximum is 719
+    assert!(h.sent_raw().is_empty());
+    assert!(
+        h.event("reject")
+            .unwrap()
+            .contains("above the maximum of 719")
+    );
+    h.set_property("right_remaining_time", "719");
     assert_eq!(inner(&h), "F043200805090B3B".to_owned() + "00000000");
+}
+
+#[test]
+fn the_host_enforces_requires_remote_start_before_the_script_is_asked() {
+    let h = harness();
+    h.start().feed_hex(COOKING); // cooking, but remote start is not granted
+    h.set_property("right_off", "");
+    h.set_property("power_off", "");
+    h.set_property("right_remaining_time", "30");
+    assert!(h.sent_raw().is_empty());
+    assert_eq!(
+        h.event("reject").unwrap(),
+        r#"{"prop":"right_remaining_time","reason":"requires remote_start"}"#
+    );
 }
 
 #[test]

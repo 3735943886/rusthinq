@@ -31,6 +31,16 @@ pub trait TimerHost: Send + Sync {
     fn cancel(&self, name: &str);
 }
 
+/// What the host hands a script's `ctx` besides the device itself: its timers, the IL
+/// descriptor state commands are validated against, and the configured `il_prefix`.
+#[derive(Clone)]
+pub struct HostServices {
+    pub timers: Arc<dyn TimerHost>,
+    pub il_state: Arc<crate::scripting::il::IlState>,
+    /// `[scripting] il_prefix`; `None` means IL descriptors are not published.
+    pub il_prefix: Option<Arc<str>>,
+}
+
 #[derive(Clone)]
 pub struct DeviceCtx {
     id: Arc<str>,
@@ -55,6 +65,8 @@ pub struct DeviceCtx {
     /// directly, sidesteps that entirely.
     state: rhai::Dynamic,
     timers: Arc<dyn TimerHost>,
+    /// The device's descriptor and last-published values, for validating commands.
+    il_state: Arc<crate::scripting::il::IlState>,
     /// `[scripting] il_prefix`; `None` means IL descriptors are not published.
     il_prefix: Option<Arc<str>>,
 }
@@ -66,8 +78,7 @@ impl DeviceCtx {
         mqtt: Arc<dyn MqttConnection>,
         device: DeviceHandle,
         state: rhai::Dynamic,
-        timers: Arc<dyn TimerHost>,
-        il_prefix: Option<Arc<str>>,
+        services: HostServices,
     ) -> Self {
         Self {
             id,
@@ -75,8 +86,9 @@ impl DeviceCtx {
             mqtt,
             device,
             state,
-            timers,
-            il_prefix,
+            timers: services.timers,
+            il_state: services.il_state,
+            il_prefix: services.il_prefix,
         }
     }
 
@@ -121,11 +133,14 @@ impl DeviceCtx {
     /// and adds the `x-mqtt` binding pointing at this device's own property topics,
     /// because a driver does not know topics. A no-op when `il_prefix` is not configured.
     pub fn publish_il(&mut self, descriptor_json: String) -> Result<(), Box<EvalAltResult>> {
+        let mut doc: serde_json::Value = serde_json::from_str(&descriptor_json)
+            .map_err(|e| format!("ctx.publish_il: invalid JSON: {e}"))?;
+        // The host keeps the descriptor to validate commands against, whether or not it is
+        // published (`il_prefix` only controls the publishing).
+        self.il_state.set_descriptor(&doc);
         let Some(prefix) = self.il_prefix.clone() else {
             return Ok(());
         };
-        let mut doc: serde_json::Value = serde_json::from_str(&descriptor_json)
-            .map_err(|e| format!("ctx.publish_il: invalid JSON: {e}"))?;
         let obj = doc
             .as_object_mut()
             .ok_or("ctx.publish_il: descriptor must be a JSON object")?;
@@ -196,6 +211,7 @@ impl DeviceCtx {
     }
 
     pub fn publish_property(&mut self, property: String, value: String) {
+        self.il_state.record_value(&property, &value);
         self.mqtt.publish_property(&self.id, &property, &value);
     }
 

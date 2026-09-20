@@ -282,3 +282,22 @@ fn a_real_frame_from_the_appliance_reads_as_idle_small_load() {
         ],
     );
 }
+
+#[test]
+fn the_host_holds_start_back_until_remote_start_is_armed() {
+    let h = harness();
+    h.start().feed_hex(&status(idle())); // remote start is not armed at the panel
+    h.set_property("start", "");
+    h.set_property("power_off", "");
+    assert!(
+        h.sent_raw().is_empty(),
+        "nothing is sent to an appliance that would refuse it"
+    );
+    assert_eq!(
+        h.event("reject").unwrap(),
+        r#"{"prop":"power_off","reason":"requires remote_start"}"#
+    );
+    h.feed_hex(&status(washing())); // now armed
+    h.set_property("start", "");
+    assert_eq!(h.sent_raw().len(), 1);
+}

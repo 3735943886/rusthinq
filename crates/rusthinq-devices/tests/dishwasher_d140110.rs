@@ -170,3 +170,13 @@ fn the_descriptor_is_published() {
     assert_eq!(d["props"]["remaining_time"]["unit"], "min");
     rusthinq_devices::scripting::set_il_prefix(None);
 }
+
+#[test]
+fn every_write_is_refused_by_the_host_because_no_property_is_writable() {
+    let h = harness();
+    h.start().feed_hex(READY);
+    h.set_property("running", "true");
+    h.set_property("status", "off");
+    assert!(h.sent_raw().is_empty());
+    assert!(h.event("reject").unwrap().contains("read-only property"));
+}

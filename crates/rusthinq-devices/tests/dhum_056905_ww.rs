@@ -117,11 +117,26 @@ fn target_humidity_write_attaches_power_and_mode() {
 }
 
 #[test]
-fn target_humidity_is_clamped_to_the_supported_range() {
+fn a_target_outside_the_descriptors_range_is_rejected_by_the_host_not_clamped() {
     let h = running();
     let before = h.sent_raw().len();
     h.set_property("target", "10");
-    assert_eq!(sent_tlvs(&h.sent_raw()[before])[0], (0x253, 30));
+    h.set_property("target", "75");
+    h.set_property("target", "45.5"); // the descriptor's step is 1
+    assert_eq!(h.sent_raw().len(), before, "nothing reaches the appliance");
+    let reject = h.event("reject").unwrap();
+    assert!(reject.contains("\"prop\":\"target\""), "{reject}");
+}
+
+#[test]
+fn the_script_receives_the_canonical_form_of_a_valid_command() {
+    let h = running();
+    let before = h.sent_raw().len();
+    h.set_property("power", "ON"); // the descriptor says binary: the script sees "true"
+    h.set_property("target", "45.0");
+    let sent = h.sent_raw();
+    assert_eq!(sent_tlvs(&sent[before]), vec![(0x1f7, 1), (0x1f9, 17)]);
+    assert_eq!(sent_tlvs(&sent[before + 1])[0], (0x253, 45));
 }
 
 #[test]
