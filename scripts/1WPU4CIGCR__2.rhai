@@ -19,6 +19,8 @@
 // 24), and mineral / sparkling totals (this model has no such tap). Energy is not on the
 // wire at all.
 
+import "aabb_common" as c;
+
 fn record_len() { 26 }
 
 fn descriptor(ctx) {
@@ -77,19 +79,6 @@ fn default_amount_wire(name) {
     switch name { "120ml" => 1, "250ml" => 2, "500ml" => 3, _ => () }
 }
 
-fn pad2(n) { if n < 10 { "0" + n } else { n.to_string() } }
-
-fn pub_name(ctx, prop, name) {
-    if name != () { ctx.publish_property(prop, name); }
-}
-
-fn on_off(v) { if v == 1 { "true" } else { "false" } }
-
-fn to_bool(text) {
-    let t = text.to_lower();
-    t == "true" || t == "on" || t == "1"
-}
-
 // ---- host hooks -------------------------------------------------------------------
 
 fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
@@ -97,8 +86,8 @@ fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
 fn on_drop(ctx) { ctx.publish_property("available", "false"); }
 
 fn on_data(ctx, data) {
-    let inner = aabb_unwrap(data);
-    if inner == () || inner.len() < 2 || inner[0] != 0x12 { return; }
+    let inner = c::inner(data, 0x12);
+    if inner == () { return; }
 
     if inner[1] == 0xec && inner.len() == 2 + record_len() * 2 {
         // The frame restates the previous record so a listener that missed one can see what
@@ -111,15 +100,15 @@ fn on_data(ctx, data) {
 
 fn status(ctx, r, o) {
     ctx.publish_property("available", "true");
-    pub_name(ctx, "status", status_name(r[o + 0]));
-    pub_name(ctx, "tap_uv", tap_uv_name(r[o + 1]));
-    pub_name(ctx, "water_selection", water_name(r[o + 2]));
-    pub_name(ctx, "water_amount", amount_name(r[o + 3]));
-    pub_name(ctx, "default_water", default_water_name(r[o + 10]));
-    pub_name(ctx, "default_amount", amount_name(r[o + 11]));
-    ctx.publish_property("auto_care", on_off(r[o + 20]));
-    ctx.publish_property("button_sound", on_off(r[o + 12]));
-    ctx.publish_property("not_use_notice", on_off(r[o + 8]));
+    c::pub_name(ctx, "status", status_name(r[o + 0]));
+    c::pub_name(ctx, "tap_uv", tap_uv_name(r[o + 1]));
+    c::pub_name(ctx, "water_selection", water_name(r[o + 2]));
+    c::pub_name(ctx, "water_amount", amount_name(r[o + 3]));
+    c::pub_name(ctx, "default_water", default_water_name(r[o + 10]));
+    c::pub_name(ctx, "default_amount", amount_name(r[o + 11]));
+    ctx.publish_property("auto_care", c::on_off(r[o + 20]));
+    ctx.publish_property("button_sound", c::on_off(r[o + 12]));
+    ctx.publish_property("not_use_notice", c::on_off(r[o + 8]));
 
     // The next self-clean, as month / day / hour / minute with no year, in UTC. Converting
     // to local time needs a timezone and a calendar, which is a consumer's business.
@@ -127,7 +116,7 @@ fn status(ctx, r, o) {
     let day = r[o + 16];
     if month >= 1 && month <= 12 && day >= 1 && day <= 31 {
         ctx.publish_property("self_clean_next",
-            pad2(month) + "-" + pad2(day) + " " + pad2(r[o + 17]) + ":" + pad2(r[o + 18]));
+            c::pad2(month) + "-" + c::pad2(day) + " " + c::pad2(r[o + 17]) + ":" + c::pad2(r[o + 18]));
     }
 }
 
@@ -150,25 +139,21 @@ fn set_field(ctx, offset, value) {
     ctx.send_raw(aabb_wrap(inner));
 }
 
-fn reject(ctx, prop, reason) {
-    ctx.publish_event("reject", json_stringify(#{ prop: prop, reason: reason }));
-}
-
 fn on_set_property(ctx, prop, value) {
     switch prop {
         "default_water" => {
             let w = default_water_wire(value);
-            if w == () { reject(ctx, prop, "unknown water"); return; }
+            if w == () { c::reject(ctx, prop, "unknown water"); return; }
             set_field(ctx, 10, w);
         }
         "default_amount" => {
             let w = default_amount_wire(value);
-            if w == () { reject(ctx, prop, "unknown amount"); return; }
+            if w == () { c::reject(ctx, prop, "unknown amount"); return; }
             set_field(ctx, 11, w);
         }
-        "auto_care" => { set_field(ctx, 20, if to_bool(value) { 1 } else { 0 }); }
-        "button_sound" => { set_field(ctx, 12, if to_bool(value) { 1 } else { 0 }); }
-        "not_use_notice" => { set_field(ctx, 8, if to_bool(value) { 1 } else { 0 }); }
-        _ => { reject(ctx, prop, "unknown or read-only property"); }
+        "auto_care" => { set_field(ctx, 20, if c::to_bool(value) { 1 } else { 0 }); }
+        "button_sound" => { set_field(ctx, 12, if c::to_bool(value) { 1 } else { 0 }); }
+        "not_use_notice" => { set_field(ctx, 8, if c::to_bool(value) { 1 } else { 0 }); }
+        _ => { c::reject(ctx, prop, "unknown or read-only property"); }
     }
 }

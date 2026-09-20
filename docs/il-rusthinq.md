@@ -27,6 +27,8 @@ Timers are requests: the script never sleeps or spawns anything. The host arms o
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
 timer never fires. `cancel_pending_work` / `drop_device` clear them all.
 
+AABB drivers share `scripts/aabb_common.rhai` (`import "aabb_common" as c;`): frame check, name/flag/bit helpers, reject.
+
 Pure helpers for AABB devices: `aabb_wrap(inner)` (array or blob) and `aabb_unwrap(frame)` (`()` if not `AA..BB`; the checksum is not validated, as elsewhere).
 
 Pure helpers for TLV devices: `tlv_frame_parse(bytes)` (returns the tag list of a standard
@@ -60,6 +62,7 @@ frames captured from a real appliance.
 | DHUM_056905_WW (LG dehumidifier) | `scripts/DHUM_056905_WW.rhai` | tested against captured frames; not yet run against the live appliance |
 | AIR_910604_WW (LG air purifier) | `scripts/AIR_910604_WW.rhai` | same |
 | 1WPU4CIGCR__2 (LG water purifier, AABB) | `scripts/1WPU4CIGCR__2.rhai` | tested against real captured frames and the write frames the appliance accepted (both from rethink's test suite); not yet run live |
+| D140110 (LG dishwasher, AABB, read-only) | `scripts/D140110.rhai` | tested against nine real frames of a full cycle (from rethink's test suite); not yet run live |
 
 TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
 
