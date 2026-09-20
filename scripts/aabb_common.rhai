@@ -30,6 +30,11 @@ fn to_bool(text) {
     t == "true" || t == "on" || t == "1"
 }
 
+// A number from text, or `()` if it is not one.
+fn to_number(text) {
+    try { text.parse_float() } catch { () }
+}
+
 fn reject(ctx, prop, reason) {
     ctx.publish_event("reject", json_stringify(#{ prop: prop, reason: reason }));
 }
