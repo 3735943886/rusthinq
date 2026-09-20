@@ -96,12 +96,16 @@ fn on_timer(ctx, name) {
     }
 }
 
-// From the device's `on_data(ctx, data)`. Consumes the capability reply (tag 0x2da) and
-// the frames that are not standard TLV state frames, and returns `()` for those. For a
-// state frame it returns `#{ tlvs, first }`: the tag list to apply, and whether this is
-// the first values frame (then the retry timer is already cancelled, the refresh armed,
-// and the device should do its one-off first-values work).
-fn receive(ctx, data) {
+// From the device's `on_data(ctx, data)`. Returns `()` for a frame that is not a standard TLV
+// state frame. Otherwise `#{ tlvs, first, caps }`:
+//   caps  the capability reply (it carries tag 0x2da). The handshake moves on to the values
+//         query; the device may read its capabilities from `tlvs` and has nothing to publish.
+//   first the first *values* response, after the capabilities: a frame of at least `min_tags`
+//         tags of which one is in `value_tags` (each appliance says which frames are its state,
+//         as the cloud does). Then the retry timer is already cancelled, the refresh armed, and
+//         the device should do its one-off first-values work. A change notification that is not
+//         one of those cannot end the retry early.
+fn receive(ctx, data, min_tags, value_tags) {
     let tlvs = tlv_frame_parse(data);
     if tlvs == () { return (); }
 
@@ -112,14 +116,16 @@ fn receive(ctx, data) {
             query(ctx, 2);
             ctx.set_timer("values_retry", retry_ms());
         }
-        return ();
+        return #{ tlvs: tlvs, first: false, caps: true };
     }
 
-    let first = !is_set(ctx, "values");
-    if first {
+    let first = false;
+    if is_set(ctx, "caps") && !is_set(ctx, "values")
+        && tlvs.len() >= min_tags && tlvs.some(|t| value_tags.contains(t.t)) {
+        first = true;
         ctx.state_set("values", true);
         ctx.cancel_timer("values_retry");
         ctx.set_timer("refresh", refresh_ms());
     }
-    #{ tlvs: tlvs, first: first }
+    #{ tlvs: tlvs, first: first, caps: false }
 }

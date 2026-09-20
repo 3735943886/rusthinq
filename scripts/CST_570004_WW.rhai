@@ -38,7 +38,7 @@ fn descriptor(ctx) {
             fan: #{ type: "select", rw: true, role: "fan_speed", src: #{ tlv_tag: "0x1fa" },
                     options: ["auto", "very_low", "low", "medium", "high", "power"] },
             target: #{ type: "number", rw: true, role: "target_temperature", src: #{ tlv_tag: "0x1fe" },
-                       min: 16, max: 30, step: 0.5, unit: "°C" },
+                       min: range_min(ctx), max: range_max(ctx), step: 0.5, unit: "°C" },
             temperature: #{ type: "number", role: "current_temperature", src: #{ tlv_tag: "0x1fd" },
                             unit: "°C" },
             humidity: #{ type: "number", class: "humidity", series: "gauge", role: "current_humidity", src: #{ tlv_tag: "0x336" }, unit: "%" },
@@ -64,6 +64,13 @@ fn descriptor(ctx) {
         }
     })
 }
+
+// The setpoint range the unit reports in its capabilities (0x2e1 / 0x2e2, half degrees); what
+// the captured unit reports until a capability reply says otherwise.
+fn range_min(ctx) { let v = ctx.state_get("range_min"); if v == () { 16 } else { v } }
+fn range_max(ctx) { let v = ctx.state_get("range_max"); if v == () { 30 } else { v } }
+
+fn deg(v) { if v % 2 == 0 { v / 2 } else { v / 2.0 } }
 
 fn mode_name(raw) {
     switch raw {
@@ -231,8 +238,9 @@ fn on_timer(ctx, name) {
 }
 
 fn on_data(ctx, data) {
-    let frame = c::receive(ctx, data);
+    let frame = c::receive(ctx, data, 10, [0x1f7]);
     if frame == () { return; }
+    if frame.caps { on_caps(ctx, frame.tlvs); return; }
 
     let before = ctx.state_get("emode");
     let energy = ();
@@ -255,6 +263,24 @@ fn on_data(ctx, data) {
         // Ask the cloud not to relay tag 1200 (the appliance's noisy periodic report).
         ctx.send_clip("setMaskingInfo", 0, "{\"blacklist_tlv\":\"1200\"}");
     }
+}
+
+// The capability reply: adopt the setpoint range the unit reports, and say so in the descriptor
+// (the host then refuses a setpoint outside it).
+fn on_caps(ctx, tlvs) {
+    let lo = ();
+    let hi = ();
+    for e in tlvs {
+        if e.t == 0x2e1 { lo = e.v; }
+        if e.t == 0x2e2 { hi = e.v; }
+    }
+    if lo == () || hi == () || lo >= hi { return; }
+    let lo = deg(lo);
+    let hi = deg(hi);
+    if lo == range_min(ctx) && hi == range_max(ctx) { return; }
+    ctx.state_set("range_min", lo);
+    ctx.state_set("range_max", hi);
+    ctx.publish_il(descriptor(ctx));
 }
 
 // Apply one wire tag.

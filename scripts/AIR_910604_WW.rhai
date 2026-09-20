@@ -114,8 +114,8 @@ fn on_drop(ctx) { ctx.publish_property("available", "false"); }
 fn on_timer(ctx, name) { c::on_timer(ctx, name); }
 
 fn on_data(ctx, data) {
-    let frame = c::receive(ctx, data);
-    if frame == () { return; }
+    let frame = c::receive(ctx, data, 10, [0x1f7]);
+    if frame == () || frame.caps { return; }
     for e in frame.tlvs { apply(ctx, e.t, e.v); }
     if frame.first { ctx.publish_property("available", "true"); }
 }

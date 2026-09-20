@@ -192,3 +192,40 @@ fn test_losing_the_connection_marks_it_unavailable() {
     d.drop_device();
     expect_eq(d.property("available"), "false");
 }
+
+fn test_a_stray_notification_before_the_values_does_not_end_the_retry() {
+    let d = device();
+    d.start();
+    d.feed(caps());
+    d.feed(t::notify([[0x1fa, 6]])); // a change notification, not the state
+    expect(has_timer(d, "values_retry"), "the values query is still being retried");
+    expect_eq(d.property("available"), ());
+    d.feed(state());
+    expect(!has_timer(d, "values_retry"), "the full state ends the retry");
+    expect_eq(d.property("available"), "true");
+}
+
+fn test_the_setpoint_range_follows_the_capability_reply() {
+    let d = device();
+    d.start();
+    expect_eq(d.descriptor().props.target.min, 16);
+    // a unit that reports a narrower range: 18.0 .. 29.0 (half degrees on the wire)
+    d.feed(t::notify([[0x2da, 55], [0x2e1, 36], [0x2e2, 58]]));
+    let target = d.descriptor().props.target;
+    expect_eq(target.min, 18);
+    expect_eq(target.max, 29);
+    d.feed(state());
+    let n = d.sent().len();
+    d.set("target", "17.5"); // below what this unit takes: the host refuses
+    expect_eq(d.sent().len(), n);
+    d.set("target", "18.5");
+    expect_eq(t::sent_since(d, n), [[[0x1fe, 37], [0x1f9, 0], [0x1fa, 6]]]);
+}
+
+fn test_the_captured_capabilities_keep_the_range_they_report() {
+    let d = device();
+    d.start();
+    d.feed(caps()); // 0x2e1 = 32, 0x2e2 = 60: 16.0 .. 30.0
+    expect_eq(d.descriptor().props.target.min, 16);
+    expect_eq(d.descriptor().props.target.max, 30);
+}

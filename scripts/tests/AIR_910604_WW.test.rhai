@@ -106,3 +106,15 @@ fn test_the_host_refuses_what_the_descriptor_forbids_before_the_script_sees_it()
     expect_eq(d.sent().len(), n);
     expect(d.event("reject").contains("unknown property"), "the last refusal is for the unknown property");
 }
+
+fn test_a_stray_notification_before_the_values_does_not_end_the_retry() {
+    let d = device();
+    d.start();
+    d.feed(caps());
+    d.feed(t::notify([[0x1fa, 6]]));
+    expect_eq(d.timers(), [["values_retry", 15000]]);
+    expect_eq(d.property("available"), ());
+    d.feed(values());
+    expect_eq(d.timers(), [["refresh", 900000]]);
+    expect_eq(d.property("available"), "true");
+}

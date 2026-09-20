@@ -156,3 +156,15 @@ fn test_dropping_the_device_marks_it_unavailable() {
     d.drop_device();
     expect_eq(d.property("available"), "false");
 }
+
+fn test_a_notification_of_tags_that_are_not_state_does_not_end_the_retry() {
+    let d = device();
+    d.start();
+    d.feed(caps());
+    d.feed(t::notify([[0x221, 0]])); // the error code alone is not one of the appliance's state tags
+    expect_eq(d.timers(), [["values_retry", 15000]]);
+    expect_eq(d.property("available"), ());
+    d.feed(t::notify([[0x1fa, 6]])); // a state tag: the cloud counts this as values too
+    expect_eq(d.property("available"), "true");
+    expect_eq(d.timers(), [["refresh", 900000]]);
+}

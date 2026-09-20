@@ -70,6 +70,9 @@ fn mode_wire(name) {
     }
 }
 
+// The tags whose presence makes a frame the appliance's state (not just a stray notify).
+fn VALUE_TAGS() { [0x1f7, 0x1f9, 0x1fa, 0x21b, 0x21e, 0x186, 0x2b2, 0x253, 0x2a2, 0x336, 0x360] }
+
 fn is_silent(raw) { raw == 2 || raw == 19 }
 
 fn tank_state_name(raw) {
@@ -111,8 +114,8 @@ fn on_drop(ctx) {
 fn on_timer(ctx, name) { c::on_timer(ctx, name); }
 
 fn on_data(ctx, data) {
-    let frame = c::receive(ctx, data);
-    if frame == () { return; }
+    let frame = c::receive(ctx, data, 1, VALUE_TAGS());
+    if frame == () || frame.caps { return; }
 
     for e in frame.tlvs { apply(ctx, e.t, e.v); }
 
