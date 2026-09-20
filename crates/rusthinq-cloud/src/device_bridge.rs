@@ -99,6 +99,9 @@ pub struct DeviceBridge {
     /// Drops currently waiting out `grace`, keyed by device id — cancelled
     /// (best-effort) by `new_device` when the same id re-registers in time.
     pending_drops: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Connected devices no handler matched when they connected, so that a script
+    /// added later can still be given to them (see `remap`).
+    unmapped: Mutex<HashMap<String, Arc<ConnectedDevice>>>,
     grace: Duration,
 }
 
@@ -117,6 +120,7 @@ impl DeviceBridge {
             t2_adapters: Mutex::new(HashMap::new()),
             t1_adapters: Mutex::new(HashMap::new()),
             pending_drops: Mutex::new(HashMap::new()),
+            unmapped: Mutex::new(HashMap::new()),
             grace,
         })
     }
@@ -177,6 +181,7 @@ impl DeviceBridge {
     /// handler installed by `install`, below).
     pub fn new_device(self: &Arc<Self>, thinqdev: Arc<ConnectedDevice>) {
         self.cancel_superseded(&thinqdev.id);
+        self.unmapped.lock().remove(&thinqdev.id);
 
         let handler: Option<Arc<dyn DeviceHandler>> = match thinqdev.platform {
             Platform::Thinq1 => {
@@ -242,10 +247,47 @@ impl DeviceBridge {
                 thinqdev.platform,
                 thinqdev.meta.model_id
             );
+            self.unmapped
+                .lock()
+                .insert(thinqdev.id.clone(), thinqdev.clone());
+            let bridge = self.clone();
+            let gone = thinqdev.clone();
+            thinqdev.add_close_handler(move || {
+                let mut unmapped = bridge.unmapped.lock();
+                if unmapped
+                    .get(&gone.id)
+                    .is_some_and(|d| Arc::ptr_eq(d, &gone))
+                {
+                    unmapped.remove(&gone.id);
+                }
+            });
             return;
         };
 
         self.install(thinqdev, handler);
+    }
+
+    /// Called after the script hot-reload watcher handled a change: re-publishes every
+    /// handler's config (a reload swaps code in but does not re-run `publish_config`, so
+    /// a changed descriptor would otherwise stay unpublished until the next reconnect),
+    /// then gives a handler to each connected device that had none and now has a script.
+    pub fn remap(self: &Arc<Self>) {
+        self.republish_all();
+        let pending: Vec<_> = self.unmapped.lock().values().cloned().collect();
+        for dev in pending {
+            let known = match dev.platform {
+                Platform::Thinq1 => lookup_t1(&dev.meta.model_id).is_some(),
+                Platform::Thinq2 => lookup_t2(&dev.meta.model_id).is_some(),
+            };
+            if known {
+                tracing::info!(
+                    "{}: a script for {} appeared — attaching it",
+                    dev.id,
+                    dev.meta.model_id
+                );
+                self.new_device(dev);
+            }
+        }
     }
 
     /// Cancels any drop still waiting out the grace period for `id`, and cancels
@@ -515,5 +557,43 @@ mod tests {
             1,
             "the id must still be known (and thus listable as offline) after the drop"
         );
+    }
+
+    /// A device that connected before its script existed gets the script once `remap`
+    /// runs (what the hot-reload watcher triggers), without reconnecting.
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn remap_attaches_a_script_that_appeared_after_the_device_connected() {
+        const MODEL: &str = "REMAP_TEST_MODEL";
+        let dir = std::env::temp_dir().join(format!("remap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        rusthinq_devices::scripting::init(dir.clone(), false);
+
+        let bridge = DeviceBridge::new(MockMqttConnection::new());
+        let dev = ConnectedDevice::new(
+            "remap-dev".into(),
+            Platform::Thinq2,
+            Metadata {
+                model_id: MODEL.into(),
+                model_name: MODEL.into(),
+                device_type: None,
+                sw_version: None,
+            },
+            Arc::new(|_b| {}),
+            Arc::new(|_m| {}),
+        );
+        bridge.new_device(dev);
+        assert!(!bridge.has_device("remap-dev"), "no script yet");
+
+        bridge.remap();
+        assert!(!bridge.has_device("remap-dev"), "still no script");
+
+        std::fs::write(dir.join(format!("{MODEL}.rhai")), "fn start(ctx) {}").unwrap();
+        bridge.remap();
+        assert!(
+            bridge.has_device("remap-dev"),
+            "the new script was attached"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

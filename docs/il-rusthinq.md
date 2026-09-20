@@ -36,6 +36,12 @@ set, so this does not depend on publishing. A script that publishes no descripto
 checked. A `set` for a device that is not connected at all is still dropped silently, because
 the same `set` stream carries bridge control and raw injection that other handlers consume.
 
+With `watch = true`, a saved, added or removed script is picked up while running: the new
+code takes effect on already-connected devices at once, every device's descriptor is
+published again (a reload does not re-run `start`, so a changed descriptor would otherwise
+wait for a reconnect), and a connected device that had no script when it connected is given
+one that has since appeared.
+
 Timers are requests: the script never sleeps or spawns anything. The host arms one thread
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
 timer never fires. `cancel_pending_work` / `drop_device` clear them all.

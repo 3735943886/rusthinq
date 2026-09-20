@@ -81,6 +81,7 @@ fn handle_events(result: DebounceEventResult) {
         }
     };
 
+    let mut changed = false;
     for event in events {
         if event.path.extension().and_then(|e| e.to_str()) != Some("rhai") {
             continue;
@@ -88,6 +89,7 @@ fn handle_events(result: DebounceEventResult) {
         if !modified_since_last_seen(&event.path) {
             continue;
         }
+        changed = true;
 
         // Independent of whether `event.path` is a top-level device script (handled
         // below) or a module some script `import`s (e.g. shared logic) — a no-op if
@@ -111,6 +113,9 @@ fn handle_events(result: DebounceEventResult) {
                 );
             }
         }
+    }
+    if changed {
+        crate::scripting::notify_scripts_changed();
     }
 }
 

@@ -195,6 +195,17 @@ async fn main() -> Result<()> {
     let mqtt_dyn: Arc<dyn rusthinq_core::mqtt::MqttConnection> = mqtt_sink.clone();
     let device_bridge = device_bridge::DeviceBridge::new(mqtt_sink.clone());
     device_bridge.attach_mqtt_sink(&mqtt_sink);
+    #[cfg(feature = "scripting")]
+    if config.scripting.is_some() {
+        // The watcher runs on its own thread; `remap` may spawn tokio tasks, so hand it
+        // the runtime.
+        let bridge = device_bridge.clone();
+        let rt = tokio::runtime::Handle::current();
+        rusthinq_devices::scripting::on_scripts_changed(move || {
+            let bridge = bridge.clone();
+            rt.spawn_blocking(move || bridge.remap());
+        });
+    }
 
     // Raw wire-frame observer/inject bus, over the same MQTT connection (see
     // raw_bus.rs) — only exists at all when raw_prefix is configured.

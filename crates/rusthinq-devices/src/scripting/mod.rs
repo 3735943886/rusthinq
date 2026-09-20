@@ -39,6 +39,30 @@ pub fn set_il_prefix(prefix: Option<String>) {
     *il_prefix_slot().write() = prefix.map(std::sync::Arc::from);
 }
 
+type ChangeCallback = Box<dyn Fn() + Send + Sync>;
+
+static ON_CHANGE: OnceLock<rusthinq_util::sync::Mutex<Vec<ChangeCallback>>> = OnceLock::new();
+
+/// Register a callback run (on the watcher thread) after the hot-reload watcher has
+/// handled a batch of `.rhai` changes — a script edited, added or removed. A reload
+/// only swaps compiled code into devices that already use it, so whoever owns the
+/// devices needs this to re-publish their descriptors and to give a device that
+/// connected before its script existed a handler.
+pub fn on_scripts_changed(cb: impl Fn() + Send + Sync + 'static) {
+    ON_CHANGE
+        .get_or_init(Default::default)
+        .lock()
+        .push(Box::new(cb));
+}
+
+pub(crate) fn notify_scripts_changed() {
+    if let Some(cbs) = ON_CHANGE.get() {
+        for cb in cbs.lock().iter() {
+            cb();
+        }
+    }
+}
+
 static RHAI_DIR: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 fn rhai_dir_slot() -> &'static RwLock<Option<PathBuf>> {
@@ -66,6 +90,17 @@ pub fn init(rhai_dir: PathBuf, watch: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registered_callback_runs_when_scripts_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        on_scripts_changed(|| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        });
+        notify_scripts_changed();
+        assert!(CALLS.load(Ordering::SeqCst) >= 1);
+    }
 
     #[test]
     fn rhai_dir_is_none_until_init_is_called() {
