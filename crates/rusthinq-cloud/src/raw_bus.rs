@@ -119,7 +119,9 @@ pub fn attach(
 
 /// Publish one bridge<->LG message: `raw/lg/tx` when `to_lg` (sent to the LG cloud),
 /// `raw/lg/rx` otherwise (received from it). Wired by `main.rs` to the bridge's traffic
-/// hook when `lg_tx`/`lg_rx` is on.
+/// hook when `lg_tx`/`lg_rx` is on. There is no LG side without the `bridge` feature, so
+/// this is not compiled without it.
+#[cfg(any(test, feature = "bridge"))]
 pub fn lg_tap(
     mqtt: &Arc<dyn MqttConnection>,
     raw_prefix: &str,
