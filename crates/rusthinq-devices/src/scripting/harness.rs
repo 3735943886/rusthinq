@@ -210,6 +210,11 @@ impl ScriptHarness {
             .map(|(_, payload, retain)| (String::from_utf8_lossy(&payload).into_owned(), retain))
     }
 
+    /// The most recent runtime error a hook raised, as `<hook>: <error>` (`None` if none).
+    pub fn script_error(&self) -> Option<String> {
+        self.event("script_error")
+    }
+
     /// Raw byte frames sent to the appliance via `ctx.send_raw`, in send order. Empty
     /// for a T1 harness (no raw send on that platform).
     pub fn sent_raw(&self) -> Vec<Vec<u8>> {

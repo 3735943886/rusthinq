@@ -77,3 +77,12 @@ fn send_clip_reaches_the_device_as_a_structured_message() {
     assert_eq!(clips[0].1, 3);
     assert_eq!(clips[0].2["k"], 1);
 }
+
+#[test]
+fn a_runtime_error_in_a_hook_is_published_as_a_script_error_event() {
+    let (_dir, h) = harness("fn on_set_property(ctx, prop, value) { let x = 1 / 0; }");
+    assert_eq!(h.script_error(), None);
+    h.set_property("anything", "");
+    let error = h.script_error().expect("the error is surfaced");
+    assert!(error.starts_with("on_set_property:"), "{error}");
+}

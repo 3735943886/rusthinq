@@ -36,7 +36,15 @@ use std::time::Duration;
 ///
 /// A missing function is not an error (most of the script API is optional) — only a
 /// genuine script runtime error is logged.
-fn call_optional(ast: &AST, label: &str, fn_name: &str, ctx: DeviceCtx, extra: Vec<Dynamic>) {
+///
+/// A genuine runtime error is returned (as text) so the caller can also surface it.
+fn call_optional(
+    ast: &AST,
+    label: &str,
+    fn_name: &str,
+    ctx: DeviceCtx,
+    extra: Vec<Dynamic>,
+) -> Option<String> {
     let mut scope = Scope::new();
     let mut args: Vec<Dynamic> = vec![Dynamic::from(ctx)];
     args.extend(extra);
@@ -46,7 +54,7 @@ fn call_optional(ast: &AST, label: &str, fn_name: &str, ctx: DeviceCtx, extra: V
         engine().call_fn_with_options(options, &mut scope, ast, fn_name, args);
     if let Err(err) = result {
         if matches!(*err, EvalAltResult::ErrorFunctionNotFound(..)) {
-            return;
+            return None;
         }
         tracing::warn!(
             target: "rusthinq_scripting",
@@ -55,7 +63,9 @@ fn call_optional(ast: &AST, label: &str, fn_name: &str, ctx: DeviceCtx, extra: V
             error = %err,
             "rhai script error"
         );
+        return Some(format!("{fn_name}: {err}"));
     }
+    None
 }
 
 /// "Broken script" stub: the script file existed but failed to compile (or vanished
@@ -173,8 +183,13 @@ impl ScriptedDevice {
         );
         let id = self.id.clone();
         let fn_name_owned = fn_name.to_string();
+        let mqtt = self.mqtt.clone();
         panic_guard::guard(&format!("rhai:{id}:{fn_name_owned}"), move || {
-            call_optional(&ast, &id, &fn_name_owned, ctx, extra);
+            // A runtime error in a hook is also published as a `script_error` event, so it
+            // can be seen without the log (and asserted on in a test).
+            if let Some(error) = call_optional(&ast, &id, &fn_name_owned, ctx, extra) {
+                mqtt.publish_event(&id, "script_error", &error);
+            }
         });
     }
 }

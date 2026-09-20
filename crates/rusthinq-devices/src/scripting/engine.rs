@@ -6,9 +6,10 @@
 use crate::scripting::ctx::DeviceCtx;
 use rhai::module_resolvers::FileModuleResolver;
 use rhai::{Dynamic, Engine, EvalAltResult, Module, ModuleResolver, Position, Shared};
-use rusthinq_util::sync::Mutex;
-use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::Duration;
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(build_engine);
 
@@ -22,15 +23,67 @@ pub fn engine() -> &'static Engine {
 /// as opposed to a top-level device script itself — can be evicted from its compiled-
 /// module cache without a process restart. `FileModuleResolver::clear_cache_for_path`
 /// needs `&mut self`; the `Engine` (and thus its resolver) is shared behind `&'static`
-/// for every device, so this `Mutex` is what makes that reachable from `invalidate_module`.
+/// for every device, so this lock is what makes that reachable from `invalidate_module`.
+///
+/// It is a `RwLock` used so that resolving never blocks: `resolve` takes a read lock, which
+/// many threads (and the same thread, recursively) may hold at once. Compiling a module
+/// resolves that module's own `import`s through this same resolver while the outer read lock
+/// is still held, so a plain `Mutex` here deadlocked the first time a module imported
+/// another module. Invalidation is the only writer and never *queues* for the write lock
+/// (`try_write` in a loop), because a queued writer would block that nested read.
+///
+/// It also fixes how a module's own `import`s are found. rhai's `FileModuleResolver` names a
+/// module's source by its import name (`"tlv_common"`), not by its file path, so an `import`
+/// inside a module has no directory to be relative to and falls back to the process's working
+/// directory. This resolver remembers the directory each module was found in and hands it
+/// back as the source of that module's nested imports, so they resolve beside it, exactly as
+/// a top-level script's do.
 struct HotReloadResolver {
-    inner: Mutex<FileModuleResolver>,
+    inner: RwLock<FileModuleResolver>,
+    /// import name -> directory it was resolved from.
+    module_dirs: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl HotReloadResolver {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(FileModuleResolver::new()),
+            inner: RwLock::new(FileModuleResolver::new()),
+            module_dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The source to resolve `path` against: the importer's own path if it has one, else the
+    /// directory its module was found in (a nested import).
+    fn effective_source(&self, source: Option<&str>) -> Option<String> {
+        let source = source?;
+        if Path::new(source)
+            .parent()
+            .is_some_and(|p| p != Path::new(""))
+        {
+            return Some(source.to_string());
+        }
+        let dirs = self.module_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        Some(match dirs.get(source) {
+            Some(dir) => dir.join(source).to_string_lossy().into_owned(),
+            None => source.to_string(),
+        })
+    }
+
+    fn invalidate(&self, path: &Path) {
+        loop {
+            match self.inner.try_write() {
+                Ok(mut resolver) => {
+                    let _ = resolver.clear_cache_for_path(path);
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    let _ = e.into_inner().clear_cache_for_path(path);
+                    return;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
     }
 }
@@ -43,7 +96,22 @@ impl ModuleResolver for HotReloadResolver {
         path: &str,
         pos: Position,
     ) -> Result<Shared<Module>, Box<EvalAltResult>> {
-        self.inner.lock().resolve(engine, source, path, pos)
+        let effective = self.effective_source(source);
+        // Remember where `path` is being looked for, so its own imports can find their way.
+        if let Some(dir) = effective
+            .as_deref()
+            .and_then(|s| Path::new(s).parent())
+            .filter(|p| *p != Path::new(""))
+        {
+            self.module_dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_string(), dir.to_path_buf());
+        }
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(engine, effective.as_deref(), path, pos)
     }
 }
 
@@ -73,7 +141,7 @@ impl ModuleResolver for SharedResolverHandle {
 /// top-level device script (which `cache::reload` handles separately) or a module
 /// some script `import`s — harmless no-op if `path` was never resolved as a module.
 pub(crate) fn invalidate_module(path: &Path) {
-    let _ = MODULE_RESOLVER.inner.lock().clear_cache_for_path(path);
+    MODULE_RESOLVER.invalidate(path);
 }
 
 /// Op-count/collection-size sandboxing — a buggy device script (infinite loop, a huge
@@ -267,6 +335,34 @@ mod tests {
         let ast = engine().compile(script).unwrap();
         let mut scope = Scope::new();
         engine().call_fn(&mut scope, &ast, "run_script", ())
+    }
+
+    /// A module that itself imports another module, with the working directory somewhere
+    /// else entirely. Two things went wrong here before: the resolver held its (then
+    /// non-reentrant) lock while compiling a module and deadlocked on the nested import, and
+    /// rhai names a module's source by import name, so the nested import was looked up
+    /// relative to the working directory instead of beside the module.
+    #[test]
+    fn a_module_can_import_another_module_from_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inner_mod.rhai"), "fn base() { 40 }").unwrap();
+        std::fs::write(
+            dir.path().join("outer_mod.rhai"),
+            "import \"inner_mod\" as i;\nfn answer() { i::base() + 2 }",
+        )
+        .unwrap();
+        let script = dir.path().join("script.rhai");
+        std::fs::write(
+            &script,
+            "import \"outer_mod\" as o;\nfn run_script() { o::answer() }",
+        )
+        .unwrap();
+        let ast = engine().compile_file(script).unwrap();
+        let mut scope = Scope::new();
+        let answer: i64 = engine()
+            .call_fn(&mut scope, &ast, "run_script", ())
+            .unwrap();
+        assert_eq!(answer, 42);
     }
 
     #[test]
