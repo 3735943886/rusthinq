@@ -23,9 +23,13 @@ inputs and outputs map onto them:
 | `SetTimer` / `CancelTimer` | `ctx.set_timer(name, ms)` / `ctx.cancel_timer(name)` |
 | `Reject` | `ctx.publish_event("reject", json)` |
 
+A runtime error in a hook is logged and also published as a `script_error` event (`<hook>: <error>`), so a broken driver is visible over MQTT; a script that fails to compile publishes the `script_error` property once instead.
+
 Timers are requests: the script never sleeps or spawns anything. The host arms one thread
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
 timer never fires. `cancel_pending_work` / `drop_device` clear them all.
+
+The washer / dryer / styler family shares `scripts/monitoring_common.rhai` (record parsing for the 0xEC / 0xEB / 0xE2 frames, command acknowledgements reported as rejections, the course a Start will ask for), which itself imports `aabb_common`.
 
 AABB drivers share `scripts/aabb_common.rhai` (`import "aabb_common" as c;`): frame check, name/flag/bit helpers, reject.
 
@@ -64,6 +68,7 @@ frames captured from a real appliance.
 | 1WPU4CIGCR__2 (LG water purifier, AABB) | `scripts/1WPU4CIGCR__2.rhai` | tested against real captured frames and the write frames the appliance accepted (both from rethink's test suite); not yet run live |
 | D140110 (LG dishwasher, AABB, read-only) | `scripts/D140110.rhai` | tested against nine real frames of a full cycle (from rethink's test suite); not yet run live |
 | WBEY3GT (LG cooktop, AABB) | `scripts/WBEY3GT.rhai` | tested against real frames and the command frames the LG app sent, byte for byte; not yet run live. Writes are rejected unless the panel has granted remote start, and no command lights a ring |
+| Pd0F_F (LG mini washer, AABB monitoring record) | `scripts/Pd0F_F.rhai` | commands byte for byte as the LG app sent them (from rethink's test suite); status frames built from the documented offsets and the state the rethink adapter had retained, not yet checked against a live capture |
 
 TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
 
