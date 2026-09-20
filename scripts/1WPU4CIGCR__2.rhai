@@ -33,24 +33,24 @@ fn descriptor(ctx) {
         model: ctx.model_id(),
         props: #{
             available: #{ type: "binary", role: "available" },
-            status: #{ type: "select", options: ["failed", "not_working", "normal"] },
+            status: #{ type: "select", category: "diagnostic", options: ["failed", "not_working", "normal"] },
             tap_uv: #{ type: "select", label: "Tap UV lamp",
                        options: ["standby", "cleaning", "cleaning_manual"] },
             water_selection: #{ type: "select", label: "Water selected",
                                 options: ["hot", "normal", "cold", "sterilized"] },
             water_amount: #{ type: "select", label: "Amount selected",
                              options: ["120ml", "250ml", "500ml", "continuous"] },
-            default_water: #{ type: "select", rw: true,
+            default_water: #{ type: "select", category: "config", rw: true,
                               options: ["last_used", "normal", "cold"] },
-            default_amount: #{ type: "select", rw: true, options: ["120ml", "250ml", "500ml"] },
-            auto_care: #{ type: "binary", rw: true },
-            button_sound: #{ type: "binary", rw: true },
-            not_use_notice: #{ type: "binary", rw: true, label: "Unused-water notice" },
-            self_clean_next: #{ type: "text", label: "Next self-clean, UTC (MM-DD HH:MM)" },
-            hot_water_today: #{ type: "number", unit: "mL", label: "Hot water dispensed today" },
-            normal_water_today: #{ type: "number", unit: "mL", label: "Purified water dispensed today" },
-            cold_water_today: #{ type: "number", unit: "mL", label: "Cold water dispensed today" },
-            sterilized_water_today: #{ type: "number", unit: "mL", label: "Sterilised water dispensed today" }
+            default_amount: #{ type: "select", category: "config", rw: true, options: ["120ml", "250ml", "500ml"] },
+            auto_care: #{ type: "binary", category: "config", rw: true },
+            button_sound: #{ type: "binary", category: "config", rw: true },
+            not_use_notice: #{ type: "binary", category: "config", rw: true, label: "Unused-water notice" },
+            self_clean_next: #{ type: "text", category: "diagnostic", label: "Next self-clean, UTC (MM-DD HH:MM)" },
+            hot_water_today: #{ type: "number", class: "volume", series: "counter", unit: "mL", label: "Hot water dispensed today" },
+            normal_water_today: #{ type: "number", class: "volume", series: "counter", unit: "mL", label: "Purified water dispensed today" },
+            cold_water_today: #{ type: "number", class: "volume", series: "counter", unit: "mL", label: "Cold water dispensed today" },
+            sterilized_water_today: #{ type: "number", class: "volume", series: "counter", unit: "mL", label: "Sterilised water dispensed today" }
         }
     })
 }

@@ -34,18 +34,18 @@ fn descriptor(ctx) {
             course: #{ type: "select", label: "Cycle",
                        options: ["none", "auto", "intensive", "delicate", "turbo", "eco", "rinse",
                                  "refresh", "express", "machine_clean", "download_cycle"] },
-            error: #{ type: "select", options: ["none", "HE", "IE", "OE", "FE", "TE", "AE", "EE", "LE", "NE", "BE", "F3"] },
-            running: #{ type: "binary" },
-            door: #{ type: "binary", label: "Door open" },
+            error: #{ type: "select", category: "diagnostic", options: ["none", "HE", "IE", "OE", "FE", "TE", "AE", "EE", "LE", "NE", "BE", "F3"] },
+            running: #{ type: "binary", class: "running" },
+            door: #{ type: "binary", class: "door", label: "Door open" },
             child_lock: #{ type: "binary" },
-            chime: #{ type: "binary" },
-            rinse_refill: #{ type: "binary", label: "Rinse aid low" },
-            salt_refill: #{ type: "binary", label: "Salt low" },
-            total_time: #{ type: "number", unit: "min" },
-            remaining_time: #{ type: "number", unit: "min" },
-            reserve_time: #{ type: "number", unit: "min", label: "Delayed start" },
-            rinse_aid_level: #{ type: "number" },
-            softening_level: #{ type: "number", label: "Water softening level" }
+            chime: #{ type: "binary", category: "diagnostic" },
+            rinse_refill: #{ type: "binary", class: "problem", label: "Rinse aid low" },
+            salt_refill: #{ type: "binary", class: "problem", label: "Salt low" },
+            total_time: #{ type: "number", class: "duration", unit: "min" },
+            remaining_time: #{ type: "number", class: "duration", unit: "min" },
+            reserve_time: #{ type: "number", class: "duration", unit: "min", label: "Delayed start" },
+            rinse_aid_level: #{ type: "number", category: "diagnostic" },
+            softening_level: #{ type: "number", category: "diagnostic", label: "Water softening level" }
         }
     })
 }

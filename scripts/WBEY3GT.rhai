@@ -36,8 +36,8 @@ fn timer_max_minutes() { 11 * 60 + 59 }
 fn descriptor(ctx) {
     let props = #{
         available: #{ type: "binary", role: "available" },
-        remote_start: #{ type: "binary", label: "Remote start granted at the panel" },
-        cooking: #{ type: "binary" },
+        remote_start: #{ type: "binary", category: "diagnostic", label: "Remote start granted at the panel" },
+        cooking: #{ type: "binary", class: "heat" },
         locked: #{ type: "binary", label: "Panel lock" },
         power_off: #{ type: "trigger", label: "Switch the cooktop off", requires: "remote_start" }
     };
@@ -46,11 +46,11 @@ fn descriptor(ctx) {
         props[k + "_state"] = #{ type: "select", group: k, label: b[1] + " state",
                                  options: ["off", "cooking", "paused"] };
         // 0 is off and the dial runs 1..9; the model allows up to 11 (presumably a boost step)
-        props[k + "_power_level"] = #{ type: "number", group: k, label: b[1] + " power level" };
-        props[k + "_cook_time"] = #{ type: "number", group: k, unit: "min", label: b[1] + " cooking time" };
+        props[k + "_power_level"] = #{ type: "number", series: "gauge", group: k, label: b[1] + " power level" };
+        props[k + "_cook_time"] = #{ type: "number", class: "duration", group: k, unit: "min", label: b[1] + " cooking time" };
         // settable, but only while the ring is lit: the command restates the power level, and
         // a level of 0 is the command to switch the ring off
-        props[k + "_remaining_time"] = #{ type: "number", rw: true, group: k, unit: "min",
+        props[k + "_remaining_time"] = #{ type: "number", class: "duration", rw: true, group: k, unit: "min",
                                           min: 0, max: timer_max_minutes(), step: 1,
                                           requires: "remote_start", label: b[1] + " remaining time" };
         props[k + "_off"] = #{ type: "trigger", group: k, requires: "remote_start",

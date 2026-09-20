@@ -29,20 +29,20 @@ fn descriptor(ctx) {
                      options: ["smart", "jet", "silent", "spot", "laundry"] },
             target: #{ type: "number", rw: true, role: "target_humidity", src: #{ tlv_tag: "0x253" },
                        min: 30, max: 70, step: 1, unit: "%" },
-            humidity: #{ type: "number", role: "current_humidity", src: #{ tlv_tag: "0x336" }, unit: "%" },
-            temperature: #{ type: "number", role: "current_temperature", src: #{ tlv_tag: "0x1fd" },
+            humidity: #{ type: "number", class: "humidity", series: "gauge", role: "current_humidity", src: #{ tlv_tag: "0x336" }, unit: "%" },
+            temperature: #{ type: "number", class: "temperature", series: "gauge", role: "current_temperature", src: #{ tlv_tag: "0x1fd" },
                             unit: "°C" },
             fan: #{ type: "select", rw: true, role: "fan_speed", src: #{ tlv_tag: "0x1fa" },
                     options: ["low", "high"] },
-            tank_full: #{ type: "binary", src: #{ tlv_tag: "0x186" } },
-            tank_state: #{ type: "select", src: #{ tlv_tag: "0x186" },
+            tank_full: #{ type: "binary", class: "problem", src: #{ tlv_tag: "0x186" } },
+            tank_state: #{ type: "select", category: "diagnostic", src: #{ tlv_tag: "0x186" },
                            options: ["not_full", "full_stopped", "full_fan_mode"] },
             sterilize: #{ type: "binary", rw: true, src: #{ tlv_tag: "0x360" } },
             uvnano: #{ type: "binary", rw: true, src: #{ tlv_tag: "0x2a2" } },
             bucket_light: #{ type: "binary", rw: true, src: #{ tlv_tag: "0x21e" } },
-            off_timer: #{ type: "number", rw: true, src: #{ tlv_tag: "0x21b" },
+            off_timer: #{ type: "number", class: "duration", rw: true, src: #{ tlv_tag: "0x21b" },
                           min: 0, max: 540, step: 60, unit: "min" },
-            error: #{ type: "number", src: #{ tlv_tag: "0x221" } }
+            error: #{ type: "number", category: "diagnostic", src: #{ tlv_tag: "0x221" } }
         }
     })
 }

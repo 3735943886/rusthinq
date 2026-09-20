@@ -131,7 +131,7 @@ fn descriptor(ctx) {
         model: ctx.model_id(),
         props: #{
             available: #{ type: "binary", role: "available" },
-            power: #{ type: "binary", label: "Powered on" },
+            power: #{ type: "binary", class: "running", label: "Powered on" },
             status: #{ type: "select", options: m::names(states()) },
             course: #{ type: "select", label: "Course (dial)", options: m::names(courses()) },
             course_select: #{ type: "select", rw: true, label: "Course for Start",
@@ -140,18 +140,18 @@ fn descriptor(ctx) {
             pause: #{ type: "trigger", requires: "remote_start" },
             power_off: #{ type: "trigger", requires: "remote_start" },
             smart_course: #{ type: "select", options: m::names(smart_courses()) },
-            download_course: #{ type: "select", label: "Downloaded course",
+            download_course: #{ type: "select", category: "diagnostic", label: "Downloaded course",
                                 options: m::names(smart_courses()) },
-            remaining_time: #{ type: "number", unit: "min" },
-            initial_time: #{ type: "number", unit: "min", label: "Cycle length" },
-            reserve_time: #{ type: "number", unit: "min", label: "Reserved finish time" },
+            remaining_time: #{ type: "number", class: "duration", unit: "min" },
+            initial_time: #{ type: "number", class: "duration", category: "diagnostic", unit: "min", label: "Cycle length" },
+            reserve_time: #{ type: "number", class: "duration", unit: "min", label: "Reserved finish time" },
             // holds the last cycle's total while idle, climbs during a cycle, resets at the next
-            energy: #{ type: "number", unit: "Wh", label: "Cycle energy" },
-            error: #{ type: "binary" },
-            error_message: #{ type: "text" },
+            energy: #{ type: "number", class: "energy", series: "counter", unit: "Wh", label: "Cycle energy" },
+            error: #{ type: "binary", class: "problem", category: "diagnostic" },
+            error_message: #{ type: "text", category: "diagnostic" },
             night_dry: #{ type: "binary" },
-            child_lock: #{ type: "binary" },
-            remote_start: #{ type: "binary", label: "Remote start armed at the panel" }
+            child_lock: #{ type: "binary", category: "diagnostic" },
+            remote_start: #{ type: "binary", category: "diagnostic", label: "Remote start armed at the panel" }
         }
     })
 }

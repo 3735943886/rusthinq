@@ -29,18 +29,18 @@ fn descriptor(ctx) {
                      options: ["circulator_clean", "baby_care", "dual_clean", "auto"] },
             fan: #{ type: "select", rw: true, role: "fan_speed", src: #{ tlv_tag: "0x1fa" },
                     options: ["low", "mid", "high", "power", "auto"] },
-            pm1: #{ type: "number", src: #{ tlv_tag: "0x333" }, unit: "µg/m³" },
-            pm25: #{ type: "number", src: #{ tlv_tag: "0x334" }, unit: "µg/m³" },
-            pm10: #{ type: "number", src: #{ tlv_tag: "0x335" }, unit: "µg/m³" },
-            air_quality: #{ type: "number", src: #{ tlv_tag: "0x240" }, min: 1, max: 4 },
-            odor: #{ type: "number", src: #{ tlv_tag: "0x241" }, min: 1, max: 4 },
-            filter_life: #{ type: "number", src: #{ tlv_tag: "0x355" }, unit: "%" },
-            top_filter_life: #{ type: "number", src: #{ tlv_tag: "0x363" }, unit: "%" },
-            light: #{ type: "binary", rw: true, src: #{ tlv_tag: "0x24e" } },
-            sterilize: #{ type: "binary", rw: true, src: #{ tlv_tag: "0x360" } },
-            sleep_timer: #{ type: "number", rw: true, src: #{ tlv_tag: "0x21a" },
+            pm1: #{ type: "number", class: "pm1", series: "gauge", src: #{ tlv_tag: "0x333" }, unit: "μg/m³" },
+            pm25: #{ type: "number", class: "pm25", series: "gauge", src: #{ tlv_tag: "0x334" }, unit: "μg/m³" },
+            pm10: #{ type: "number", class: "pm10", series: "gauge", src: #{ tlv_tag: "0x335" }, unit: "μg/m³" },
+            air_quality: #{ type: "number", series: "gauge", src: #{ tlv_tag: "0x240" }, min: 1, max: 4 },
+            odor: #{ type: "number", series: "gauge", src: #{ tlv_tag: "0x241" }, min: 1, max: 4 },
+            filter_life: #{ type: "number", series: "gauge", src: #{ tlv_tag: "0x355" }, unit: "%" },
+            top_filter_life: #{ type: "number", series: "gauge", src: #{ tlv_tag: "0x363" }, unit: "%" },
+            light: #{ type: "binary", category: "config", rw: true, src: #{ tlv_tag: "0x24e" } },
+            sterilize: #{ type: "binary", category: "config", rw: true, src: #{ tlv_tag: "0x360" } },
+            sleep_timer: #{ type: "number", class: "duration", rw: true, src: #{ tlv_tag: "0x21a" },
                             min: 0, max: 720, step: 10, unit: "min" },
-            error: #{ type: "number", src: #{ tlv_tag: "0x221" } }
+            error: #{ type: "number", category: "diagnostic", src: #{ tlv_tag: "0x221" } }
         }
     })
 }

@@ -106,7 +106,7 @@ fn descriptor(ctx) {
         model: ctx.model_id(),
         props: #{
             available: #{ type: "binary", role: "available" },
-            power: #{ type: "binary", label: "Powered on" },
+            power: #{ type: "binary", class: "running", label: "Powered on" },
             status: #{ type: "select", options: ["off", "initial", "paused", "sensing", "soaking",
                       "washing", "rinsing", "spinning", "complete", "reserved", "firmware_update",
                       "diagnosis"] },
@@ -118,21 +118,21 @@ fn descriptor(ctx) {
             start: #{ type: "trigger", requires: "remote_start" },
             pause: #{ type: "trigger", requires: "remote_start" },
             power_off: #{ type: "trigger", requires: "remote_start" },
-            remaining_time: #{ type: "number", unit: "min" },
-            initial_time: #{ type: "number", unit: "min", label: "Cycle length" },
-            reserve_time: #{ type: "number", unit: "min", label: "Reserved finish time" },
+            remaining_time: #{ type: "number", class: "duration", unit: "min" },
+            initial_time: #{ type: "number", class: "duration", category: "diagnostic", unit: "min", label: "Cycle length" },
+            reserve_time: #{ type: "number", class: "duration", unit: "min", label: "Reserved finish time" },
             temp: #{ type: "select", label: "Water temperature",
                      options: ["cold", "cold_wash", "30", "35", "38", "40", "60", "90"] },
-            rinse: #{ type: "number", label: "Rinse cycles" },
+            rinse: #{ type: "number", series: "gauge", label: "Rinse cycles" },
             spin: #{ type: "binary" },
-            error: #{ type: "binary" },
-            error_message: #{ type: "text" },
+            error: #{ type: "binary", class: "problem", category: "diagnostic" },
+            error_message: #{ type: "text", category: "diagnostic" },
             sterilize: #{ type: "binary" },
             warm_water: #{ type: "binary" },
-            door_lock: #{ type: "binary" },
-            child_lock: #{ type: "binary" },
-            audible_diagnosis: #{ type: "binary" },
-            remote_start: #{ type: "binary", label: "Remote start armed at the panel" }
+            door_lock: #{ type: "binary", category: "diagnostic" },
+            child_lock: #{ type: "binary", category: "diagnostic" },
+            audible_diagnosis: #{ type: "binary", category: "diagnostic" },
+            remote_start: #{ type: "binary", category: "diagnostic", label: "Remote start armed at the panel" }
         }
     })
 }

@@ -110,7 +110,7 @@ fn descriptor(ctx) {
         il: 0, kind: "dryer", label: "Dryer", vendor: "LG", model: ctx.model_id(),
         props: #{
             available: #{ type: "binary", role: "available" },
-            power: #{ type: "binary", label: "Powered on" },
+            power: #{ type: "binary", class: "running", label: "Powered on" },
             status: #{ type: "select", options: ["off", "initial", "running", "paused", "complete",
                                                   "error", "audible_diagnosis", "reserved"] },
             process: #{ type: "select", label: "Cycle step",
@@ -122,24 +122,24 @@ fn descriptor(ctx) {
             start: #{ type: "trigger", requires: "remote_start" },
             pause: #{ type: "trigger", requires: "remote_start" },
             power_off: #{ type: "trigger", requires: "remote_start" },
-            remaining_time: #{ type: "number", unit: "min" },
-            initial_time: #{ type: "number", unit: "min", label: "Cycle length" },
-            reserve_time: #{ type: "number", unit: "min", label: "Reserved finish time" },
+            remaining_time: #{ type: "number", class: "duration", unit: "min" },
+            initial_time: #{ type: "number", class: "duration", category: "diagnostic", unit: "min", label: "Cycle length" },
+            reserve_time: #{ type: "number", class: "duration", unit: "min", label: "Reserved finish time" },
             dry_level: #{ type: "select", options: ["none", "damp_dry", "less_dry", "iron_dry",
                                                     "cupboard_dry", "very_dry"] },
             eco_hybrid: #{ type: "select", options: ["none", "eco", "normal", "turbo"] },
             // climbs during the cycle and resets to 0 at the next one
-            energy: #{ type: "number", unit: "Wh", label: "Cycle energy" },
-            error: #{ type: "binary" },
-            error_message: #{ type: "text" },
+            energy: #{ type: "number", class: "energy", series: "counter", unit: "Wh", label: "Cycle energy" },
+            error: #{ type: "binary", class: "problem", category: "diagnostic" },
+            error_message: #{ type: "text", category: "diagnostic" },
             steam: #{ type: "binary" },
             anti_crease: #{ type: "binary" },
             hand_iron: #{ type: "binary", label: "Easy iron" },
             damp_dry_beep: #{ type: "binary" },
             self_clean: #{ type: "binary", label: "Condenser self-clean" },
             reservation: #{ type: "binary" },
-            child_lock: #{ type: "binary" },
-            remote_start: #{ type: "binary", label: "Remote start armed at the panel" }
+            child_lock: #{ type: "binary", category: "diagnostic" },
+            remote_start: #{ type: "binary", category: "diagnostic", label: "Remote start armed at the panel" }
         }
     })
 }

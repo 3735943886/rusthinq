@@ -1,0 +1,118 @@
+//! Every shipped driver's descriptor is well formed against the IL: known types and roles
+//! (with the type each role requires), coherent `class` / `series` / `category`, and
+//! `requires` naming a real binary.
+#![cfg(feature = "scripting")]
+
+use rusthinq_devices::scripting::ScriptHarness;
+use serde_json::Value;
+
+const MODELS: &[&str] = &[
+    "1WPU4CIGCR__2",
+    "AIR_910604_WW",
+    "CST_570004_WW",
+    "D140110",
+    "DHUM_056905_WW",
+    "F24VDD",
+    "Pd0F_F",
+    "RH14_N_KR",
+    "S3BF_POD_DN4",
+    "WBEY3GT",
+];
+
+/// role -> the type the registry gives it
+const ROLES: &[(&str, &str)] = &[
+    ("available", "binary"),
+    ("on", "binary"),
+    ("mode", "select"),
+    ("fan_speed", "select"),
+    ("target_humidity", "number"),
+    ("current_humidity", "number"),
+    ("current_temperature", "number"),
+    ("target_temperature", "number"),
+    ("swing_vertical", "binary"),
+    ("swing_horizontal", "binary"),
+    ("action", "select"),
+];
+
+fn descriptor(model: &str) -> Value {
+    rusthinq_devices::scripting::set_il_prefix(Some("il".to_string()));
+    let path = format!("{}/../../scripts/{model}.rhai", env!("CARGO_MANIFEST_DIR"));
+    let h = ScriptHarness::t2(&path, model);
+    h.start();
+    let (_, payload, _) = h
+        .raw_publishes()
+        .into_iter()
+        .find(|(t, _, _)| t.starts_with("il/"))
+        .unwrap_or_else(|| panic!("{model} published no descriptor"));
+    serde_json::from_str(&payload).unwrap()
+}
+
+#[test]
+fn every_driver_publishes_a_well_formed_descriptor() {
+    for model in MODELS {
+        let d = descriptor(model);
+        assert_eq!(d["il"], 0, "{model}");
+        let props = d["props"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{model}: no props"));
+        assert!(props.contains_key("available"), "{model}: no availability");
+        for (name, p) in props {
+            let at = format!("{model}.{name}");
+            let ty = p["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{at}: no type"));
+            assert!(
+                ["binary", "number", "select", "text", "trigger"].contains(&ty),
+                "{at}: type {ty}"
+            );
+            let rw = p["rw"].as_bool().unwrap_or(false);
+            if let Some(role) = p.get("role") {
+                let role = role.as_str().unwrap();
+                let want = ROLES
+                    .iter()
+                    .find(|(r, _)| *r == role)
+                    .unwrap_or_else(|| panic!("{at}: unknown role {role}"))
+                    .1;
+                assert_eq!(ty, want, "{at}: role {role} has type {want}");
+            }
+            if let Some(series) = p.get("series") {
+                assert_eq!(ty, "number", "{at}: series only on numbers");
+                assert!(
+                    ["gauge", "counter"].contains(&series.as_str().unwrap()),
+                    "{at}"
+                );
+            }
+            if let Some(cat) = p.get("category") {
+                let cat = cat.as_str().unwrap();
+                assert!(
+                    ["diagnostic", "config"].contains(&cat),
+                    "{at}: category {cat}"
+                );
+                assert!(
+                    cat != "config" || rw,
+                    "{at}: a config control must be writable"
+                );
+                assert!(
+                    cat != "diagnostic" || !rw,
+                    "{at}: a diagnostic is not a control"
+                );
+            }
+            if let Some(class) = p.get("class") {
+                assert!(class.as_str().is_some_and(|c| !c.is_empty()), "{at}");
+            }
+            if ty == "select" {
+                assert!(
+                    !p["options"].as_array().unwrap_or(&vec![]).is_empty(),
+                    "{at}: no options"
+                );
+            }
+            if ty == "number" && p.get("min").is_some() && p.get("max").is_some() {
+                assert!(p["min"].as_f64() <= p["max"].as_f64(), "{at}: min > max");
+            }
+            if let Some(req) = p.get("requires") {
+                let req = req.as_str().unwrap();
+                assert_eq!(props[req]["type"], "binary", "{at}: requires {req}");
+            }
+        }
+    }
+}
