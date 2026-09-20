@@ -27,7 +27,7 @@ fn rhai_dir_slot() -> &'static RwLock<Option<PathBuf>> {
     RHAI_DIR.get_or_init(|| RwLock::new(None))
 }
 
-/// Directory of `<modelId>.rhai` scripts, if `[devices]` configured one. `None` means
+/// Directory of `<modelId>.rhai` scripts, if `[scripting]` configured one. `None` means
 /// scripting is entirely off — `registry.rs`'s fallback never triggers.
 pub(crate) fn rhai_dir() -> Option<PathBuf> {
     rhai_dir_slot().read().clone()

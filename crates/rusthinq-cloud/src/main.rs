@@ -110,8 +110,8 @@ async fn main() -> Result<()> {
             .to_string_lossy()
             .into();
     }
-    if let Some(ref mut devices) = config.devices {
-        devices.rhai_dir = config_dir.join(&devices.rhai_dir).to_string_lossy().into();
+    if let Some(ref mut scripting) = config.scripting {
+        scripting.rhai_dir = config_dir.join(&scripting.rhai_dir).to_string_lossy().into();
     }
     // On by default (not an opt-in feature — see MqttConfig::state_file's doc
     // comment): falls back to a default path next to the config file rather than
@@ -161,25 +161,25 @@ async fn main() -> Result<()> {
     let known_devices = known_devices::KnownDevices::new(Some(known_devices_path));
 
     // Rhai device scripting (see rusthinq_devices::scripting) — only exists at all
-    // when [devices] is configured, same opt-in-by-presence pattern as [bridge]/
+    // when [scripting] is configured, same opt-in-by-presence pattern as [bridge]/
     // raw_prefix. Must run before any device can connect (before DeviceBridge exists),
     // since registry.rs's script fallback checks rhai_dir on every lookup. Compiled
     // out entirely without the `scripting` feature.
     #[cfg(feature = "scripting")]
-    if let Some(ref devices) = config.devices {
-        rusthinq_devices::scripting::init(PathBuf::from(&devices.rhai_dir), devices.watch);
+    if let Some(ref scripting) = config.scripting {
+        rusthinq_devices::scripting::init(PathBuf::from(&scripting.rhai_dir), scripting.watch);
         logging::log(
             "status",
             &[&format!(
                 "rhai device scripting enabled: dir={} watch={}",
-                devices.rhai_dir, devices.watch
+                scripting.rhai_dir, scripting.watch
             )],
         );
     }
     #[cfg(not(feature = "scripting"))]
-    if config.devices.is_some() {
+    if config.scripting.is_some() {
         tracing::warn!(
-            "config.toml has a [devices] section but this binary was built without \
+            "config.toml has a [scripting] section but this binary was built without \
              the `scripting` feature — ignoring it, no .rhai device scripts available"
         );
     }
@@ -342,7 +342,7 @@ async fn main() -> Result<()> {
 
     // Optional web dashboard (rusthinq_gui) — its own independent MQTT client, not
     // wired into `mqtt_sink`/`DeviceBridge` at all (see rusthinq-gui's crate docs).
-    // Same opt-in-by-presence pattern as `[bridge]`/`[devices]`.
+    // Same opt-in-by-presence pattern as `[bridge]`/`[scripting]`.
     #[cfg(feature = "gui")]
     if let Some(ref gui) = config.gui {
         let gui_cfg = gui.clone();

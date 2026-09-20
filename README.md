@@ -46,7 +46,7 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
      upstream device handlers use, ported into a small `DeviceHandler` trait. Requires
      a rebuild to add or change.
   2. **A `.rhai` script — no rebuild, no restart.** Drop a `<modelId>.rhai` file into
-     `rhai_dir` (see `[devices]` in `config.toml`) and it starts handling that model on
+     `rhai_dir` (see `[scripting]` in `config.toml`) and it starts handling that model on
      its next connection; with `watch = true`, editing and saving the script hot-reloads
      it into every already-connected device of that model within a couple hundred
      milliseconds (a script that fails to compile just leaves the previous version
@@ -62,7 +62,7 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
      plumbing; whatever's on the other end of that bus — a Python script, a Node
      process, a one-off shell pipeline — sees the same bytes a native handler or a
      script would and can drive the device however it needs to, with no Rust or Rhai
-     involved at all. See `raw_bus.rs` and the `[mqtt]`/`[devices]` comments in
+     involved at all. See `raw_bus.rs` and the `[mqtt]`/`[scripting]` comments in
      `config.toml` for the wire shape.
   4. **[rusthinq-adapter](https://github.com/3735943886/rusthinq-adapter): rethink's
      TypeScript device driver, unmodified.** A pre-built instance of (3): plugs the same
@@ -83,7 +83,7 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
   a model where raw_bus is another process's *only* data source (3 or 4) also getting a
   native handler or a `.rhai` script from the registry (1 or 2): that's two
   independent, mutually-unaware full drivers for one physical device. See the
-  `[devices]` comment in `config.toml` for the long-form version of this warning.
+  `[scripting]` comment in `config.toml` for the long-form version of this warning.
 
 ## Usage
 
@@ -112,14 +112,16 @@ under `target/release/` are named `rusthinq-*` — see the tables below.
 `rusthinq-cloud` ships **nothing extra by default** — a plain `cargo build -p
 rusthinq-cloud` is a minimal build (local/SoftAP devices over MQTT only: no LG-cloud
 bridge, no native/Rhai device handlers, no web dashboard). Additional functionality is
-opted into with Cargo features:
+opted into with Cargo features. A feature that has its own config section needs
+**both** to do anything: compiled in, *and* the section present in `config.toml` (absent
+section = the feature stays off at runtime, even in a build that includes it):
 
-| Feature | Adds | Off by default because |
-|---|---|---|
-| `bridge` | Forwarding to the real LG cloud (pulls in `reqwest`/`rsa`/oauth2) | Not every deployment talks to LG at all |
-| `native` | Built-in Rust device handlers (`rusthinq-devices/native`) | Gates no dependencies today (upstream handlers haven't been ported yet), kept for symmetry with `scripting` |
-| `scripting` | Rhai `.rhai` device-scripting support (pulls in `rhai`/`notify`) | Only needed when driving a device via a script |
-| `gui` | The optional web dashboard (`rusthinq-gui`, see [below](#web-dashboard-optional)) | Needs both this feature *and* a `[gui]` config section to do anything |
+| Feature | Config section | Adds | Off by default because |
+|---|---|---|---|
+| `bridge` | `[bridge]` | Forwarding to the real LG cloud (pulls in `reqwest`/`rsa`/oauth2) | Not every deployment talks to LG at all |
+| `scripting` | `[scripting]` | Rhai `.rhai` device-scripting support (pulls in `rhai`/`notify`) | Only needed when driving a device via a script |
+| `gui` | `[gui]` | The optional web dashboard (`rusthinq-gui`, see [below](#web-dashboard-optional)) | Not every deployment wants a dashboard |
+| `native` | none | Built-in Rust device handlers (`rusthinq-devices/native`) | Gates no dependencies today (upstream handlers haven't been ported yet), kept for symmetry with `scripting` |
 
 ```bash
 # everything (what release.yml's published binaries are built with)
@@ -129,7 +131,7 @@ cargo build -p rusthinq-cloud --features bridge,native,scripting,gui
 ## Configuration
 
 See `config.toml` in the repo root — every option is documented inline where it's
-declared, including the `[devices]` Rhai-scripting section and the raw-bus/script
+declared, including the `[scripting]` Rhai-scripting section and the raw-bus/script
 coexistence warning above. In short:
 
 | Section | Required? | Purpose |
@@ -137,7 +139,7 @@ coexistence warning above. In short:
 | top-level | **Required** | hostname, TLS CA files, HTTPS/MQTTS port mapping, log filter |
 | `[mqtt]` | **Required** | broker URL/credentials, `rusthinq_prefix` (device state), `raw_prefix` (RE tap/inject bus, off by default), retained-state persistence path |
 | `[bridge]` | Optional | LG-cloud forwarding storage path (requires the `bridge` feature) |
-| `[devices]` | Optional | `rhai_dir` + hot-reload `watch` flag for `.rhai` scripts (requires the `scripting` feature) |
+| `[scripting]` | Optional | `rhai_dir` + hot-reload `watch` flag for `.rhai` scripts (requires the `scripting` feature) |
 | `[gui]` | Optional | `gui_port` + optional `gui_user`/`gui_pass` Basic Auth for the web dashboard (requires the `gui` feature) |
 
 LG account login for bridge mode is over MQTT too, not a separate CLI: publishing an LG

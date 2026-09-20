@@ -70,10 +70,10 @@ raw_prefix = "rusthinq-raw"
 # [bridge]
 # storage_path = "./state" # LG account credentials (oauth2.json) and per-device bridge state
 
-# Optional device scripting (see rusthinq-devices::scripting). Absent = the feature doesn't
-# exist. Put a <modelId>.rhai in rhai_dir to handle that model (e.g.
-# rhai_dir/RAC_056905_WW.rhai); shared logic can live in its own .rhai file and be
-# imported with `import "common" as common;`.
+# Optional device scripting (rusthinq-devices::scripting, `scripting` Cargo feature). Absent
+# entirely = the feature doesn't exist. Put a <modelId>.rhai in rhai_dir to handle that
+# model (e.g. rhai_dir/RAC_056905_WW.rhai); shared logic can live in its own .rhai file and
+# be imported with `import "common" as common;`.
 #
 # raw_prefix and a model's .rhai script are independent and never arbitrated - both run
 # on every frame for a matching device, with no priority between them. Fine for debug/RE
@@ -81,7 +81,7 @@ raw_prefix = "rusthinq-raw"
 # a raw-only external driver and a .rhai script means two unaware drivers interpreting
 # the same data and publishing separately - no crash, but no guarantee they agree.
 #
-# [devices]
+# [scripting]
 # rhai_dir = "./scripts"
 # watch = true # hot-reload on save; keeps the previous version running if the new one fails to compile
 

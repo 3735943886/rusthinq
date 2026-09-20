@@ -20,7 +20,7 @@
 //! traffic, testing a command via inject before adding it to the script) is exactly
 //! what this bus is for and is fine. What isn't fine, and isn't checked anywhere in
 //! code, is a model where this bus is another process's *only* data source (see
-//! config.toml's `[devices]` comment — the rethink-TS-adapter setup) also getting a
+//! config.toml's `[scripting]` comment — the rethink-TS-adapter setup) also getting a
 //! `<modelId>.rhai`: that's two independent full drivers for one device, and nothing
 //! here will warn you.
 

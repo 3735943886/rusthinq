@@ -106,11 +106,11 @@ pub struct BridgeConfig {
     pub storage_path: String,
 }
 
-/// Rhai device-scripting support (`rusthinq-devices::scripting`). Absent `[devices]`
+/// Rhai device-scripting support (`rusthinq-devices::scripting`). Absent `[scripting]`
 /// means the feature doesn't exist at all — `registry.rs`'s script fallback never
 /// triggers, same as `raw_prefix`/`bridge` being unset for their own opt-in features.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevicesConfig {
+pub struct ScriptingConfig {
     /// Directory of `<modelId>.rhai` scripts.
     pub rhai_dir: String,
     /// Hot-reload `rhai_dir` on save. Off by default.
@@ -157,7 +157,7 @@ impl PlainPortSpec {
 
 /// Optional web dashboard (`rusthinq-gui`, only compiled in with the `gui`
 /// feature). Absent `[gui]` means it doesn't run at all, same opt-in-by-presence
-/// pattern as `[bridge]`/`[devices]`. It talks to `mqtt.mqtt_url` as its own MQTT
+/// pattern as `[bridge]`/`[scripting]`. It talks to `mqtt.mqtt_url` as its own MQTT
 /// client, same as any other tool would -- nothing here is a second control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiConfig {
@@ -184,7 +184,7 @@ pub struct RawConfig {
     pub mqtts_port: PortSpec,
     /// Optional unencrypted HTTP listener alongside `https_port`, for a reverse proxy
     /// that terminates TLS itself and forwards plain HTTP here. Absent by default —
-    /// same opt-in-by-presence pattern as `[bridge]`/`[devices]`; without it there's
+    /// same opt-in-by-presence pattern as `[bridge]`/`[scripting]`; without it there's
     /// no plaintext surface at all.
     #[serde(default)]
     pub http_port: Option<PlainPortSpec>,
@@ -204,7 +204,7 @@ pub struct RawConfig {
     #[serde(default)]
     pub bridge: Option<BridgeConfig>,
     #[serde(default)]
-    pub devices: Option<DevicesConfig>,
+    pub scripting: Option<ScriptingConfig>,
     #[serde(default)]
     pub gui: Option<GuiConfig>,
     #[serde(default)]
@@ -231,7 +231,7 @@ pub struct Config {
     pub thinq1_port: Port,
     pub mqtt_enabled: bool,
     pub bridge: Option<BridgeConfig>,
-    pub devices: Option<DevicesConfig>,
+    pub scripting: Option<ScriptingConfig>,
     pub gui: Option<GuiConfig>,
     pub log: Vec<String>,
     pub advertise_requested_host: bool,
@@ -288,7 +288,7 @@ pub fn normalize(raw: RawConfig) -> Config {
         }),
         mqtt_enabled: raw.mqtt_enabled.unwrap_or(true),
         bridge: raw.bridge,
-        devices: raw.devices,
+        scripting: raw.scripting,
         gui: raw.gui,
         log: raw
             .log
@@ -544,7 +544,7 @@ state_file = "mqtt_state.json"
     }
 
     #[test]
-    fn devices_section_is_absent_by_default_and_parses_when_present() {
+    fn scripting_section_is_absent_by_default_and_parses_when_present() {
         let without = r#"
 hostname = "x"
 ca_key_file = "k"
@@ -558,7 +558,7 @@ rusthinq_prefix = "rusthinq"
 mqtt_user = ""
 mqtt_pass = ""
 "#;
-        assert!(parse_config_text(without).unwrap().devices.is_none());
+        assert!(parse_config_text(without).unwrap().scripting.is_none());
 
         let with = r#"
 hostname = "x"
@@ -573,17 +573,18 @@ rusthinq_prefix = "rusthinq"
 mqtt_user = ""
 mqtt_pass = ""
 
-[devices]
+[scripting]
 rhai_dir = "./scripts"
 watch = true
 "#;
-        let devices = parse_config_text(with).unwrap().devices.unwrap();
-        assert_eq!(devices.rhai_dir, "./scripts");
-        assert!(devices.watch);
+        let scripting = parse_config_text(with).unwrap().scripting.unwrap();
+        assert_eq!(scripting.rhai_dir, "./scripts");
+        assert!(scripting.watch);
     }
 
+
     #[test]
-    fn devices_watch_defaults_to_false() {
+    fn scripting_watch_defaults_to_false() {
         let text = r#"
 hostname = "x"
 ca_key_file = "k"
@@ -597,10 +598,10 @@ rusthinq_prefix = "rusthinq"
 mqtt_user = ""
 mqtt_pass = ""
 
-[devices]
+[scripting]
 rhai_dir = "./scripts"
 "#;
-        assert!(!parse_config_text(text).unwrap().devices.unwrap().watch);
+        assert!(!parse_config_text(text).unwrap().scripting.unwrap().watch);
     }
 
     #[test]
