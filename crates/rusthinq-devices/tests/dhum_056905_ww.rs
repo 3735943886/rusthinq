@@ -214,8 +214,14 @@ fn the_descriptor_is_published_with_the_host_supplied_binding() {
     assert_eq!(d["kind"], "humidifier");
     assert_eq!(d["props"]["target"]["role"], "target_humidity");
     assert_eq!(d["props"]["uvnano"]["rw"], true);
+    assert_eq!(d["props"]["fan"]["role"], "fan_speed");
     assert!(d["x-mqtt"]["state"].as_str().unwrap().ends_with("/{prop}"));
-    assert!(d["x-mqtt"]["reject"].as_str().unwrap().ends_with("/{id}/reject"));
+    assert!(
+        d["x-mqtt"]["reject"]
+            .as_str()
+            .unwrap()
+            .ends_with("/{id}/reject")
+    );
     rusthinq_devices::scripting::set_il_prefix(None);
 }
 

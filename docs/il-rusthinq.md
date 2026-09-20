@@ -56,6 +56,9 @@ frames captured from a real appliance.
 | model | script | status |
 |---|---|---|
 | DHUM_056905_WW (LG dehumidifier) | `scripts/DHUM_056905_WW.rhai` | tested against captured frames; not yet run against the live appliance |
+| AIR_910604_WW (LG air purifier) | `scripts/AIR_910604_WW.rhai` | same |
+
+TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
 
 Do not run a driver alongside another consumer that already drives the same appliance
 (for example the rusthinq-adapter): two unaware drivers would both write to it.
