@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 struct State {
+    /// The whole descriptor, as published.
+    descriptor: Option<Value>,
     /// The descriptor's `props` object, once `publish_il` has been called.
     props: Option<Map<String, Value>>,
     /// The last value published for each property (`ctx.publish_property`).
@@ -29,7 +31,14 @@ pub struct IlState(Mutex<State>);
 impl IlState {
     /// Remember the descriptor's `props`. A descriptor with no `props` object clears it.
     pub fn set_descriptor(&self, descriptor: &Value) {
-        self.0.lock().props = descriptor.get("props").and_then(Value::as_object).cloned();
+        let mut state = self.0.lock();
+        state.props = descriptor.get("props").and_then(Value::as_object).cloned();
+        state.descriptor = Some(descriptor.clone());
+    }
+
+    /// The descriptor the driver last published, if any.
+    pub fn descriptor(&self) -> Option<Value> {
+        self.0.lock().descriptor.clone()
     }
 
     /// Record a value the driver just published (for `requires`).

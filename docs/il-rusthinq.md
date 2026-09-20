@@ -65,10 +65,40 @@ commands keep using those existing topics, so the IL adds only the descriptor.
 
 ## Testing
 
-`ScriptHarness` drives a script with frames and asserts on what it published or sent:
-`pending_timers()`, `fire_timer(name)` (no waiting), `sent_raw()`, `sent_clip()`,
-`property()`, `event()`, `raw_publish()`. The DHUM_056905_WW driver's tests run against
-frames captured from a real appliance.
+A driver's tests are written in Rhai and live beside it, so a driver and its tests can be
+kept apart from the Rust source (in their own repository, say): `scripts/tests/<Model>.test.rhai`
+tests `scripts/<Model>.rhai`. Every zero-argument `test_*` function in it is one test, run
+against a fresh device; it fails on the first failed `expect*` or runtime error. Run them with
+
+```
+cargo run -p rusthinq-devices --features scripting --bin rusthinq-script-test -- scripts
+```
+
+(or `cargo test`, which runs the same files and also checks that every driver has tests).
+
+```rhai
+import "tlv_test" as t;                       // helpers in scripts/tests/
+
+fn caps() { "0000…" }                          // captured frames (functions: constants are not visible)
+fn test_target_write_attaches_power_and_mode() {
+    let d = t::running(device(), caps(), state());
+    let n = d.sent().len();
+    d.set("target", "45");
+    expect_eq(t::sent_since(d, n), [[[0x253, 45], [0x1f7, 1], [0x1f9, 17]]]);
+}
+```
+
+What a test can do: `device()` gives a fresh device running the driver; on it `start()`,
+`drop_device()`, `feed(hex or blob)`, `set(prop, value)`, `fire(timer)` (no waiting), and, to
+look at what happened, `property(name)`, `event(name)`, `script_error()`, `sent()` (frames sent,
+as blobs), `sent_tlvs(i)`, `timers()`, `clips()`, `descriptor()`. Assertions are `expect(cond,
+msg)`, `expect_eq(actual, expected[, msg])` and `expect_props(dev, #{prop: "value"})`. Everything a
+driver can call (`hex_encode`, `tlv_frame_build`, `aabb_wrap`, …) is available to a test too.
+`tests/tlv_test.rhai` and `tests/aabb_test.rhai` hold the helpers shared by the TLV and AABB
+drivers. Tests run against frames captured from real appliances wherever there is one.
+
+The host's own behaviour (timers, host-side command validation, the descriptor binding) is
+tested in Rust with `ScriptHarness`, which is what the runner drives.
 
 ## Drivers
 

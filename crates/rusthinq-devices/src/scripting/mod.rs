@@ -12,6 +12,7 @@ pub mod ctx;
 pub mod engine;
 pub mod harness;
 pub mod il;
+pub mod script_test;
 pub mod scripted_device;
 pub mod watcher;
 

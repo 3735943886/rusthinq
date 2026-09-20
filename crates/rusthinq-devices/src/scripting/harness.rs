@@ -2,11 +2,9 @@
 //! connections, feed it wire frames (including from a plain hex fixture file), and
 //! assert on what it published or sent back.
 //!
-//! Not gated behind `#[cfg(test)]` — a device script kept in its own separate repo
-//! (cloned or symlinked into `rhai_dir`) depends on `rusthinq-devices` as an ordinary
-//! library and writes its own `#[test]`s against this harness, so it has to be
-//! reachable from a normal (non-test) build too, the same way `rusthinq-core`'s
-//! `Mock*` types are.
+//! Not gated behind `#[cfg(test)]` — `script_test` (the runner for driver tests written in
+//! Rhai, which is how a device script kept in its own separate repo is tested) drives it from
+//! a normal (non-test) build, the same way `rusthinq-core`'s `Mock*` types are reachable.
 
 use crate::device_trait::DeviceHandler;
 use crate::scripting::scripted_device::{ScriptedDevice, build_t1_scripted, build_t2_scripted};
@@ -114,6 +112,11 @@ impl ScriptHarness {
                 .collect(),
             HarnessDevice::T1(_) => Vec::new(),
         }
+    }
+
+    /// The IL descriptor the script published with `ctx.publish_il` (`None` if it has not).
+    pub fn descriptor(&self) -> Option<serde_json::Value> {
+        self.scripted.as_ref().and_then(|d| d.il_descriptor())
     }
 
     /// Timers the script has armed and not yet fired, as `(name, delay_ms)`, sorted by name.

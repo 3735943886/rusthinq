@@ -153,6 +153,11 @@ pub struct ScriptedDevice {
 }
 
 impl ScriptedDevice {
+    /// The IL descriptor the script last published, if any — a test hook (`ScriptHarness`).
+    pub(crate) fn il_descriptor(&self) -> Option<serde_json::Value> {
+        self.il_state.descriptor()
+    }
+
     /// Timers currently armed, as `(name, delay_ms)` — a test hook (`ScriptHarness`).
     pub(crate) fn pending_timers(&self) -> Vec<(String, u64)> {
         let mut v: Vec<_> = self

@@ -147,3 +147,30 @@ fn a_script_that_publishes_no_descriptor_is_not_validated() {
     assert_eq!(h.property("got").as_deref(), Some("as-is"));
     assert_eq!(h.event("reject"), None);
 }
+
+#[test]
+fn the_host_binds_a_published_descriptor_to_the_devices_own_topics() {
+    rusthinq_devices::scripting::set_il_prefix(Some("il".into()));
+    let (_dir, h) = harness(IL_SCRIPT);
+    h.start();
+    let (payload, retained) = h.raw_publish("il/harness").expect("descriptor published");
+    rusthinq_devices::scripting::set_il_prefix(None);
+    assert!(retained);
+    let d: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(d["id"], "harness");
+    assert_eq!(d["source"], "rusthinq");
+    assert_eq!(d["props"]["level"]["max"], 10);
+    assert!(d["x-mqtt"]["state"].as_str().unwrap().ends_with("/{prop}"));
+    assert!(
+        d["x-mqtt"]["set"]
+            .as_str()
+            .unwrap()
+            .ends_with("/{prop}/set")
+    );
+    assert!(
+        d["x-mqtt"]["reject"]
+            .as_str()
+            .unwrap()
+            .ends_with("/{id}/reject")
+    );
+}

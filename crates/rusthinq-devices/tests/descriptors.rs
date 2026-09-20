@@ -1,23 +1,10 @@
-//! Every shipped driver's descriptor is well formed against the IL: known types and roles
+//! Every driver's descriptor is well formed against the IL: known types and roles
 //! (with the type each role requires), coherent `class` / `series` / `category`, and
 //! `requires` naming a real binary.
 #![cfg(feature = "scripting")]
 
 use rusthinq_devices::scripting::ScriptHarness;
 use serde_json::Value;
-
-const MODELS: &[&str] = &[
-    "1WPU4CIGCR__2",
-    "AIR_910604_WW",
-    "CST_570004_WW",
-    "D140110",
-    "DHUM_056905_WW",
-    "F24VDD",
-    "Pd0F_F",
-    "RH14_N_KR",
-    "S3BF_POD_DN4",
-    "WBEY3GT",
-];
 
 /// role -> the type the registry gives it
 const ROLES: &[(&str, &str)] = &[
@@ -34,6 +21,19 @@ const ROLES: &[(&str, &str)] = &[
     ("action", "select"),
 ];
 
+/// Every driver in `scripts/`: each `.rhai` that is not a shared module.
+fn models() -> Vec<String> {
+    let dir = format!("{}/../../scripts", env!("CARGO_MANIFEST_DIR"));
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix(".rhai").map(str::to_string))
+        .filter(|n| !n.ends_with("_common"))
+        .collect();
+    names.sort();
+    names
+}
+
 fn descriptor(model: &str) -> Value {
     rusthinq_devices::scripting::set_il_prefix(Some("il".to_string()));
     let path = format!("{}/../../scripts/{model}.rhai", env!("CARGO_MANIFEST_DIR"));
@@ -49,7 +49,7 @@ fn descriptor(model: &str) -> Value {
 
 #[test]
 fn every_driver_publishes_a_well_formed_descriptor() {
-    for model in MODELS {
+    for model in &models() {
         let d = descriptor(model);
         assert_eq!(d["il"], 0, "{model}");
         let props = d["props"]

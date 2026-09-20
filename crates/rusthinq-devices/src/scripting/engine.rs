@@ -165,6 +165,12 @@ const MAX_MAP_SIZE: usize = 1_000;
 const MAX_EXPR_DEPTH: usize = 200;
 const MAX_FUNCTION_EXPR_DEPTH: usize = 100;
 
+/// A fresh engine with everything a driver script sees registered, for a caller that
+/// wants to add its own functions (the driver test runner).
+pub(crate) fn new_engine() -> Engine {
+    build_engine()
+}
+
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
 
