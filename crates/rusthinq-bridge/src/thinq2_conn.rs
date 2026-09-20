@@ -177,7 +177,9 @@ pub async fn connect_thinq2(
                     {
                         rusthinq_core::logging::log(
                             "bridge",
-                            &[&format!("{did} could not publish pre-deploy to {prov_topic}: {e}")],
+                            &[&format!(
+                                "{did} could not publish pre-deploy to {prov_topic}: {e}"
+                            )],
                         );
                         let _ = client_c.disconnect().await;
                         continue;

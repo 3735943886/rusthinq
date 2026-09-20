@@ -41,48 +41,47 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
   entirely up to how it's driven (see below), which is also why this fork carries no
   device support list: whether a model works, and how well, depends on what handler
   it's given.
-- **Four ways to drive a device, freely mixed per model:**
-  1. **A native Rust handler.** `crates/rusthinq-devices/src/devices/` — the same style
-     upstream device handlers use, ported into a small `DeviceHandler` trait. Requires
-     a rebuild to add or change.
-  2. **A `.rhai` script — no rebuild, no restart.** Drop a `<modelId>.rhai` file into
+- **Two ways to drive a device, freely mixed per model:**
+  1. **A `.rhai` script — no rebuild, no restart.** Drop a `<modelId>.rhai` file into
      `rhai_dir` (see `[scripting]` in `config.toml`) and it starts handling that model on
      its next connection; with `watch = true`, editing and saving the script hot-reloads
      it into every already-connected device of that model within a couple hundred
      milliseconds (a script that fails to compile just leaves the previous version
      running — never worse than before the save). Scripts get raw wire bytes
      in-process (no MQTT round trip), opt-in access to `rusthinq-util`'s TLV/CRC16/hex
-     codec helpers, and publish through the same MQTT primitives a native handler uses.
+     codec helpers, and publish through the same MQTT primitives the host itself uses.
      See `crates/rusthinq-devices/src/scripting/` for the engine, and
      `scripting::ctx` for the exact script-facing API.
-  3. **A custom consumer, in any language.** Setting `[mqtt] raw_prefix` taps every
+  2. **A custom consumer, in any language.** Setting `[mqtt] raw_prefix` taps every
      connected device's raw rx/tx frames onto MQTT
      (`<raw_prefix>/<id>/raw/rx|tx`, plus `raw/clip/rx|tx` for the CLIP layer), with an
      inject topic to send frames back (`<raw_prefix>/<id>/raw/inject/set`). Which
      streams exist is listed in `[mqtt] raw` (off unless listed; see `config.toml`). rusthinq still owns the TLS/socket/framing
      plumbing; whatever's on the other end of that bus — a Python script, a Node
-     process, a one-off shell pipeline — sees the same bytes a native handler or a
+     process, a one-off shell pipeline — sees the same bytes a
      script would and can drive the device however it needs to, with no Rust or Rhai
      involved at all. See `raw_bus.rs` and the `[mqtt]`/`[scripting]` comments in
      `config.toml` for the wire shape.
-  4. **[rusthinq-adapter](https://github.com/3735943886/rusthinq-adapter): rethink's
-     TypeScript device driver, unmodified.** A pre-built instance of (3): plugs the same
-     raw bus in as a drop-in replacement for rethink's own MQTT broker connection, runs
-     completely unchanged, as a separate long-lived process, with rethink's own
-     `Connection`/`Bridge` still doing its own discovery and state publishing exactly as
-     it always has. Useful for a model whose upstream driver is too involved to be worth
-     re-writing in Rhai — or anything else — from scratch. See that repo's README for
-     setup and its `rusthinq-adapter-config.jsonc` for the config shape.
 
-  **A registry handler (1 or 2) should not be combined with raw_bus used as another
-  process's full driver (3 or 4) for the same model.** `raw_bus` taps every connected
+     A ready-made consumer of this kind is
+     [rusthinq-adapter](https://github.com/3735943886/rusthinq-adapter): rethink's
+     TypeScript device driver, unmodified. It plugs the same raw bus in as a drop-in
+     replacement for rethink's own MQTT broker connection and runs completely unchanged,
+     as a separate long-lived process, with rethink's own `Connection`/`Bridge` still
+     doing its own discovery and state publishing exactly as it always has. Useful for a
+     model whose upstream driver is too involved to be worth re-writing in Rhai — or
+     anything else — from scratch. See that repo's README for setup and its
+     `rusthinq-adapter-config.jsonc` for the config shape.
+
+  **A registry handler (1) should not be combined with raw_bus used as another
+  process's full driver (2, including rusthinq-adapter) for the same model.** `raw_bus` taps every connected
   device unconditionally the moment `raw_prefix` is set, with no idea whether
-  `registry.rs` also gave that model a native handler or a script — nothing arbitrates
-  between them, and nothing raises a warning. Using raw_bus purely for *debugging* alongside (1) or (2)
+  `registry.rs` also gave that model a script — nothing arbitrates
+  between them, and nothing raises a warning. Using raw_bus purely for *debugging* alongside (1)
   (watching a handler's real wire traffic, testing a command via inject before adding
   it to the script) is exactly what the raw bus is for and is fine. What isn't fine is
-  a model where raw_bus is another process's *only* data source (3 or 4) also getting a
-  native handler or a `.rhai` script from the registry (1 or 2): that's two
+  a model where raw_bus is another process's *only* data source (2) also getting a
+  `.rhai` script from the registry (1): that's two
   independent, mutually-unaware full drivers for one physical device. See the
   `[scripting]` comment in `config.toml` for the long-form version of this warning.
 
@@ -104,9 +103,9 @@ protocol/device reverse-engineering notes in general.
 Requirements: Rust **1.88+**, OpenSSL CLI (CA / device CSR signing).
 
 ```bash
-cargo build -p rusthinq-cloud --features bridge,native,scripting -p rusthinq-setup -p rusthinq-bridge -p rusthinq-tools
+cargo build -p rusthinq-cloud --features bridge,scripting -p rusthinq-setup -p rusthinq-bridge -p rusthinq-tools
 cargo test --workspace
-cargo run -p rusthinq-cloud --features bridge,native,scripting -- ./config.toml
+cargo run -p rusthinq-cloud --features bridge,scripting -- ./config.toml
 cargo run -p rusthinq-setup -- 192.168.120.254 'MySSID' 'MyPassword!'
 ```
 
@@ -115,7 +114,7 @@ under `target/release/` are named `rusthinq-*` — see the tables below.
 
 `rusthinq-cloud` ships **nothing extra by default** — a plain `cargo build -p
 rusthinq-cloud` is a minimal build (local/SoftAP devices over MQTT only: no LG-cloud
-bridge, no native/Rhai device handlers, no web dashboard). Additional functionality is
+bridge, no Rhai device scripting, no web dashboard). Additional functionality is
 opted into with Cargo features. A feature that has its own config section needs
 **both** to do anything: compiled in, *and* the section present in `config.toml` (absent
 section = the feature stays off at runtime, even in a build that includes it):
@@ -125,11 +124,10 @@ section = the feature stays off at runtime, even in a build that includes it):
 | `bridge` | `[bridge]` | Forwarding to the real LG cloud (pulls in `reqwest`/`rsa`/oauth2) | Not every deployment talks to LG at all |
 | `scripting` | `[scripting]` | Rhai `.rhai` device-scripting support (pulls in `rhai`/`notify`) | Only needed when driving a device via a script |
 | `gui` | `[gui]` | The optional web dashboard (`rusthinq-gui`, see [below](#web-dashboard-optional)) | Not every deployment wants a dashboard |
-| `native` | none | Built-in Rust device handlers (`rusthinq-devices/native`) | Gates no dependencies today (upstream handlers haven't been ported yet), kept for symmetry with `scripting` |
 
 ```bash
 # everything (what release.yml's published binaries are built with)
-cargo build -p rusthinq-cloud --features bridge,native,scripting,gui
+cargo build -p rusthinq-cloud --features bridge,scripting,gui
 ```
 
 ## Configuration
@@ -165,7 +163,7 @@ bridge on/off, and login/logout.
 |---|---|
 | `rusthinq-util` | Codecs (TLV, CRC16, framing, MTOSP) |
 | `rusthinq-core` | Config, MQTT transport (consumer-neutral), ThinQ1/2 device traits |
-| `rusthinq-devices` | Device protocol/state bases, native `modelId` handlers, and the Rhai scripting engine (`scripting/`) |
+| `rusthinq-devices` | Device protocol/state bases, the `modelId` lookup, and the Rhai scripting engine (`scripting/`) |
 | `rusthinq-bridge` | Optional LG-cloud bridge helpers |
 | `rusthinq-gui` | Optional web dashboard, talking to `rusthinq-cloud` only over MQTT |
 | `rusthinq-cloud` | Main server — binary `rusthinq-cloud` |

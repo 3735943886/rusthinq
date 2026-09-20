@@ -271,14 +271,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(sink.clone());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         let published: Arc<rusthinq_util::sync::Mutex<Vec<(String, String)>>> =
             Arc::new(rusthinq_util::sync::Mutex::new(Vec::new()));
@@ -317,14 +316,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(test_sink());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt_dyn.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt_dyn.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         do_enable(&mqtt_dyn, &manager, &bridge, &device_list, "missing", "").await;
 
@@ -346,14 +344,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(test_sink());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt_dyn.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt_dyn.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         do_enable(&mqtt_dyn, &manager, &bridge, &device_list, "dev-1", "401").await;
 
@@ -376,14 +373,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(test_sink());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt_dyn.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt_dyn.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         do_disable(&mqtt_dyn, &bridge, &device_list, "dev-2").await;
 
@@ -409,14 +405,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(test_sink());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt_dyn.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt_dyn.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         do_logout(&mqtt_dyn, &bridge, &device_list).await;
 
@@ -436,14 +431,13 @@ mod tests {
         ));
         let bridge = Bridge::new(storage);
         let device_bridge = DeviceBridge::new(sink.clone());
-        let device_list =
-            DeviceListPublisher::new(
-                mqtt.clone(),
-                manager.clone(),
-                device_bridge,
-                None,
-                KnownDevices::new(None),
-            );
+        let device_list = DeviceListPublisher::new(
+            mqtt.clone(),
+            manager.clone(),
+            device_bridge,
+            None,
+            KnownDevices::new(None),
+        );
 
         let published: Arc<rusthinq_util::sync::Mutex<Vec<(String, String)>>> =
             Arc::new(rusthinq_util::sync::Mutex::new(Vec::new()));

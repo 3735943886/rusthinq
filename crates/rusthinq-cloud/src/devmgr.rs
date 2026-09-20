@@ -159,7 +159,7 @@ impl ConnectedDevice {
 
     /// Guarded per handler: `on_data` chains several independent concerns (raw wire
     /// tap, downstream-integration translation, LG bridge forwarding) for the same
-    /// device — a panic in one (a malformed packet tripping a future Rhai/native
+    /// device — a panic in one (a malformed packet tripping a future Rhai
     /// handler bug) must not stop the others from seeing this frame, nor unwind
     /// whatever task delivered it.
     pub fn notify_data(&self, buf: &[u8]) {

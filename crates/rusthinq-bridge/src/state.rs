@@ -59,7 +59,10 @@ impl JsonStorage {
             Err(e) => {
                 rusthinq_core::logging::log(
                     "bridge",
-                    &[&format!("Failed to read {}: {e} (treating as absent)", path.display())],
+                    &[&format!(
+                        "Failed to read {}: {e} (treating as absent)",
+                        path.display()
+                    )],
                 );
                 return None;
             }
@@ -99,7 +102,10 @@ impl JsonStorage {
             Err(e) => {
                 rusthinq_core::logging::log(
                     "bridge",
-                    &[&format!("Failed to serialize state for {}: {e}", path.display())],
+                    &[&format!(
+                        "Failed to serialize state for {}: {e}",
+                        path.display()
+                    )],
                 );
             }
         }

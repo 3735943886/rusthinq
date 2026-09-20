@@ -36,7 +36,7 @@ Either download a release build, or build from source.
 
 **Release build.** Run the *Release builds* workflow, or take a published archive, for
 your platform (`linux-amd64`, `linux-aarch64`). It contains `rusthinq-cloud` and
-`rusthinq-setup`, built with every feature (`bridge`, `native`, `scripting`, `gui`).
+`rusthinq-setup`, built with every feature (`bridge`, `scripting`, `gui`).
 **(verify: archive names and where they're published)**
 
 **From source.** Rust 1.88 or newer:
@@ -44,7 +44,7 @@ your platform (`linux-amd64`, `linux-aarch64`). It contains `rusthinq-cloud` and
 ```bash
 git clone https://github.com/3735943886/rusthinq.git
 cd rusthinq
-cargo build --release -p rusthinq-cloud --features bridge,native,scripting,gui -p rusthinq-setup
+cargo build --release -p rusthinq-cloud --features bridge,scripting,gui -p rusthinq-setup
 ```
 
 A plain `cargo build` enables no optional feature. Pick only what you need; see the
@@ -234,7 +234,7 @@ results appear on `rusthinq/bridge/status` and `rusthinq/<id>/bridge/status`. Th
 
 - **Using the data:** what an appliance's properties mean depends on how it's driven.
   See [the four ways to drive a device](../README.md#what-makes-this-different-from-upstream)
-  (native handler, `.rhai` script, raw-frame consumer, rusthinq-adapter).
+  (`.rhai` script, raw-frame consumer, rusthinq-adapter).
 - **Home Assistant or anything else:** it reads the same MQTT topics; rusthinq itself
   is consumer-neutral.
 - **Everything you can do over MQTT:** [mqtt-control.md](mqtt-control.md).

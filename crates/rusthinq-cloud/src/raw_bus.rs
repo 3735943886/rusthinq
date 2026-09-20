@@ -29,7 +29,7 @@
 //! `attach()` runs for every connected device once `raw_prefix` is set (for whichever
 //! streams `raw` lists),
 //! with zero awareness of whether `registry.rs` also gave that device's model a
-//! script/native handler — there is no priority between the two, both just run in
+//! script handler — there is no priority between the two, both just run in
 //! parallel on every frame. Deliberate coexistence (debugging a scripted device's wire
 //! traffic, testing a command via inject before adding it to the script) is exactly
 //! what this bus is for and is fine. What isn't fine, and isn't checked anywhere in

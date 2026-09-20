@@ -672,7 +672,11 @@ mod mqtt_sink_tests {
 
         sink.clear_retained("dev1");
         let known = sink.known_devices();
-        assert_eq!(known.len(), 1, "clear_retained must drop the id from known_devices too");
+        assert_eq!(
+            known.len(),
+            1,
+            "clear_retained must drop the id from known_devices too"
+        );
         assert_eq!(known[0].0, "dev2");
     }
 
@@ -691,7 +695,10 @@ mod mqtt_sink_tests {
         let loaded = load_published_topics(&path);
         assert_eq!(loaded.len(), 1);
         let state = &loaded["dev1"];
-        assert_eq!(state.last_seen_unix, 0, "no timestamp existed in the old shape");
+        assert_eq!(
+            state.last_seen_unix, 0,
+            "no timestamp existed in the old shape"
+        );
         assert!(state.properties.contains("power"));
         assert!(state.properties.contains("temperature"));
 

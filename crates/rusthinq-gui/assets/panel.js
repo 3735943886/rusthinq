@@ -22,9 +22,9 @@ const STATUS_OK = `<i class="tiny material-icons green-text">check</i>`
 const STATUS_ERROR = `<i class="tiny material-icons red-text">error</i>`
 const STATUS_UNKNOWN = `<i class="tiny material-icons red-text">question_mark</i>`
 let bridge_status = false
-// Whether this build could possibly map *any* device (native or scripting
-// compiled in) -- gates the per-device "no native or script handler" warning,
-// which means nothing when neither is on: every device would show it then,
+// Whether this build could possibly map *any* device (scripting compiled in)
+// -- gates the per-device "no script handler" warning,
+// which means nothing when it is off: every device would show it then,
 // regardless of the device itself. Set from the first `features` snapshot.
 let deviceMappingCapable = false
 // Whether this build has the `bridge` Cargo feature at all -- there's no LG
@@ -150,14 +150,14 @@ class DeviceEntry {
         td.className = 'dev-model'
         let model = this.remoteState.model
         if (!this.remoteState.mapped && deviceMappingCapable) {
-            // "mapped" just means registry.rs found a native or .rhai handler for this
+            // "mapped" just means registry.rs found a .rhai handler for this
             // modelId -- it says nothing about whether some other tool is driving the
             // device over the raw bus instead (rusthinq has no way to know that, MQTT
             // pub/sub doesn't expose who's subscribed), so this can't claim "unsupported".
-            // Only shown when this build could possibly have mapped it (native or
-            // scripting compiled in) -- with both off, *every* device is unmapped
+            // Only shown when this build could possibly have mapped it (scripting
+            // compiled in) -- with it off, *every* device is unmapped
             // regardless of the device itself, so the warning would say nothing.
-            model += ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No native or script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`
+            model += ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`
         }
         td.innerHTML = model
         children.push(td)
@@ -337,13 +337,13 @@ function connect() {
                 const tooltip =
                     enabled.length > 0
                         ? `Build features: ${enabled.join(', ')}`
-                        : 'Build features: none (bridge/native/scripting all off)'
+                        : 'Build features: none (bridge/scripting all off)'
                 document.querySelectorAll('.version').forEach((el) => {
                     M.Tooltip.getInstance(el)?.destroy()
                     el.setAttribute('data-tooltip', tooltip)
                     M.Tooltip.init(el, { position: 'bottom' })
                 })
-                deviceMappingCapable = !!(json.features.native || json.features.scripting)
+                deviceMappingCapable = !!json.features.scripting
 
                 bridgeFeatureEnabled = !!json.features.bridge
                 document.getElementById('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled)

@@ -1175,7 +1175,9 @@ mod lifecycle_tests {
         let bridge = test_bridge();
         let id = "dev-guard";
 
-        let guard = bridge.try_begin_start(id).expect("first claim must succeed");
+        let guard = bridge
+            .try_begin_start(id)
+            .expect("first claim must succeed");
         assert!(
             bridge.try_begin_start(id).is_none(),
             "a second claim for the same id must be refused while the first is held"
@@ -1642,8 +1644,7 @@ mod lifecycle_tests {
             "deployAppInfo": app_info,
             "deployPlatformInfo": platform_info,
         });
-        let state: Thinq2DeviceState =
-            serde_json::from_value(normalize_t2_state(saved)).unwrap();
+        let state: Thinq2DeviceState = serde_json::from_value(normalize_t2_state(saved)).unwrap();
         assert_eq!(state.deploy_app_info, Some(app_info));
         assert_eq!(state.deploy_platform_info, Some(platform_info));
     }
@@ -1663,8 +1664,7 @@ mod lifecycle_tests {
             "provTopic": "prov",
             "subTopic": "sub",
         });
-        let state: Thinq2DeviceState =
-            serde_json::from_value(normalize_t2_state(saved)).unwrap();
+        let state: Thinq2DeviceState = serde_json::from_value(normalize_t2_state(saved)).unwrap();
         assert_eq!(state.deploy_app_info, None);
         assert_eq!(state.deploy_platform_info, None);
     }

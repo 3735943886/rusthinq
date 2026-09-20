@@ -70,7 +70,7 @@ impl DeviceListPublisher {
         // good) would simply vanish from this snapshot with nothing left to notice
         // or clean it up. List it too, from `known_devices` -- tracked at the
         // connection level (`DeviceManager::on_new_device`/`on_drop_device`) rather
-        // than from MQTT property publishes, since a device with no native/script
+        // than from MQTT property publishes, since a device with no script
         // handler (driven purely over the raw bus, or not driven by anything at
         // all) never publishes a single property and would otherwise never appear
         // here even while genuinely connected, let alone after. See
@@ -109,12 +109,11 @@ impl DeviceListPublisher {
             // `rusthinq-gui` talks to rusthinq-cloud only over MQTT and has no other way
             // to know. Used for two things on the dashboard: showing the running
             // build's features next to its version, and deciding whether a device's "no
-            // native or script handler" warning means anything -- with both `native` and
-            // `scripting` off, *every* device would show it regardless of the device
-            // itself, which is not a per-device signal at that point.
+            // script handler" warning means anything -- with `scripting` off, *every*
+            // device would show it regardless of the device itself, which is not a
+            // per-device signal at that point.
             "features": {
                 "bridge": cfg!(feature = "bridge"),
-                "native": cfg!(feature = "native"),
                 "scripting": cfg!(feature = "scripting"),
             },
         })
@@ -209,13 +208,12 @@ mod tests {
             .expect("devices topic must be retained");
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["features"]["bridge"], cfg!(feature = "bridge"));
-        assert_eq!(v["features"]["native"], cfg!(feature = "native"));
         assert_eq!(v["features"]["scripting"], cfg!(feature = "scripting"));
     }
 
     #[test]
     fn mapped_reflects_device_bridge_has_device() {
-        // This test's modelId has neither a native factory nor a matching `.rhai`
+        // This test's modelId has no matching `.rhai`
         // script, so device_bridge.new_device() can't actually map it; "mapped" must
         // stay false rather than assume success. This still exercises the real
         // new_device() path so the snapshot logic is checked against DeviceBridge,
@@ -303,7 +301,7 @@ mod tests {
     /// now must still show up in the snapshot (as `online: false`), not vanish the
     /// moment it disconnects -- tracked via `known_devices` (connection-level),
     /// not `mqtt.known_devices()` (property-publish-level, blind to a raw-bus-only
-    /// device with no native/script handler).
+    /// device with no script handler).
     #[test]
     fn known_but_offline_devices_are_listed_alongside_live_ones() {
         let mqtt = MockMqttConnection::new();
@@ -319,13 +317,8 @@ mod tests {
         };
         known_devices.note_connected("dev-gone", &gone_meta, Platform::Thinq2);
         known_devices.note_disconnected("dev-gone"); // no live connection at all
-        let publisher = DeviceListPublisher::new(
-            mqtt.clone(),
-            manager,
-            device_bridge,
-            None,
-            known_devices,
-        );
+        let publisher =
+            DeviceListPublisher::new(mqtt.clone(), manager, device_bridge, None, known_devices);
 
         publisher.publish();
 
@@ -348,13 +341,8 @@ mod tests {
         let device_bridge = DeviceBridge::new(mqtt.clone());
         let known_devices = empty_known_devices();
         known_devices.note_connected("dev-1", &dev.meta, Platform::Thinq2);
-        let publisher = DeviceListPublisher::new(
-            mqtt.clone(),
-            manager,
-            device_bridge,
-            None,
-            known_devices,
-        );
+        let publisher =
+            DeviceListPublisher::new(mqtt.clone(), manager, device_bridge, None, known_devices);
 
         publisher.publish();
 

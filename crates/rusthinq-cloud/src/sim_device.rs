@@ -140,7 +140,11 @@ mod tests {
         let sink = MqttSink::new(test_config());
         let manager = DeviceManager::new();
         let broker = Arc::new(Broker::new());
-        let acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         register(&sink, acceptor, broker, "rusthinq-raw".into());
 
         let did = "sim-1";
@@ -179,7 +183,11 @@ mod tests {
         let sink = MqttSink::new(test_config());
         let manager = DeviceManager::new();
         let broker = Arc::new(Broker::new());
-        let acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         register(&sink, acceptor, broker, "rusthinq-raw".into());
 
         let did = "sim-3";

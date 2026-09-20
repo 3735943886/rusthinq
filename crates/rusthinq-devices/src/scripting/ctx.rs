@@ -2,7 +2,7 @@
 //!
 //! Deliberately narrow: a script can only publish/send for *its own* device (the one
 //! `ScriptedDevice` was built for), scoped through `MqttConnection::publish_property`/
-//! `publish_event` exactly like a native handler would. It does not expose
+//! `publish_event` as the host does for any device. It does not expose
 //! `publish_retained`/`publish_raw` — those are for callers with no per-device scope
 //! (devlist snapshots, the raw wire-frame bus), not a single device's script.
 

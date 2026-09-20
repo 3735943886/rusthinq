@@ -61,7 +61,9 @@ async fn bind_with_retry(label: &str, address: &str, port: u16) -> TcpListener {
 /// `Port::address` was, until now, parsed from `config.toml` but never actually read
 /// anywhere (every listener always bound all interfaces regardless of it).
 fn bind_address(port: &Port) -> String {
-    port.address.clone().unwrap_or_else(|| "0.0.0.0".to_string())
+    port.address
+        .clone()
+        .unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 /// For the startup banner: a bound port's number, or "off" for one left unbound
@@ -111,7 +113,10 @@ async fn main() -> Result<()> {
             .into();
     }
     if let Some(ref mut scripting) = config.scripting {
-        scripting.rhai_dir = config_dir.join(&scripting.rhai_dir).to_string_lossy().into();
+        scripting.rhai_dir = config_dir
+            .join(&scripting.rhai_dir)
+            .to_string_lossy()
+            .into();
     }
     // On by default (not an opt-in feature — see MqttConfig::state_file's doc
     // comment): falls back to a default path next to the config file rather than
@@ -449,7 +454,9 @@ async fn main() -> Result<()> {
                 let listener = bind_with_retry("MQTTS", &address, port).await;
                 logging::log(
                     "status",
-                    &[&format!("MQTTS listening on {address}:{port} (legacy device TLS)")],
+                    &[&format!(
+                        "MQTTS listening on {address}:{port} (legacy device TLS)"
+                    )],
                 );
                 loop {
                     match listener.accept().await {
@@ -506,7 +513,9 @@ async fn main() -> Result<()> {
                 let listener = bind_with_retry("HTTPS", &address, port).await;
                 logging::log(
                     "status",
-                    &[&format!("HTTPS listening on {address}:{port} (legacy device TLS)")],
+                    &[&format!(
+                        "HTTPS listening on {address}:{port} (legacy device TLS)"
+                    )],
                 );
                 loop {
                     let (stream, peer) = match listener.accept().await {

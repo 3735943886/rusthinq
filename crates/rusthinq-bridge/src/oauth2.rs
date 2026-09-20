@@ -217,7 +217,10 @@ mod tests {
             serde_json::json!(null),
         ];
         for raw in invalid {
-            assert!(parse_token_response(&raw, 1_000).is_err(), "expected {raw} to be rejected");
+            assert!(
+                parse_token_response(&raw, 1_000).is_err(),
+                "expected {raw} to be rejected"
+            );
         }
     }
 

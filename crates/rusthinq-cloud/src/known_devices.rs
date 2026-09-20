@@ -2,9 +2,9 @@
 //! whether) anything drives its properties.
 //!
 //! `MqttSink::known_devices` (`rusthinq-core`) only sees ids that went through
-//! `publish_property`, which a native Rust handler or `.rhai` script calls but the
+//! `publish_property`, which a `.rhai` script calls but the
 //! raw bus (`raw_bus.rs`) never does -- it only ever calls `publish_raw`. A
-//! deployment with no native/script handler for any of its models (a real, common
+//! deployment with no script handler for any of its models (a real, common
 //! setup: raw bus + an external consumer, e.g. `rethink`'s TS adapter, driving
 //! everything) never gets a single entry there no matter how many devices connect,
 //! since nothing ever calls `publish_property` for them. This tracks every id
@@ -90,7 +90,10 @@ impl KnownDevices {
     /// "found to be gone," not "seen."
     #[cfg_attr(
         not(feature = "bridge"),
-        allow(dead_code, reason = "only ever called from main.rs's bridge-only hook wiring")
+        allow(
+            dead_code,
+            reason = "only ever called from main.rs's bridge-only hook wiring"
+        )
     )]
     pub fn note_orphaned(&self, id: &str) {
         let mut entries = self.entries.lock();

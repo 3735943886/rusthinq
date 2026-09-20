@@ -16,9 +16,9 @@ env:
   PACKAGES: -p rusthinq-cloud -p rusthinq-setup
   BINARIES: rusthinq-cloud rusthinq-setup
   # rusthinq-cloud ships with nothing enabled by default (see its Cargo.toml) --
-  # release builds want the full feature set: LG-cloud bridge, native/Rhai device
-  # handlers, and the web dashboard.
-  FEATURES: bridge,native,scripting,gui
+  # release builds want the full feature set: LG-cloud bridge, Rhai device
+  # scripting, and the web dashboard.
+  FEATURES: bridge,scripting,gui
 
 concurrency:
   group: release-${{ inputs.tag }}

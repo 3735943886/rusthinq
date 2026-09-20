@@ -220,7 +220,10 @@ mod tests {
         let events = events_capturing(responses.clone(), statuses.clone());
         let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
 
-        for header in [serde_json::json!({}), serde_json::json!({ "x-lgedm-deviceId": "" })] {
+        for header in [
+            serde_json::json!({}),
+            serde_json::json!({ "x-lgedm-deviceId": "" }),
+        ] {
             let mut device_id = None;
             let payload = serde_json::json!({
                 "Header": header,

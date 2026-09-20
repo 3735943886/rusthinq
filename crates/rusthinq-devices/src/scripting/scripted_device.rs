@@ -1,6 +1,5 @@
 //! `ScriptedDevice`: a `DeviceHandler` whose behavior is entirely defined by a `.rhai`
-//! script instead of Rust code — see `registry.rs`'s two-stage lookup (native first,
-//! this as the fallback).
+//! script instead of Rust code — see `registry.rs`'s lookup.
 
 use crate::device_trait::DeviceHandler;
 use crate::scripting::cache::{self, AstSlot};
@@ -259,8 +258,7 @@ fn script_path(model_id: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// True if a `.rhai` script exists for `model_id` — the fallback `registry.rs` checks
-/// once no native factory matches.
+/// True if a `.rhai` script exists for `model_id` — what `registry.rs` checks.
 pub fn has_script_for(model_id: &str) -> bool {
     script_path(model_id).is_some()
 }

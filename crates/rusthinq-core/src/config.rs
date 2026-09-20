@@ -203,7 +203,10 @@ impl Port {
         match &self.advertise {
             Some(AdvertiseSpec::Url(u)) => u.clone(),
             Some(AdvertiseSpec::Port(p)) => format!("{scheme}://{hostname}:{p}"),
-            None => format!("{scheme}://{hostname}:{}", self.bind.unwrap_or(default_port)),
+            None => format!(
+                "{scheme}://{hostname}:{}",
+                self.bind.unwrap_or(default_port)
+            ),
         }
     }
 }
@@ -510,7 +513,10 @@ mqtt_pass = ""
 "#;
         let cfg = parse_config_text(text).unwrap();
         assert_eq!(cfg.https_port.bind, None);
-        assert_eq!(cfg.https_port.advertise_url("https", "x", 443), "https://x:443");
+        assert_eq!(
+            cfg.https_port.advertise_url("https", "x", 443),
+            "https://x:443"
+        );
     }
 
     #[test]
@@ -530,7 +536,10 @@ mqtt_pass = ""
 "#;
         let cfg = parse_config_text(text).unwrap();
         assert_eq!(cfg.https_port.advertise, None);
-        assert_eq!(cfg.https_port.advertise_url("https", "x", 443), "https://x:4433");
+        assert_eq!(
+            cfg.https_port.advertise_url("https", "x", 443),
+            "https://x:4433"
+        );
     }
 
     #[test]

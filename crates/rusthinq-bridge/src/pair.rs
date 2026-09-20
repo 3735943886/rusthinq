@@ -545,10 +545,8 @@ mod tests {
         // Live info, once the appliance has re-deployed, wins over the persisted one.
         let live_app = serde_json::json!({"protocolVer": "7", "softVer": "live"});
         let live_platform = serde_json::json!({"provisioningKey": "LIVE"});
-        let (app, platform) = resolve_deploy_info(
-            Some((live_app.clone(), live_platform.clone())),
-            &state,
-        );
+        let (app, platform) =
+            resolve_deploy_info(Some((live_app.clone(), live_platform.clone())), &state);
         assert_eq!(app, Some(live_app));
         assert_eq!(platform, Some(live_platform));
     }

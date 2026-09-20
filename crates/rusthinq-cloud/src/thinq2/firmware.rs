@@ -157,7 +157,10 @@ impl FirmwareHosts {
                 if is_new { " (new host)" } else { "" }
             )],
         );
-        hosts.insert(host, Confidence::Suspected(Instant::now(), INITIAL_SUSPECTED_TTL));
+        hosts.insert(
+            host,
+            Confidence::Suspected(Instant::now(), INITIAL_SUSPECTED_TTL),
+        );
     }
 
     /// Register the host of a firmware/download URL the cloud just handed an appliance

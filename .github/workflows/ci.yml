@@ -46,14 +46,11 @@ jobs:
         include:
           - { package: rusthinq-cloud, features: "" }
           - { package: rusthinq-cloud, features: bridge }
-          - { package: rusthinq-cloud, features: native }
           - { package: rusthinq-cloud, features: scripting }
           - { package: rusthinq-cloud, features: gui }
-          - { package: rusthinq-cloud, features: "bridge,native,scripting,gui" }
+          - { package: rusthinq-cloud, features: "bridge,scripting,gui" }
           - { package: rusthinq-devices, features: "" }
-          - { package: rusthinq-devices, features: native }
           - { package: rusthinq-devices, features: scripting }
-          - { package: rusthinq-devices, features: "native,scripting" }
     steps:
       - uses: actions/checkout@v4
 

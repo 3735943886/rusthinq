@@ -82,11 +82,7 @@ pub async fn serve(
 /// unauthenticated request never even reaches `index_html` -- the browser's native
 /// Basic Auth prompt is the login form. Credentials are compared in constant time to
 /// avoid leaking a match-length timing side channel.
-async fn basic_auth(
-    State(want): State<Arc<BasicAuthCreds>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn basic_auth(State(want): State<Arc<BasicAuthCreds>>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -94,7 +90,11 @@ async fn basic_auth(
         .and_then(|v| v.strip_prefix("Basic "))
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|raw| String::from_utf8(raw).ok())
-        .and_then(|creds| creds.split_once(':').map(|(u, p)| (u.to_string(), p.to_string())))
+        .and_then(|creds| {
+            creds
+                .split_once(':')
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+        })
         .is_some_and(|(user, pass)| {
             ct_eq(user.as_bytes(), want.user.as_bytes())
                 && ct_eq(pass.as_bytes(), want.pass.as_bytes())
@@ -135,7 +135,11 @@ async fn dark_css() -> Response {
 }
 
 async fn logo_svg() -> Response {
-    ([("content-type", "image/svg+xml")], include_str!("../assets/logo.svg")).into_response()
+    (
+        [("content-type", "image/svg+xml")],
+        include_str!("../assets/logo.svg"),
+    )
+        .into_response()
 }
 
 async fn favicon_png() -> Response {

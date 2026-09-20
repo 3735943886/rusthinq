@@ -1,6 +1,5 @@
 //! Device handler trait and helpers for modelId registration.
 
-use crate::property::PropertyValue;
 use rusthinq_core::metadata::Metadata;
 use rusthinq_core::mqtt::MqttConnection;
 use rusthinq_core::thinq::{Thinq1Device, Thinq2Device};
@@ -37,8 +36,3 @@ pub type T2Factory =
 /// Factory for ThinQ1 devices.
 pub type T1Factory =
     fn(Arc<dyn MqttConnection>, Arc<dyn Thinq1Device>, Metadata) -> Arc<dyn DeviceHandler>;
-
-/// Helper: property equality for publish cache (string form).
-pub fn prop_str(v: &PropertyValue) -> String {
-    v.as_string()
-}

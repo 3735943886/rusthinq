@@ -469,7 +469,10 @@ mod tests {
         port: u16,
         reader_id: &str,
         topic: impl Into<String>,
-    ) -> (AsyncClient, tokio::sync::mpsc::UnboundedReceiver<rumqttc::Publish>) {
+    ) -> (
+        AsyncClient,
+        tokio::sync::mpsc::UnboundedReceiver<rumqttc::Publish>,
+    ) {
         let mut opts = MqttOptions::new(format!("fake-{reader_id}-reader"), "127.0.0.1", port);
         opts.set_keep_alive(std::time::Duration::from_secs(30));
         let (reader_client, mut reader_eventloop) = AsyncClient::new(opts, 32);
@@ -510,7 +513,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let _acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let _acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -574,8 +581,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let _acceptor =
-            DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let _acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -603,7 +613,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let ack = serde_json::json!({"did": did, "mid": 2, "cmd": "completeProvisioning_ack", "type": 1});
+        let ack =
+            serde_json::json!({"did": did, "mid": 2, "cmd": "completeProvisioning_ack", "type": 1});
         client
             .publish(
                 format!("clip/message/devices/{did}"),
@@ -653,7 +664,11 @@ mod tests {
 
         wait_for(|| (!received.lock().is_empty()).then_some(())).await;
         let got = received.lock().clone();
-        assert_eq!(got.len(), 1, "only the unhandled cmd should have reached the handler");
+        assert_eq!(
+            got.len(),
+            1,
+            "only the unhandled cmd should have reached the handler"
+        );
         assert_eq!(got[0]["cmd"], "respUniversalCtrl");
     }
 
@@ -669,7 +684,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let _acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let _acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -754,7 +773,8 @@ mod tests {
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
         let firmware_hosts = Arc::new(FirmwareHosts::new());
-        let _acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), firmware_hosts.clone());
+        let _acceptor =
+            DeviceAcceptor::new(broker.clone(), manager.clone(), firmware_hosts.clone());
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -829,7 +849,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let _acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let _acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -912,7 +936,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let _acceptor = DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let _acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {
@@ -962,10 +990,7 @@ mod tests {
              published on an AWS rule republish topic",
         );
 
-        assert_eq!(
-            received.get("did").and_then(|v| v.as_str()),
-            Some(did)
-        );
+        assert_eq!(received.get("did").and_then(|v| v.as_str()), Some(did));
     }
 
     async fn complete_provisioning_for(port: u16, did: &str) {
@@ -1012,8 +1037,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let broker = Arc::new(Broker::new());
         let manager = DeviceManager::new();
-        let acceptor =
-            DeviceAcceptor::new(broker.clone(), manager.clone(), Arc::new(FirmwareHosts::new()));
+        let acceptor = DeviceAcceptor::new(
+            broker.clone(),
+            manager.clone(),
+            Arc::new(FirmwareHosts::new()),
+        );
         {
             let broker = broker.clone();
             tokio::spawn(async move {

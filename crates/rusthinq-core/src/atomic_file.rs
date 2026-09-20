@@ -28,7 +28,8 @@ pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
         std::process::id()
     ));
 
-    let result = std::fs::write(&tmp_path, contents).and_then(|()| std::fs::rename(&tmp_path, path));
+    let result =
+        std::fs::write(&tmp_path, contents).and_then(|()| std::fs::rename(&tmp_path, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -41,7 +42,8 @@ mod tests {
 
     #[test]
     fn write_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!("rusthinq-atomic-write-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rusthinq-atomic-write-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
 

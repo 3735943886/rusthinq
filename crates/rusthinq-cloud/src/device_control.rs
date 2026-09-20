@@ -8,8 +8,8 @@
 //! `<prefix>/<id>/forget/set` (subscribed, payload ignored):
 //!   - clears every retained `<prefix>/<id>/<property>` topic
 //!     (`MqttConnection::clear_retained`) -- only relevant if something drove this
-//!     device's properties via `publish_property` in the first place (a native or
-//!     `.rhai` handler); a no-op otherwise, which is most of the time for a
+//!     device's properties via `publish_property` in the first place (a `.rhai`
+//!     handler); a no-op otherwise, which is most of the time for a
 //!     raw-bus-driven device
 //!   - removes the id from `known_devices.rs`'s connection-level ledger, which is
 //!     what actually makes it stop appearing in `<prefix>/devices` at all

@@ -1,11 +1,10 @@
-//! Rhai device-scripting support: `ScriptedDevice` fills `registry.rs`'s two-stage
-//! lookup once no native handler matches a `modelId`.
+//! Rhai device-scripting support: `ScriptedDevice` is what `registry.rs`'s lookup
+//! returns for a `modelId` that has a script.
 //!
 //! A `.rhai` script gets raw wire bytes straight from the device's own `on_data`
 //! callback (in-process, no MQTT round trip), opt-in access to `rusthinq-util`'s
 //! codec helpers (`crc16`, `hex_*`, `tlv_*`, ...), and can publish/send back out
-//! through the same `MqttConnection`/`Thinq1Device`/`Thinq2Device` primitives a native
-//! handler would use — see `ctx.rs` for the exact surface.
+//! through the same `MqttConnection`/`Thinq1Device`/`Thinq2Device` primitives the host itself uses — see `ctx.rs` for the exact surface.
 
 pub mod cache;
 pub mod ctx;

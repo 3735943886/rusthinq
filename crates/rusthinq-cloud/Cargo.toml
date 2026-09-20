@@ -12,23 +12,19 @@ path = "src/main.rs"
 [features]
 # All off: a plain `cargo build` matches a minimal deployment (local/SoftAP devices
 # only, no LG-cloud bridge, no scripting, no web dashboard). release.yml's actual
-# release builds pass --features bridge,native,scripting,gui explicitly — see the
+# release builds pass --features bridge,scripting,gui explicitly — see the
 # individual features below for what each one adds back.
 default = []
 # Optional forwarding to the real LG cloud (rusthinq_bridge). Off
 # (--no-default-features) drops reqwest/oauth2/rsa/hmac/sha1 etc. entirely for
 # deployments that only ever run local/SoftAP-adopted devices.
 bridge = ["dep:rusthinq-bridge"]
-# Built-in Rust device handlers (see rusthinq_devices::devices). Currently an
-# empty table upstream, so this gates no dependencies today — see that crate's
-# Cargo.toml.
-native = ["rusthinq-devices/native"]
 # Rhai device-scripting support for external `.rhai` converters (see
 # rusthinq_devices::scripting). Off drops rhai/notify entirely.
 scripting = ["rusthinq-devices/scripting"]
 # Optional web dashboard (rusthinq_gui), talking to rusthinq-cloud only over MQTT
 # like any other client -- see rusthinq-gui's crate docs. Off by default (unlike
-# bridge/native/scripting): a stock build stays exactly what it is today; opting in
+# bridge/scripting): a stock build stays exactly what it is today; opting in
 # needs both this feature and a `[gui]` config section.
 gui = ["dep:rusthinq-gui"]
 

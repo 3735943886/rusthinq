@@ -89,7 +89,7 @@ pub fn build(elements: &[Tlv]) -> Vec<u8> {
 
 /// Build a complete TLV device frame: `[b0, b1, 04 00 00 00 65, b2, b3, b4, len, tlv.., crc16]`.
 /// `header` is `[b0, b1]` optionally followed by `b2, b3, b4` (defaults `2, 2, 1`) — the
-/// same shape `TlvDeviceCore::send` takes, so `[1, 1, 2, 2, 1]` is the values/caps query.
+/// same shape the TLV drivers pass to `tlv_frame_build`, so `[1, 1, 2, 2, 1]` is the values/caps query.
 pub fn frame_build(header: &[u8], elements: &[Tlv]) -> Option<Vec<u8>> {
     if header.len() < 2 {
         return None;
@@ -117,9 +117,8 @@ pub fn frame_build(header: &[u8], elements: &[Tlv]) -> Option<Vec<u8>> {
 }
 
 /// Parse a device-to-host TLV state frame (the `0x87`/`0xa7`, `0x02` form
-/// `TlvDeviceCore::process_data` treats as the standard one). `None` for anything else
-/// — an ack, a private-command frame, a truncated buffer. The CRC is not checked, as in
-/// `process_data`.
+/// the TLV drivers treat as the standard one). `None` for anything else
+/// — an ack, a private-command frame, a truncated buffer. The CRC is not checked, as elsewhere.
 pub fn frame_parse(buf: &[u8]) -> Option<Vec<Tlv>> {
     if buf.len() < 13 {
         return None;

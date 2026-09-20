@@ -500,7 +500,11 @@ mod tests {
 
         dev.notify_close();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(handler.drop_calls.load(Ordering::SeqCst), 1, "still drops locally");
+        assert_eq!(
+            handler.drop_calls.load(Ordering::SeqCst),
+            1,
+            "still drops locally"
+        );
 
         assert!(
             mqtt.device("dev-1").is_some(),
