@@ -19,6 +19,33 @@
 
 import "aabb_common" as c;
 
+// ---- code tables ---------------------------------------------------------------------
+//
+// A table is an array of `[code, name]` pairs, so a driver states each enum once and reads
+// it both ways (a state code to its name, a name back to the code a command needs).
+
+fn name_of(table, code) {
+    for e in table { if e[0] == code { return e[1]; } }
+    ()
+}
+
+fn code_of(table, name) {
+    for e in table { if e[1] == name { return e[0]; } }
+    ()
+}
+
+fn names(table) {
+    let out = [];
+    for e in table { out.push(e[1]); }
+    out
+}
+
+fn codes(table) {
+    let out = [];
+    for e in table { out.push(e[0]); }
+    out
+}
+
 fn control_power_off() { 0x01 }
 fn control_pause() { 0x04 }
 

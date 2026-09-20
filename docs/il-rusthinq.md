@@ -70,6 +70,7 @@ frames captured from a real appliance.
 | WBEY3GT (LG cooktop, AABB) | `scripts/WBEY3GT.rhai` | tested against real frames and the command frames the LG app sent, byte for byte; not yet run live. Writes are rejected unless the panel has granted remote start, and no command lights a ring |
 | Pd0F_F (LG mini washer, AABB monitoring record) | `scripts/Pd0F_F.rhai` | commands byte for byte as the LG app sent them (from rethink's test suite); status frames built from the documented offsets and the state the rethink adapter had retained, not yet checked against a live capture |
 | RH14_N_KR (LG dryer, AABB monitoring record) | `scripts/RH14_N_KR.rhai` | tested against three real frames captured from the appliance while it ran a cycle (their previous records agree with what the rethink adapter had retained at that moment) and the start frame the LG app sent; not yet run live |
+| S3BF_POD_DN4 (LG styler, AABB monitoring record) | `scripts/S3BF_POD_DN4.rhai` | tested against a real idle frame from the cabinet (energy and downloaded course agree with what the rethink adapter had retained) and the 46-byte Fine Dust start the LG app sent, byte for byte; there is no power-on command (measured: the cabinet acknowledges and ignores them); not yet run live |
 
 TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
 

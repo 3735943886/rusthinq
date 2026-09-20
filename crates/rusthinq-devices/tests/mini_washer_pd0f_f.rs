@@ -8,6 +8,9 @@ use rusthinq_devices::scripting::ScriptHarness;
 
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/Pd0F_F.rhai");
 
+/// A real capture from the drawer on r5c, taken when it woke briefly.
+const REAL_IDLE: &str = "aa3c20ec001900000100010100000100000000000000000000000000006700001900000100010100000100000000000000000000000000006700afbb";
+
 fn harness() -> ScriptHarness {
     ScriptHarness::t2(SCRIPT, "Pd0F_F")
 }
@@ -262,4 +265,20 @@ fn the_descriptor_marks_the_controls_and_the_dial_is_separate_from_the_selection
     assert_eq!(d["props"]["course_select"]["rw"], true);
     assert_eq!(d["props"]["course"].get("rw"), None);
     rusthinq_devices::scripting::set_il_prefix(None);
+}
+
+#[test]
+fn a_real_frame_from_the_appliance_reads_as_idle_small_load() {
+    let h = harness();
+    h.feed_hex(REAL_IDLE);
+    assert_eq!(h.script_error(), None);
+    expect(
+        &h,
+        &[
+            ("available", "true"),
+            ("power", "false"),
+            ("status", "off"),
+            ("course", "small_load"),
+        ],
+    );
 }
