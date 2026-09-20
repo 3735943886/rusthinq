@@ -187,6 +187,26 @@ fn register_codec_helpers(engine: &mut Engine) {
                     .ok_or_else(|| "tlv_frame_build: bad header or too many elements".into())
             },
         )
+        .register_fn("aabb_wrap", |inner: Vec<u8>| {
+            crate::device_base::wrap_aabb(&inner)
+        })
+        .register_fn(
+            "aabb_wrap",
+            |inner: rhai::Array| -> Result<Vec<u8>, Box<EvalAltResult>> {
+                let bytes: Vec<u8> = inner
+                    .iter()
+                    .map(|d| d.as_int().ok().and_then(|n| u8::try_from(n).ok()))
+                    .collect::<Option<_>>()
+                    .ok_or("aabb_wrap: expected an array of byte values")?;
+                Ok(crate::device_base::wrap_aabb(&bytes))
+            },
+        )
+        .register_fn("aabb_unwrap", |data: Vec<u8>| -> rhai::Dynamic {
+            match crate::device_base::unwrap_aabb(&data) {
+                Some(inner) => rhai::Dynamic::from_blob(inner),
+                None => rhai::Dynamic::UNIT,
+            }
+        })
         .register_fn("known_tag_name", |id: i64| {
             rusthinq_util::tlv_catalog::known_tag_name(id as u16)
                 .unwrap_or("")
@@ -247,6 +267,30 @@ mod tests {
         let ast = engine().compile(script).unwrap();
         let mut scope = Scope::new();
         engine().call_fn(&mut scope, &ast, "run_script", ())
+    }
+
+    #[test]
+    fn aabb_wrap_and_unwrap_round_trip_and_reject_unframed_input() {
+        let ast = engine()
+            .compile(
+                r#"
+                fn run_script() {
+                    let inner = [0x12, 0xec, 0x01];
+                    let framed = aabb_wrap(inner);
+                    if framed[0] != 0xaa || framed[framed.len() - 1] != 0xbb { return "bad frame"; }
+                    let back = aabb_unwrap(framed);
+                    if back.len() != 3 || back[1] != 0xec { return "bad inner"; }
+                    if aabb_unwrap(blob(4, 1)) != () { return "accepted unframed"; }
+                    "ok"
+                }
+                "#,
+            )
+            .unwrap();
+        let mut scope = Scope::new();
+        let out: String = engine()
+            .call_fn(&mut scope, &ast, "run_script", ())
+            .unwrap();
+        assert_eq!(out, "ok");
     }
 
     #[test]
