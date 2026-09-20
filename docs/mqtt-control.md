@@ -141,7 +141,7 @@ mosquitto_sub -h localhost -t 'rusthinq/<id>/forget/status' -v
 | `rusthinq/bridge/login/complete/set` | subscribed | full redirected URL | finish LG OAuth login |
 | `rusthinq/bridge/logout/set` | subscribed | ignored | clear LG credentials, detach every bridge session |
 | `rusthinq/bridge/status` | published | text | login/logout outcome |
-| `rusthinq/<id>/forget/set` | subscribed | ignored | clear retained MQTT state (+ saved bridge pairing, if built) for an id, live or not |
+| `rusthinq/<id>/forget/set` | subscribed | ignored | clear retained MQTT state (and the retained IL descriptor, if `il_prefix` is set; + saved bridge pairing, if built) for an id, live or not |
 | `rusthinq/<id>/forget/status` | published | text | forget outcome |
 
 Source of truth for the exact topic strings and payload handling:

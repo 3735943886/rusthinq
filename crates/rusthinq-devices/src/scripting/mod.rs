@@ -30,7 +30,7 @@ fn il_prefix_slot() -> &'static RwLock<Option<std::sync::Arc<str>>> {
 
 /// `[scripting] il_prefix`, if set: the namespace `ctx.publish_il` publishes IL
 /// descriptors under. `None` (the default) means descriptors are not published.
-pub(crate) fn il_prefix() -> Option<std::sync::Arc<str>> {
+pub fn il_prefix() -> Option<std::sync::Arc<str>> {
     il_prefix_slot().read().clone()
 }
 

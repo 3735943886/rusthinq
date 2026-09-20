@@ -69,6 +69,9 @@ and `source`, replaces `label` with the owner's name for the device when the Thi
 `<rusthinq_prefix>/<id>/<prop>` topics, because a driver does not know topics. Values and
 commands keep using those existing topics, so the IL adds only the descriptor.
 
+Forgetting a device (`<rusthinq_prefix>/<id>/forget/set`) also clears its retained descriptor at
+`<il_prefix>/<id>`, so a consumer that follows the descriptors drops the device.
+
 ## Testing
 
 A driver's tests are written in Rhai and live beside it, so a driver and its tests can be

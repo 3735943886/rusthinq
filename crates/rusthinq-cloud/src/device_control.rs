@@ -11,6 +11,9 @@
 //!     device's properties via `publish_property` in the first place (a `.rhai`
 //!     handler); a no-op otherwise, which is most of the time for a
 //!     raw-bus-driven device
+//!   - with `[scripting] il_prefix` set, also clears the retained IL descriptor at
+//!     `<il_prefix>/<id>` (an empty retained payload; a consumer takes that as "this
+//!     device is gone")
 //!   - removes the id from `known_devices.rs`'s connection-level ledger, which is
 //!     what actually makes it stop appearing in `<prefix>/devices` at all
 //!   - with the `bridge` feature and a live LG-cloud bridge, also clears the
@@ -46,6 +49,10 @@ pub fn register(
         tokio::spawn(async move {
             disable_bridge(&bridge, &id).await;
             mqtt.clear_retained(&id);
+            #[cfg(feature = "scripting")]
+            if let Some(prefix) = rusthinq_devices::scripting::il_prefix() {
+                mqtt.publish_raw(&format!("{prefix}/{id}"), b"", true);
+            }
             known_devices.forget(&id);
             device_list.publish();
             mqtt.publish_event(&id, "forget/status", "forgotten");
@@ -102,6 +109,8 @@ mod tests {
             state_file: None,
         };
         let sink = MqttSink::new(sink_cfg);
+        #[cfg(feature = "scripting")]
+        rusthinq_devices::scripting::set_il_prefix(Some("il".into()));
 
         register(
             &sink,
@@ -128,6 +137,16 @@ mod tests {
             mqtt.known_devices().is_empty(),
             "forget must also clear_retained any properties that were published"
         );
+        #[cfg(feature = "scripting")]
+        {
+            rusthinq_devices::scripting::set_il_prefix(None);
+            assert!(
+                mqtt.raw_publishes()
+                    .iter()
+                    .any(|(t, p, retain)| t == "il/dev-gone" && p.is_empty() && *retain),
+                "forget must clear the retained IL descriptor"
+            );
+        }
         let raw = mqtt.retained("devices").expect("devices must republish");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v["devices"].get("dev-gone").is_none());
