@@ -46,8 +46,8 @@ pub struct MqttConfig {
 /// | `rx` | `raw/rx` | frames received from the device |
 /// | `tx` | `raw/tx` | everything sent to the device, whoever sent it (includes what the LG cloud sent down while bridged) |
 /// | `clip` | `raw/clip` | CLIP messages from the device that nothing local handles (only `device_packet`, `req_timesync` and the deploy handshake are), otherwise dropped unseen unless bridged |
-/// | `lg_up` | `raw/lg/up` | what the bridge sends up to the real LG cloud (`bridge` feature) |
-/// | `lg_down` | `raw/lg/down` | what the bridge receives from the real LG cloud (`bridge` feature) |
+/// | `lg_tx` | `raw/lg/tx` | what the bridge sends to the real LG cloud (`bridge` feature) |
+/// | `lg_rx` | `raw/lg/rx` | what the bridge receives from the real LG cloud (`bridge` feature) |
 /// | `inject` | `raw/inject/set` | send a raw frame to the device |
 /// | `inject_clip` | `raw/inject-clip/set` | send a named CLIP command to the device |
 /// | `emit` | `raw/emit/set` | feed a frame in as if the device had sent it; also reaches the LG cloud when bridged |
@@ -58,8 +58,8 @@ pub struct RawStreams {
     pub rx: bool,
     pub tx: bool,
     pub clip: bool,
-    pub lg_up: bool,
-    pub lg_down: bool,
+    pub lg_tx: bool,
+    pub lg_rx: bool,
     pub inject: bool,
     pub inject_clip: bool,
     pub emit: bool,
@@ -73,8 +73,8 @@ impl RawStreams {
             rx: true,
             tx: true,
             clip: true,
-            lg_up: true,
-            lg_down: true,
+            lg_tx: true,
+            lg_rx: true,
             inject: true,
             inject_clip: true,
             emit: true,
@@ -87,8 +87,8 @@ impl RawStreams {
             ("rx", &mut self.rx),
             ("tx", &mut self.tx),
             ("clip", &mut self.clip),
-            ("lg_up", &mut self.lg_up),
-            ("lg_down", &mut self.lg_down),
+            ("lg_tx", &mut self.lg_tx),
+            ("lg_rx", &mut self.lg_rx),
             ("inject", &mut self.inject),
             ("inject_clip", &mut self.inject_clip),
             ("emit", &mut self.emit),
@@ -701,11 +701,11 @@ raw_prefix = "rusthinq-raw"
         assert_eq!(off.mqtt.raw, RawStreams::default());
 
         let listed =
-            parse_config_text(&format!("{base}raw = [\"rx\", \"clip\", \"lg_up\"]\n")).unwrap();
+            parse_config_text(&format!("{base}raw = [\"rx\", \"clip\", \"lg_tx\"]\n")).unwrap();
         let raw = listed.mqtt.raw;
-        assert!(raw.rx && raw.clip && raw.lg_up);
+        assert!(raw.rx && raw.clip && raw.lg_tx);
         assert!(
-            !raw.tx && !raw.lg_down && !raw.inject && !raw.inject_clip && !raw.emit && !raw.sim
+            !raw.tx && !raw.lg_rx && !raw.inject && !raw.inject_clip && !raw.emit && !raw.sim
         );
     }
 
@@ -743,7 +743,7 @@ raw = ["rx", "clipp"]
         // dashboard monitor (rx, tx, inject, emit) + external driver (rx, inject, inject_clip)
         assert!(raw.rx && raw.tx && raw.inject && raw.inject_clip && raw.emit);
         // debugging aids stay off unless someone lists them
-        assert!(!raw.clip && !raw.lg_up && !raw.lg_down && !raw.sim);
+        assert!(!raw.clip && !raw.lg_tx && !raw.lg_rx && !raw.sim);
     }
 
     #[test]

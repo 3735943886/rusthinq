@@ -400,18 +400,18 @@ async fn main() -> Result<()> {
         br.set_note_urls_hook(Arc::new(move |payload| fh.note_urls_in(payload)));
     }
 
-    // raw/lg/up|down (see raw_bus.rs): only hooked at all when one of them is on, so the
+    // raw/lg/tx|rx (see raw_bus.rs): only hooked at all when one of them is on, so the
     // default build/config adds no per-message work to the bridge.
     #[cfg(feature = "bridge")]
     if let Some(ref br) = lg_bridge
         && let Some(ref raw_prefix) = config.mqtt.raw_prefix
-        && (config.mqtt.raw.lg_up || config.mqtt.raw.lg_down)
+        && (config.mqtt.raw.lg_tx || config.mqtt.raw.lg_rx)
     {
         let mqtt = mqtt_dyn.clone();
         let raw_prefix = raw_prefix.clone();
         let streams = config.mqtt.raw.clone();
-        br.set_traffic_hook(Arc::new(move |id, up, payload| {
-            raw_bus::lg_tap(&mqtt, &raw_prefix, &streams, id, up, payload);
+        br.set_traffic_hook(Arc::new(move |id, to_lg, payload| {
+            raw_bus::lg_tap(&mqtt, &raw_prefix, &streams, id, to_lg, payload);
         }));
     }
 

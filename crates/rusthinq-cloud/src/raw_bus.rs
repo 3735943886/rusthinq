@@ -12,7 +12,7 @@
 //!   - `<prefix>/<id>/raw/tx` (published) — hex (or JSON for CLIP commands) of each frame sent to it
 //!   - `<prefix>/<id>/raw/clip` (published, off by default) — JSON of each CLIP message the
 //!     device sent that nothing local handles; otherwise dropped unseen unless bridged
-//!   - `<prefix>/<id>/raw/lg/up`, `raw/lg/down` (published, off by default, `bridge` feature) —
+//!   - `<prefix>/<id>/raw/lg/tx`, `raw/lg/rx` (published, off by default, `bridge` feature) —
 //!     JSON of what the bridge sends to / receives from the real LG cloud; see [`lg_tap`]
 //!   - `<prefix>/<id>/raw/inject/set` (subscribed) — hex frame to send to the device
 //!   - `<prefix>/<id>/raw/emit/set` (subscribed) — hex frame to inject as if received from the device
@@ -100,20 +100,21 @@ pub fn attach(
     }
 }
 
-/// Publish one bridge<->LG message on `raw/lg/up` or `raw/lg/down`. Wired by
-/// `main.rs` to the bridge's traffic hook when `lg_up`/`lg_down` is on.
+/// Publish one bridge<->LG message: `raw/lg/tx` when `to_lg` (sent to the LG cloud),
+/// `raw/lg/rx` otherwise (received from it). Wired by `main.rs` to the bridge's traffic
+/// hook when `lg_tx`/`lg_rx` is on.
 pub fn lg_tap(
     mqtt: &Arc<dyn MqttConnection>,
     raw_prefix: &str,
     streams: &RawStreams,
     id: &str,
-    up: bool,
+    to_lg: bool,
     payload: &serde_json::Value,
 ) {
-    let (enabled, leaf) = if up {
-        (streams.lg_up, "up")
+    let (enabled, leaf) = if to_lg {
+        (streams.lg_tx, "tx")
     } else {
-        (streams.lg_down, "down")
+        (streams.lg_rx, "rx")
     };
     if !enabled {
         return;
@@ -296,7 +297,7 @@ mod tests {
         let mqtt = MockMqttConnection::new();
         let dyn_mqtt = mqtt.clone() as Arc<dyn MqttConnection>;
         let streams = RawStreams {
-            lg_up: true,
+            lg_tx: true,
             ..RawStreams::default()
         };
         let msg = json!({"cmd": "device_packet", "data": "AA"});
@@ -306,7 +307,7 @@ mod tests {
 
         let raw = mqtt.raw_publishes();
         assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0].0, "rusthinq-raw/dev-1/raw/lg/up");
+        assert_eq!(raw[0].0, "rusthinq-raw/dev-1/raw/lg/tx");
     }
 
     #[test]

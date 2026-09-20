@@ -67,8 +67,8 @@ raw_prefix = "rusthinq-raw"
 #               cloud sent down while bridged)
 #   clip        CLIP messages from the device that nothing local handles -- otherwise
 #               dropped unseen unless bridged (low volume)
-#   lg_up       what the bridge sends up to the real LG cloud   (bridge feature)
-#   lg_down     what the bridge receives from the real LG cloud (bridge feature)
+#   lg_tx       what the bridge sends to the real LG cloud      (bridge feature)
+#   lg_rx       what the bridge receives from the real LG cloud (bridge feature)
 #   inject      raw/inject/set: send a frame to the device, always wrapped as a `packet`
 #   inject_clip raw/inject-clip/set: send a named CLIP command to the device. The cmd is
 #               free-form, so this is the broader of the two -- kept apart from `inject`
@@ -83,7 +83,7 @@ raw_prefix = "rusthinq-raw"
 #   rusthinq-adapter)                        inject_clip for its one-off setMaskingInfo
 # The default below is the union of the two. Trim it to what you actually run: without the
 # dashboard drop "tx" and "emit"; without an external driver drop "inject" and "inject_clip".
-# "clip", "lg_up", "lg_down" and "sim" are debugging aids, off unless you list them.
+# "clip", "lg_tx", "lg_rx" and "sim" are debugging aids, off unless you list them.
 raw = ["rx", "tx", "inject", "inject_clip", "emit"]
 # Where the id -> published-property map used to clean up a gone device's retained
 # topics is persisted. On by default; defaults to mqtt_state.json next to this file.

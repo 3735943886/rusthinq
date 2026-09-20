@@ -103,7 +103,7 @@ pub struct Bridge {
     note_urls: Mutex<Option<NoteUrlsHook>>,
     /// Called with every ThinQ2 message the bridge sends up to, or receives from, the
     /// real cloud, for a caller that wants to watch that traffic (rusthinq-cloud wires
-    /// this to its raw bus's `raw/lg/up|down`). Only sees what actually crosses:
+    /// this to its raw bus's `raw/lg/tx|rx`). Only sees what actually crosses:
     /// messages the bridge refuses to relay (`NEVER_RELAYED_CMDS`) are not reported.
     /// `rusthinq-bridge` has no opinion on what it's used for.
     traffic: Mutex<Option<TrafficHook>>,
