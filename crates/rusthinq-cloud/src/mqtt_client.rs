@@ -88,7 +88,12 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                     let _ = client
                         .subscribe(format!("{prefix}/+/+/+/set"), QoS::AtLeastOnce)
                         .await;
-                    // raw_bus's inject/emit topics (<raw_prefix>/<id>/raw/inject|emit/set) live
+                    // Three segments between the id and `set` — `raw/inject/clip/set`,
+                    // `raw/sim/publish/set` — which matters when raw_prefix equals prefix.
+                    let _ = client
+                        .subscribe(format!("{prefix}/+/+/+/+/set"), QoS::AtLeastOnce)
+                        .await;
+                    // raw_bus's inject/emit topics (<raw_prefix>/<id>/raw/inject|emit|inject/clip/set) live
                     // under a separate prefix from the rest of the control plane - see
                     // raw_bus.rs's doc comment on register_inject. Without this, publishing to
                     // raw_prefix is a silent no-op: nothing here is subscribed to receive it, so
@@ -103,6 +108,9 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                             .await;
                         let _ = client
                             .subscribe(format!("{raw_prefix}/+/+/+/set"), QoS::AtLeastOnce)
+                            .await;
+                        let _ = client
+                            .subscribe(format!("{raw_prefix}/+/+/+/+/set"), QoS::AtLeastOnce)
                             .await;
                     }
                     let _ = client

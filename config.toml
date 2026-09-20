@@ -61,30 +61,34 @@ rusthinq_prefix = "rusthinq" # topic prefix for rusthinq's own topics
 # surface exists). Can share rusthinq_prefix or use its own value to gate ACLs separately.
 raw_prefix = "rusthinq-raw"
 # Which raw-bus streams raw_prefix turns on, listed by name. Leaving `raw` out turns every one
-# off, so raw_prefix alone exposes nothing. Topics are <raw_prefix>/<id>/raw/<stream>.
-#   rx          frames received from the device
-#   tx          everything sent to the device, whoever sent it (includes what the LG
-#               cloud sent down while bridged)
-#   clip        CLIP messages from the device that nothing local handles -- otherwise
+# off, so raw_prefix alone exposes nothing. A stream's topic is
+# <raw_prefix>/<id>/raw/<name, "_" read as "/">, e.g. clip_rx -> raw/clip/rx; the commands
+# end in /set. A topic's payload never varies: hex for rx/tx/inject/emit, JSON for the rest.
+#   rx          packets received from the device
+#   tx          packets sent to the device, whoever sent them
+#   clip_rx     CLIP messages from the device that nothing local handles -- otherwise
 #               dropped unseen unless bridged (low volume)
-#   lg_tx       what the bridge sends to the real LG cloud      (bridge feature)
+#   clip_tx     CLIP commands sent to the device, including what the LG cloud sent down
+#               while bridged (ThinQ1: its JSON)
 #   lg_rx       what the bridge receives from the real LG cloud (bridge feature)
-#   inject      raw/inject/set: send a frame to the device, always wrapped as a `packet`
-#   inject_clip raw/inject-clip/set: send a named CLIP command to the device. The cmd is
-#               free-form, so this is the broader of the two -- kept apart from `inject`
-#               so a consumer that only drives the appliance doesn't get it
-#   emit        raw/emit/set: feed a frame in as if the device sent it (also reaches the
+#   lg_tx       what the bridge sends to the real LG cloud      (bridge feature)
+#   inject      raw/inject/set: send a packet to the device
+#   inject_clip raw/inject/clip/set: send a named CLIP command ({cmd, type, data}) to the
+#               device. The cmd is free-form, so this is the broader of the two -- kept apart
+#               from `inject` so a consumer that only drives the appliance doesn't get it
+#   emit        raw/emit/set: feed a packet in as if the device sent it (also reaches the
 #               LG cloud when bridged)
-#   sim         the device simulator (simdev/...)
+#   sim         raw/sim/...: the device simulator
 #
 # What needs what:
-#   web dashboard, per-device monitor page   rx, tx to watch; inject, emit for its send boxes
+#   web dashboard, per-device monitor page   rx, tx, clip_tx to watch; inject, emit for its
+#                                            send boxes
 #   external driver over MQTT (rethink's     rx to read; inject to drive the appliance;
 #   rusthinq-adapter)                        inject_clip for its one-off setMaskingInfo
 # The default below is the union of the two. Trim it to what you actually run: without the
-# dashboard drop "tx" and "emit"; without an external driver drop "inject" and "inject_clip".
-# "clip", "lg_tx", "lg_rx" and "sim" are debugging aids, off unless you list them.
-raw = ["rx", "tx", "inject", "inject_clip", "emit"]
+# dashboard drop "tx", "clip_tx" and "emit"; without an external driver drop "inject" and
+# "inject_clip". "clip_rx", "lg_rx", "lg_tx" and "sim" are debugging aids, off unless listed.
+raw = ["rx", "tx", "clip_tx", "inject", "inject_clip", "emit"]
 # Where the id -> published-property map used to clean up a gone device's retained
 # topics is persisted. On by default; defaults to mqtt_state.json next to this file.
 # state_file = "mqtt_state.json"

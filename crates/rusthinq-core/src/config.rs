@@ -34,32 +34,36 @@ pub struct MqttConfig {
 }
 
 /// Which raw-bus streams (`raw_bus.rs`) `raw_prefix` turns on, listed by name:
-/// `raw = ["rx", "tx", "clip"]`. Only what is listed is on; leaving `raw` out turns
+/// `raw = ["rx", "tx", "clip_rx"]`. Only what is listed is on; leaving `raw` out turns
 /// every stream off, so setting `raw_prefix` alone exposes nothing. An unknown name is a
 /// config error rather than being silently ignored, so a typo can't quietly leave a
 /// stream off.
 ///
-/// Topics are `<raw_prefix>/<id>/raw/<stream>`:
+/// A stream's topic is `<raw_prefix>/<id>/raw/` plus its name with `_` read as `/`
+/// (`clip_rx` -> `raw/clip/rx`); the commands end in `/set`. Payloads are fixed per
+/// topic: hex for `rx`/`tx`/`inject`/`emit`, JSON for everything else.
 ///
 /// | name | topic | what |
 /// |---|---|---|
-/// | `rx` | `raw/rx` | frames received from the device |
-/// | `tx` | `raw/tx` | everything sent to the device, whoever sent it (includes what the LG cloud sent down while bridged) |
-/// | `clip` | `raw/clip` | CLIP messages from the device that nothing local handles (only `device_packet`, `req_timesync` and the deploy handshake are), otherwise dropped unseen unless bridged |
-/// | `lg_tx` | `raw/lg/tx` | what the bridge sends to the real LG cloud (`bridge` feature) |
+/// | `rx` | `raw/rx` | packets received from the device |
+/// | `tx` | `raw/tx` | packets sent to the device, whoever sent them |
+/// | `clip_rx` | `raw/clip/rx` | CLIP messages from the device that nothing local handles (only `device_packet`, `req_timesync` and the deploy handshake are), otherwise dropped unseen unless bridged |
+/// | `clip_tx` | `raw/clip/tx` | CLIP commands (ThinQ1: JSON) sent to the device, including what the LG cloud sent down while bridged |
 /// | `lg_rx` | `raw/lg/rx` | what the bridge receives from the real LG cloud (`bridge` feature) |
-/// | `inject` | `raw/inject/set` | send a raw frame to the device |
-/// | `inject_clip` | `raw/inject-clip/set` | send a named CLIP command to the device |
-/// | `emit` | `raw/emit/set` | feed a frame in as if the device had sent it; also reaches the LG cloud when bridged |
-/// | `sim` | `simdev/...` | the device simulator (`sim_device.rs`) |
+/// | `lg_tx` | `raw/lg/tx` | what the bridge sends to the real LG cloud (`bridge` feature) |
+/// | `inject` | `raw/inject/set` | send a packet to the device |
+/// | `inject_clip` | `raw/inject/clip/set` | send a named CLIP command to the device; the cmd is free-form, which is why it is separate from `inject` |
+/// | `emit` | `raw/emit/set` | feed a packet in as if the device had sent it; also reaches the LG cloud when bridged |
+/// | `sim` | `raw/sim/...` | the device simulator (`sim_device.rs`) |
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
 pub struct RawStreams {
     pub rx: bool,
     pub tx: bool,
-    pub clip: bool,
-    pub lg_tx: bool,
+    pub clip_rx: bool,
+    pub clip_tx: bool,
     pub lg_rx: bool,
+    pub lg_tx: bool,
     pub inject: bool,
     pub inject_clip: bool,
     pub emit: bool,
@@ -72,9 +76,10 @@ impl RawStreams {
         Self {
             rx: true,
             tx: true,
-            clip: true,
-            lg_tx: true,
+            clip_rx: true,
+            clip_tx: true,
             lg_rx: true,
+            lg_tx: true,
             inject: true,
             inject_clip: true,
             emit: true,
@@ -82,13 +87,14 @@ impl RawStreams {
         }
     }
 
-    fn slots(&mut self) -> [(&'static str, &mut bool); 9] {
+    fn slots(&mut self) -> [(&'static str, &mut bool); 10] {
         [
             ("rx", &mut self.rx),
             ("tx", &mut self.tx),
-            ("clip", &mut self.clip),
-            ("lg_tx", &mut self.lg_tx),
+            ("clip_rx", &mut self.clip_rx),
+            ("clip_tx", &mut self.clip_tx),
             ("lg_rx", &mut self.lg_rx),
+            ("lg_tx", &mut self.lg_tx),
             ("inject", &mut self.inject),
             ("inject_clip", &mut self.inject_clip),
             ("emit", &mut self.emit),
@@ -701,11 +707,17 @@ raw_prefix = "rusthinq-raw"
         assert_eq!(off.mqtt.raw, RawStreams::default());
 
         let listed =
-            parse_config_text(&format!("{base}raw = [\"rx\", \"clip\", \"lg_tx\"]\n")).unwrap();
+            parse_config_text(&format!("{base}raw = [\"rx\", \"clip_rx\", \"lg_tx\"]\n")).unwrap();
         let raw = listed.mqtt.raw;
-        assert!(raw.rx && raw.clip && raw.lg_tx);
+        assert!(raw.rx && raw.clip_rx && raw.lg_tx);
         assert!(
-            !raw.tx && !raw.lg_rx && !raw.inject && !raw.inject_clip && !raw.emit && !raw.sim
+            !raw.tx
+                && !raw.clip_tx
+                && !raw.lg_rx
+                && !raw.inject
+                && !raw.inject_clip
+                && !raw.emit
+                && !raw.sim
         );
     }
 
@@ -731,7 +743,7 @@ raw = ["rx", "clipp"]
     #[test]
     fn raw_streams_round_trip_as_a_name_list() {
         let names: Vec<String> = RawStreams::all().into();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
         assert_eq!(RawStreams::try_from(names).unwrap(), RawStreams::all());
     }
 
@@ -740,10 +752,10 @@ raw = ["rx", "clipp"]
         let cfg = parse_config_text(include_str!("../../../config.toml")).unwrap();
         assert_eq!(cfg.mqtt.raw_prefix.as_deref(), Some("rusthinq-raw"));
         let raw = cfg.mqtt.raw;
-        // dashboard monitor (rx, tx, inject, emit) + external driver (rx, inject, inject_clip)
-        assert!(raw.rx && raw.tx && raw.inject && raw.inject_clip && raw.emit);
+        // dashboard monitor (rx, tx, clip_tx, inject, emit) + external driver (rx, inject, inject_clip)
+        assert!(raw.rx && raw.tx && raw.clip_tx && raw.inject && raw.inject_clip && raw.emit);
         // debugging aids stay off unless someone lists them
-        assert!(!raw.clip && !raw.lg_tx && !raw.lg_rx && !raw.sim);
+        assert!(!raw.clip_rx && !raw.lg_tx && !raw.lg_rx && !raw.sim);
     }
 
     #[test]

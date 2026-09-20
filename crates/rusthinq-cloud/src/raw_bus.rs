@@ -7,15 +7,21 @@
 //! only where that connection is otherwise firewalled/trusted, the same assumption
 //! smartrelay's own `observer` listener makes.
 //!
-//! Topics (`<prefix>` = `config.mqtt.raw_prefix`):
-//!   - `<prefix>/<id>/raw/rx` (published) — hex of each frame received from the device
-//!   - `<prefix>/<id>/raw/tx` (published) — hex (or JSON for CLIP commands) of each frame sent to it
-//!   - `<prefix>/<id>/raw/clip` (published, off by default) — JSON of each CLIP message the
-//!     device sent that nothing local handles; otherwise dropped unseen unless bridged
-//!   - `<prefix>/<id>/raw/lg/tx`, `raw/lg/rx` (published, off by default, `bridge` feature) —
-//!     JSON of what the bridge sends to / receives from the real LG cloud; see [`lg_tap`]
-//!   - `<prefix>/<id>/raw/inject/set` (subscribed) — hex frame to send to the device
-//!   - `<prefix>/<id>/raw/emit/set` (subscribed) — hex frame to inject as if received from the device
+//! Topics (`<prefix>` = `config.mqtt.raw_prefix`). The `raw/` segment is what keeps these
+//! apart from rusthinq's own `<prefix>/<id>/<property>` topics when `raw_prefix` is set
+//! to the same value as `rusthinq_prefix`, which is allowed. The payload of a topic is
+//! fixed: hex for packets, JSON for everything else.
+//!   - `<prefix>/<id>/raw/rx`, `raw/tx` (published, hex) — packets received from / sent to the device
+//!   - `<prefix>/<id>/raw/clip/rx` (published, JSON) — CLIP messages the device sent that
+//!     nothing local handles; otherwise dropped unseen unless bridged
+//!   - `<prefix>/<id>/raw/clip/tx` (published, JSON) — CLIP commands sent to the device
+//!     (ThinQ1: its JSON), including what the LG cloud sent down while bridged
+//!   - `<prefix>/<id>/raw/lg/rx`, `raw/lg/tx` (published, JSON, `bridge` feature) — what the
+//!     bridge receives from / sends to the real LG cloud; see [`lg_tap`]
+//!   - `<prefix>/<id>/raw/inject/set` (subscribed, hex) — packet to send to the device
+//!   - `<prefix>/<id>/raw/inject/clip/set` (subscribed, JSON `{cmd, type, data}`) — CLIP command to send
+//!   - `<prefix>/<id>/raw/emit/set` (subscribed, hex) — packet to inject as if received from the device
+//!   - `<prefix>/<id>/raw/sim/...` — the device simulator, see `sim_device.rs`
 //!
 //! Each stream is switched on by name in `[mqtt] raw = [...]` (`RawStreams`); with `raw`
 //! left out every stream is off, so `raw_prefix` alone exposes nothing.
@@ -38,22 +44,28 @@ use rusthinq_core::mqtt::{MqttConnection, MqttSink};
 use serde_json::json;
 use std::sync::Arc;
 
-fn send_to_device_payload(msg: &SendToDevice) -> String {
+/// Which raw topic a message sent to the device belongs on, and its payload: packets are
+/// hex on `raw/tx`, every other kind is JSON on `raw/clip/tx`, so a topic never mixes
+/// payload formats.
+fn tx_leaf_and_payload(msg: &SendToDevice) -> (&'static str, String) {
     match msg {
-        SendToDevice::T2Packet(b) => rusthinq_util::hex::encode(b),
+        SendToDevice::T2Packet(b) => ("tx", rusthinq_util::hex::encode(b)),
         SendToDevice::T2Clip {
             cmd,
             msg_type,
             data,
-        } => json!({ "cmd": cmd, "type": msg_type, "data": data }).to_string(),
-        SendToDevice::T2Raw(v) => v.to_string(),
-        SendToDevice::T1Json(v) => v.to_string(),
+        } => (
+            "clip/tx",
+            json!({ "cmd": cmd, "type": msg_type, "data": data }).to_string(),
+        ),
+        SendToDevice::T2Raw(v) => ("clip/tx", v.to_string()),
+        SendToDevice::T1Json(v) => ("clip/tx", v.to_string()),
     }
 }
 
-/// Publish every rx/tx frame for `dev` onto the raw bus. Call once per connected
-/// device, e.g. from [`DeviceManager::on_new_device`] — only when `raw_prefix` is set;
-/// there is nothing to attach when it isn't.
+/// Publish the streams `streams` lists for `dev` onto the raw bus. Call once per
+/// connected device, e.g. from [`DeviceManager::on_new_device`] — only when `raw_prefix`
+/// is set; there is nothing to attach when it isn't.
 pub fn attach(
     mqtt: &Arc<dyn MqttConnection>,
     dev: &ConnectedDevice,
@@ -73,26 +85,31 @@ pub fn attach(
         });
     }
 
-    if streams.tx {
+    if streams.tx || streams.clip_tx {
         let id = dev.id.clone();
         let mqtt_tx = mqtt.clone();
         let prefix_tx = raw_prefix.to_string();
+        let (tx, clip_tx) = (streams.tx, streams.clip_tx);
         dev.add_send_handler(move |msg| {
+            let (leaf, payload) = tx_leaf_and_payload(&msg);
+            if (leaf == "tx" && !tx) || (leaf == "clip/tx" && !clip_tx) {
+                return;
+            }
             mqtt_tx.publish_raw(
-                &format!("{prefix_tx}/{id}/raw/tx"),
-                send_to_device_payload(&msg).as_bytes(),
+                &format!("{prefix_tx}/{id}/raw/{leaf}"),
+                payload.as_bytes(),
                 false,
             );
         });
     }
 
-    if streams.clip {
+    if streams.clip_rx {
         let id = dev.id.clone();
         let mqtt_clip = mqtt.clone();
         let prefix_clip = raw_prefix.to_string();
         dev.add_unhandled_clip_handler(move |payload| {
             mqtt_clip.publish_raw(
-                &format!("{prefix_clip}/{id}/raw/clip"),
+                &format!("{prefix_clip}/{id}/raw/clip/rx"),
                 payload.to_string().as_bytes(),
                 false,
             );
@@ -127,14 +144,14 @@ pub fn lg_tap(
 }
 
 /// Register the inject/emit handlers once, globally, on `sink` — routes
-/// `<raw_prefix>/<id>/raw/inject/set` and `<raw_prefix>/<id>/raw/emit/set` to the
+/// `<raw_prefix>/<id>/raw/inject/set`, `raw/inject/clip/set` and `raw/emit/set` to the
 /// matching connected device via `manager`. `MqttSink::handle_message` already tries
 /// both `rusthinq_prefix` and `raw_prefix`, so nothing here needs to know which one
 /// matched. Silently ignored for an unknown id or bad hex: this is a debugging tap,
 /// not a control plane that reports errors back to the publisher. Only call this when
 /// `config.mqtt.raw_prefix` is set.
 ///
-/// `raw/inject-clip/set` is the named-CLIP-command counterpart to `raw/inject` (raw
+/// `raw/inject/clip/set` is the named-CLIP-command counterpart to `raw/inject` (raw
 /// bytes only, per `SendToDevice::T2Packet`) — some commands, like the
 /// rethink-TS-adapter's one-shot `setMaskingInfo`, aren't a TLV/AABB packet at all,
 /// they're a `{cmd, type, data}` JSON CLIP envelope (`SendToDevice::T2Clip`), which
@@ -157,7 +174,7 @@ pub fn register_inject(sink: &MqttSink, manager: Arc<DeviceManager>, streams: &R
                 };
                 (dev.emit_data)(buf);
             }
-            "raw/inject-clip" if streams.inject_clip => {
+            "raw/inject/clip" if streams.inject_clip => {
                 let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
                     return;
                 };
@@ -235,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn clip_stream_is_off_unless_listed_and_publishes_unhandled_clip_when_on() {
+    fn clip_rx_is_off_unless_listed_and_publishes_unhandled_clip_when_on() {
         let payload = json!({"cmd": "respUniversalCtrl", "mid": 7});
 
         let mqtt = MockMqttConnection::new();
@@ -249,13 +266,13 @@ mod tests {
         dev.notify_unhandled_clip(payload.clone());
         assert!(
             mqtt.raw_publishes().is_empty(),
-            "raw/clip must be off unless listed"
+            "raw/clip/rx must be off unless listed"
         );
 
         let mqtt = MockMqttConnection::new();
         let dev = dummy_dev("dev-clip-on");
         let streams = RawStreams {
-            clip: true,
+            clip_rx: true,
             ..RawStreams::default()
         };
         attach(
@@ -267,9 +284,9 @@ mod tests {
         dev.notify_unhandled_clip(payload.clone());
         let raw = mqtt.raw_publishes();
         assert_eq!(raw.len(), 1);
-        assert_eq!(raw[0].0, "rusthinq-raw/dev-clip-on/raw/clip");
+        assert_eq!(raw[0].0, "rusthinq-raw/dev-clip-on/raw/clip/rx");
         assert_eq!(raw[0].1, payload.to_string().as_bytes());
-        assert!(!raw[0].2, "raw/clip must not be retained");
+        assert!(!raw[0].2, "raw/clip/rx must not be retained");
     }
 
     #[test]
@@ -311,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_publishes_tx_packet_as_hex_and_clip_as_json() {
+    fn tx_packets_are_hex_on_raw_tx_and_everything_else_is_json_on_raw_clip_tx() {
         let mqtt = MockMqttConnection::new();
         let dev = dummy_dev("dev-2");
         attach(
@@ -327,17 +344,58 @@ mod tests {
             msg_type: 1,
             data: json!({"x": 1}),
         });
+        dev.notify_send(SendToDevice::T2Raw(json!({"cmd": "ack", "mid": 5})));
 
         let raw = mqtt.raw_publishes();
         assert!(
             raw.iter()
                 .any(|(t, p, _)| t == "rusthinq-raw/dev-2/raw/tx" && p == b"dead")
         );
-        assert!(raw.iter().any(|(t, p, _)| {
-            t == "rusthinq-raw/dev-2/raw/tx"
-                && String::from_utf8_lossy(p).contains("setMaskingInfo")
-                && String::from_utf8_lossy(p).contains("\"x\":1")
-        }));
+        let clip_tx: Vec<_> = raw
+            .iter()
+            .filter(|(t, _, _)| t == "rusthinq-raw/dev-2/raw/clip/tx")
+            .map(|(_, p, _)| String::from_utf8_lossy(p).to_string())
+            .collect();
+        assert_eq!(clip_tx.len(), 2);
+        assert!(clip_tx[0].contains("setMaskingInfo") && clip_tx[0].contains("\"x\":1"));
+        assert!(clip_tx[1].contains("\"ack\""));
+        assert!(
+            !raw.iter()
+                .any(|(t, p, _)| t.ends_with("/raw/tx") && p.first() == Some(&b'{')),
+            "raw/tx must never carry JSON"
+        );
+    }
+
+    #[test]
+    fn tx_and_clip_tx_are_switched_independently() {
+        let send = |streams: &RawStreams| {
+            let mqtt = MockMqttConnection::new();
+            let dev = dummy_dev("dev-split");
+            attach(
+                &(mqtt.clone() as Arc<dyn MqttConnection>),
+                &dev,
+                "rusthinq-raw",
+                streams,
+            );
+            dev.notify_send(SendToDevice::T2Packet(vec![0x01]));
+            dev.notify_send(SendToDevice::T2Raw(json!({"cmd": "ack"})));
+            mqtt.raw_publishes()
+                .into_iter()
+                .map(|(t, _, _)| t)
+                .collect::<Vec<_>>()
+        };
+
+        let only_tx = send(&RawStreams {
+            tx: true,
+            ..RawStreams::default()
+        });
+        assert_eq!(only_tx, vec!["rusthinq-raw/dev-split/raw/tx"]);
+
+        let only_clip = send(&RawStreams {
+            clip_tx: true,
+            ..RawStreams::default()
+        });
+        assert_eq!(only_clip, vec!["rusthinq-raw/dev-split/raw/clip/tx"]);
     }
 
     #[test]
@@ -393,7 +451,7 @@ mod tests {
         register_inject(&sink, manager, &RawStreams::all());
 
         sink.handle_message(
-            "rusthinq-raw/dev-3/raw/inject-clip/set",
+            "rusthinq-raw/dev-3/raw/inject/clip/set",
             br#"{"cmd":"setMaskingInfo","type":0,"data":{"blacklist_tlv":"1200"}}"#,
         );
 
@@ -434,9 +492,9 @@ mod tests {
         manager.accept(dev);
         register_inject(&sink, manager, &RawStreams::all());
 
-        sink.handle_message("rusthinq-raw/dev-4/raw/inject-clip/set", b"not json");
+        sink.handle_message("rusthinq-raw/dev-4/raw/inject/clip/set", b"not json");
         sink.handle_message(
-            "rusthinq-raw/dev-4/raw/inject-clip/set",
+            "rusthinq-raw/dev-4/raw/inject/clip/set",
             br#"{"type":0,"data":{}}"#,
         );
 

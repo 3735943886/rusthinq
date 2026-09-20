@@ -243,6 +243,9 @@ async fn run_device_socket(mut socket: WebSocket, state: AppState, id: String) {
 
     let rx_topic = format!("{raw_prefix}/{id}/raw/rx");
     let tx_topic = format!("{raw_prefix}/{id}/raw/tx");
+    // CLIP commands (and the LG cloud's relayed messages) are JSON on their own topic; the
+    // page shows both as "tx".
+    let clip_tx_topic = format!("{raw_prefix}/{id}/raw/clip/tx");
     let inject_topic = format!("{raw_prefix}/{id}/raw/inject/set");
     let emit_topic = format!("{raw_prefix}/{id}/raw/emit/set");
 
@@ -259,6 +262,11 @@ async fn run_device_socket(mut socket: WebSocket, state: AppState, id: String) {
         .mqtt
         .client
         .subscribe(&tx_topic, QoS::AtMostOnce)
+        .await;
+    let _ = state
+        .mqtt
+        .client
+        .subscribe(&clip_tx_topic, QoS::AtMostOnce)
         .await;
 
     let mut events_rx = state.mqtt.subscribe_events();
@@ -289,7 +297,7 @@ async fn run_device_socket(mut socket: WebSocket, state: AppState, id: String) {
                         let hex = String::from_utf8_lossy(&p.payload).to_string();
                         send_json(&mut socket, &json!({ "rx": hex, "injected": false })).await
                     }
-                    Ok(p) if p.topic == tx_topic => {
+                    Ok(p) if p.topic == tx_topic || p.topic == clip_tx_topic => {
                         let text = String::from_utf8_lossy(&p.payload).to_string();
                         send_json(&mut socket, &json!({ "tx": text, "injected": false })).await
                     }

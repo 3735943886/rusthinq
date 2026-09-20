@@ -57,8 +57,9 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
      `scripting::ctx` for the exact script-facing API.
   3. **A custom consumer, in any language.** Setting `[mqtt] raw_prefix` taps every
      connected device's raw rx/tx frames onto MQTT
-     (`<raw_prefix>/<id>/raw/rx|tx`), with an inject topic to send frames back
-     (`<raw_prefix>/<id>/raw/inject/set`). rusthinq still owns the TLS/socket/framing
+     (`<raw_prefix>/<id>/raw/rx|tx`, plus `raw/clip/rx|tx` for the CLIP layer), with an
+     inject topic to send frames back (`<raw_prefix>/<id>/raw/inject/set`). Which
+     streams exist is listed in `[mqtt] raw` (off unless listed; see `config.toml`). rusthinq still owns the TLS/socket/framing
      plumbing; whatever's on the other end of that bus — a Python script, a Node
      process, a one-off shell pipeline — sees the same bytes a native handler or a
      script would and can drive the device however it needs to, with no Rust or Rhai

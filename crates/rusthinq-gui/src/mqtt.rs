@@ -9,7 +9,7 @@
 //! Subscribes for the whole run to `<rusthinq_prefix>/devices` (retained snapshot,
 //! see `devlist.rs`) and `<rusthinq_prefix>/bridge/#` (`bridge/status`,
 //! `bridge/login-url`, see `bridge_control.rs`). Per-device raw traffic
-//! (`<raw_prefix>/<id>/raw/rx`/`tx`, see `raw_bus.rs`) is subscribed on demand by
+//! (`<raw_prefix>/<id>/raw/rx`/`tx`/`clip/tx`, see `raw_bus.rs`) is subscribed on demand by
 //! `http.rs`'s `/device` handler for as long as a monitor page is open.
 
 use crate::state::Shared;

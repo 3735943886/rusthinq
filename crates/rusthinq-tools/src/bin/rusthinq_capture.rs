@@ -1,6 +1,6 @@
 //! Capture device wire traffic from rusthinq-cloud's raw MQTT bus to JSONL.
 //! Replaces tools/rusthinq-capture.ts (device path; use bridge mode for cloud
-//! correlation). Subscribes to `<prefix>/<device_id>/raw/rx` and `.../raw/tx`
+//! correlation). Subscribes to `<prefix>/<device_id>/raw/rx`, `.../raw/tx` and `.../raw/clip/tx`
 //! (see rusthinq-cloud's raw_bus.rs) instead of the old management WebSocket,
 //! which no longer exists — MQTT is the only external control surface now.
 //!
@@ -29,7 +29,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `payload` is hex for a wire frame, but T2Clip/T1Json sends on `raw/tx` are a
+/// `payload` is hex for a wire frame, but T2Clip/T1Json sends on `raw/clip/tx` are a
 /// JSON-stringified command instead — only decode when it actually looks like
 /// one of ours (even length, hex digits only).
 fn decode_summary(payload: &str) -> Option<Value> {
@@ -100,7 +100,8 @@ fn main() -> Result<()> {
         }),
     )?;
 
-    let topic_filter = format!("{prefix}/{device_id}/raw/+");
+    // `raw/#`, not `raw/+`: CLIP commands sent to the device are on `raw/clip/tx`.
+    let topic_filter = format!("{prefix}/{device_id}/raw/#");
     eprintln!("[rusthinq-capture] subscribing {topic_filter} on {host} → {out_path}");
     let client_id = format!("rusthinq-capture-{}", std::process::id());
     let (mqtt_client, mqtt_rx) =
@@ -121,7 +122,7 @@ fn main() -> Result<()> {
         while let Ok(p) = mqtt_rx.recv() {
             let dir = if p.topic.ends_with("/raw/rx") {
                 "rx"
-            } else if p.topic.ends_with("/raw/tx") {
+            } else if p.topic.ends_with("/raw/tx") || p.topic.ends_with("/raw/clip/tx") {
                 "tx"
             } else {
                 continue;

@@ -19,10 +19,10 @@
 //!
 //! Topics (`<prefix>` = `config.mqtt.raw_prefix`, same gate as raw_bus.rs — both are
 //! `None` or both are set together):
-//!   - `<prefix>/<did>/simdev/publish/set` (subscribed) — JSON body
+//!   - `<prefix>/<did>/raw/sim/publish/set` (subscribed) — JSON body
 //!     `{"topic": "clip/provisioning/devices/<did>", "payload": {...}}`; `payload` is
 //!     whatever CLIP JSON a real device would have sent at that topic.
-//!   - `<prefix>/<did>/simdev/event` (published, non-retained) — every
+//!   - `<prefix>/<did>/raw/sim/event` (published, non-retained) — every
 //!     `lime/devices/<did>` reply the broker generates for `did`, real or simulated:
 //!     the deploy/pre-deploy handshake response, `resp_timesync`, etc. A simulated
 //!     device that completes provisioning becomes a real `ConnectedDevice` from that
@@ -66,7 +66,7 @@ impl SimIds {
     }
 }
 
-/// Relay every `lime/devices/<did>` reply the broker emits to `<raw_prefix>/<did>/simdev/event`.
+/// Relay every `lime/devices/<did>` reply the broker emits to `<raw_prefix>/<did>/raw/sim/event`.
 /// Split out from `register` so a test can drive it against a mock connection directly.
 fn wire_outgoing_relay(broker: &Broker, mqtt: Arc<dyn MqttConnection>, raw_prefix: String) {
     broker.on_outgoing(Arc::new(move |p: &PublishPacket| {
@@ -74,7 +74,7 @@ fn wire_outgoing_relay(broker: &Broker, mqtt: Arc<dyn MqttConnection>, raw_prefi
             return;
         };
         mqtt.publish_raw(
-            &format!("{raw_prefix}/{did}/simdev/event"),
+            &format!("{raw_prefix}/{did}/raw/sim/event"),
             &p.payload,
             false,
         );
@@ -92,7 +92,7 @@ pub fn register(
     let ids = Arc::new(SimIds::new());
 
     sink.on_set_property(move |did, prop, value| {
-        if prop != "simdev/publish" {
+        if prop != "raw/sim/publish" {
             return;
         }
         let Ok(body) = serde_json::from_str::<serde_json::Value>(value) else {
@@ -153,11 +153,11 @@ mod tests {
             },
         });
         sink.handle_message(
-            "rusthinq-raw/sim-1/simdev/publish/set",
+            "rusthinq-raw/sim-1/raw/sim/publish/set",
             publish_cmd(&format!("clip/provisioning/devices/{did}"), deploy).as_bytes(),
         );
         sink.handle_message(
-            "rusthinq-raw/sim-1/simdev/publish/set",
+            "rusthinq-raw/sim-1/raw/sim/publish/set",
             publish_cmd(
                 &format!("clip/message/devices/{did}"),
                 serde_json::json!({ "did": did, "cmd": "completeProvisioning_ack" }),
@@ -194,7 +194,7 @@ mod tests {
             ),
         ] {
             sink.handle_message(
-                "rusthinq-raw/sim-3/simdev/publish/set",
+                "rusthinq-raw/sim-3/raw/sim/publish/set",
                 publish_cmd(&cmd_topic_pair.0, cmd_topic_pair.1).as_bytes(),
             );
         }
@@ -226,7 +226,7 @@ mod tests {
         let raw = mock.raw_publishes();
         assert!(
             raw.iter()
-                .any(|(t, _, retain)| t == &format!("rusthinq-raw/{did}/simdev/event") && !retain)
+                .any(|(t, _, retain)| t == &format!("rusthinq-raw/{did}/raw/sim/event") && !retain)
         );
     }
 
@@ -254,7 +254,7 @@ mod tests {
         let raw = mock.raw_publishes();
         assert!(
             raw.iter()
-                .any(|(t, _, _)| t == "rusthinq-raw/real-device-1/simdev/event")
+                .any(|(t, _, _)| t == "rusthinq-raw/real-device-1/raw/sim/event")
         );
     }
 
