@@ -264,6 +264,17 @@ async fn main() -> Result<()> {
         br.set_on_session_change_hook(Arc::new(move || device_list.publish()));
     }
 
+    // The same names label the IL descriptors scripts publish (see
+    // `scripting::set_name_source`), so consumers can name entities after the owner's
+    // own name for a device.
+    #[cfg(all(feature = "bridge", feature = "scripting"))]
+    if config.scripting.is_some()
+        && let Some(ref br) = lg_bridge
+    {
+        let br = br.clone();
+        rusthinq_devices::scripting::set_name_source(Some(Arc::new(move |id| br.name(id))));
+    }
+
     // Owner-given device names from the ThinQ account (see rusthinq_bridge::Bridge's
     // `name`/`start_name_refresh_loop`) — same "republish when it changes" reasoning
     // as the session-change hook above, so a freshly fetched name reaches a
@@ -271,7 +282,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "bridge")]
     if let Some(ref br) = lg_bridge {
         let device_list = device_list.clone();
-        br.set_on_names_changed_hook(Arc::new(move || device_list.publish()));
+        let device_bridge = device_bridge.clone();
+        br.set_on_names_changed_hook(Arc::new(move || {
+            device_list.publish();
+            // A descriptor carries the owner's name as its label, so a new or changed name
+            // needs the descriptors published again.
+            device_bridge.republish_all();
+        }));
         br.start_name_refresh_loop();
     }
 

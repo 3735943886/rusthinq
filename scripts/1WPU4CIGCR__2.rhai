@@ -93,6 +93,11 @@ fn on_data(ctx, data) {
         // The frame restates the previous record so a listener that missed one can see what
         // changed; only where the appliance is now matters.
         status(ctx, inner, 2 + record_len());
+    } else if inner[1] == 0xeb && inner.len() == 2 + record_len() {
+        // The answer to a status query (the LG cloud asks when the appliance connects): the
+        // current record alone. An idle appliance pushes nothing else, so without this the
+        // state stays unknown until something changes.
+        status(ctx, inner, 2);
     } else if inner[1] == 0x1f && inner.len() == 2 + 6 * 2 {
         counters(ctx, inner);
     }

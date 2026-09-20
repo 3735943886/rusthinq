@@ -3,7 +3,15 @@
 
 fn uv_done() { "AA3A12EC020103010101FFFF01FF030101FFFF08041000FF01FF00000001020003010101FFFF01FF030101FFFF08041000FF01FF0000000178BB" }
 fn amount_250() { "AA3A12EC020003010101FFFF01FF030101FFFF08041000FF01FF00000001020003020101FFFF01FF030101FFFF08041000FF01FF0000000178BB" }
+// What the appliance answers when the LG cloud asks for its status as it connects, captured live.
+fn query_reply() { "AA2012EB020003010101FFFF01FF030101FFFF09161000FF01FF00000001AABB" }
 fn counters() { "AA12121F0000000000FC000000000000BCBB" }
+
+fn test_the_answer_to_a_status_query_gives_the_state_at_startup() {
+    let d = device();
+    d.feed(query_reply());
+    expect_props(d, #{ available: "true", status: "normal", tap_uv: "standby", water_selection: "cold" });
+}
 
 fn test_the_captured_status_becomes_il_properties() {
     let d = device();

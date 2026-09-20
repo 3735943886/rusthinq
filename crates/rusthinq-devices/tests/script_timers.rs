@@ -151,13 +151,21 @@ fn a_script_that_publishes_no_descriptor_is_not_validated() {
 #[test]
 fn the_host_binds_a_published_descriptor_to_the_devices_own_topics() {
     rusthinq_devices::scripting::set_il_prefix(Some("il".into()));
+    rusthinq_devices::scripting::set_name_source(Some(std::sync::Arc::new(|id| {
+        (id == "harness").then(|| "Kitchen".to_string())
+    })));
     let (_dir, h) = harness(IL_SCRIPT);
     h.start();
     let (payload, retained) = h.raw_publish("il/harness").expect("descriptor published");
     rusthinq_devices::scripting::set_il_prefix(None);
+    rusthinq_devices::scripting::set_name_source(None);
     assert!(retained);
     let d: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(d["id"], "harness");
+    assert_eq!(
+        d["label"], "Kitchen",
+        "the owner's name replaces the driver's label"
+    );
     assert_eq!(d["source"], "rusthinq");
     assert_eq!(d["props"]["level"]["max"], 10);
     assert!(d["x-mqtt"]["state"].as_str().unwrap().ends_with("/{prop}"));

@@ -147,6 +147,10 @@ impl DeviceCtx {
         obj.entry("id")
             .or_insert_with(|| self.id.to_string().into());
         obj.entry("source").or_insert_with(|| "rusthinq".into());
+        // The owner's own name for the device beats the driver's generic label.
+        if let Some(name) = crate::scripting::device_name(&self.id) {
+            obj.insert("label".into(), name.into());
+        }
         let base = self.mqtt.device_topic(&self.id).replace(&*self.id, "{id}");
         obj.entry("x-mqtt").or_insert_with(|| {
             serde_json::json!({

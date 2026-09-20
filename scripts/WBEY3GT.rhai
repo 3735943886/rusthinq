@@ -75,9 +75,18 @@ fn on_drop(ctx) { ctx.publish_property("available", "false"); }
 
 fn on_data(ctx, data) {
     let body = c::inner(data, 0x42);
-    if body == () || body[1] != 0xec || body.len() != 2 + record_len() * 2 { return; }
+    if body == () { return; }
 
-    let cur = 2 + record_len(); // the current record
+    // 0xEC pushes the previous record then the current one; 0xEB, the answer to a status
+    // query (asked when the appliance connects), carries the current record alone. An idle
+    // panel pushes nothing else, so 0xEB is what gives the state at startup.
+    let cur = if body[1] == 0xec && body.len() == 2 + record_len() * 2 {
+        2 + record_len()
+    } else if body[1] == 0xeb && body.len() == 2 + record_len() {
+        2
+    } else {
+        return;
+    };
     ctx.publish_property("available", "true");
 
     let remote = (body[cur] & 0x02) != 0;

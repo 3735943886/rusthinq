@@ -65,7 +65,7 @@ il_prefix = "il"      # unset (the default) = descriptors are not published
 
 With `il_prefix` set, `ctx.publish_il` publishes the descriptor retained at
 `<il_prefix>/<id>`. The driver supplies only the device-neutral part; the host fills `id`
-and `source` and adds the `x-mqtt` block pointing at the device's own
+and `source`, replaces `label` with the owner's name for the device when the ThinQ account has one (the driver's label is the fallback; a new or changed name re-publishes every descriptor), and adds the `x-mqtt` block pointing at the device's own
 `<rusthinq_prefix>/<id>/<prop>` topics, because a driver does not know topics. Values and
 commands keep using those existing topics, so the IL adds only the descriptor.
 

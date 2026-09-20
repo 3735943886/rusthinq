@@ -39,6 +39,28 @@ pub fn set_il_prefix(prefix: Option<String>) {
     *il_prefix_slot().write() = prefix.map(std::sync::Arc::from);
 }
 
+/// Where the owner's own name for a device comes from (in rusthinq, the ThinQ account's
+/// alias). A driver only knows the model, so it can only give a generic label.
+pub type NameSource = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+static NAME_SOURCE: OnceLock<RwLock<Option<NameSource>>> = OnceLock::new();
+
+fn name_source_slot() -> &'static RwLock<Option<NameSource>> {
+    NAME_SOURCE.get_or_init(|| RwLock::new(None))
+}
+
+/// Set (or clear) the source of user-given device names. `ctx.publish_il` puts the name
+/// it returns in the descriptor's `label`, replacing the driver's generic one. A name that
+/// arrives or changes later shows up the next time the descriptor is published.
+pub fn set_name_source(source: Option<NameSource>) {
+    *name_source_slot().write() = source;
+}
+
+pub(crate) fn device_name(id: &str) -> Option<String> {
+    let source = name_source_slot().read().clone()?;
+    source(id).filter(|n| !n.trim().is_empty())
+}
+
 type ChangeCallback = Box<dyn Fn() + Send + Sync>;
 
 static ON_CHANGE: OnceLock<rusthinq_util::sync::Mutex<Vec<ChangeCallback>>> = OnceLock::new();

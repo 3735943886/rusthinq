@@ -12,12 +12,22 @@ fn locked_while_cooking() { "AA6642EC00000000000000000000000109010200003B3900010
 fn unlocked() { "AA6642EC000003000000000000000003091C02000020390003051D0000011F3B000300000000000000000000000000000000000000000000000000000000000109200200001C39000105210000011B3B000000000000000000000000000000000000000013BB" }
 fn remote_start() { "AA6642EC00000000000000000000000109240200011839000000000000000000000000000000000000000000000000000000000002000000000000000000000109250200011739000000000000000000000000000000000000000000000000000000000011BB" }
 
+// What the panel answers when the LG cloud asks for its status as it connects, captured live:
+// the current record alone, everything off.
+fn query_reply() { "AA3642EB0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005BBB" }
+
 fn burners() { ["left_rear", "left_front", "right"] }
 
 // The body of the one frame that was sent, upper-case hex, framing stripped.
 fn inner(d) {
     expect_eq(d.sent().len(), 1, "exactly one packet sent");
     hex_encode_upper(a::inner_of(d, 0))
+}
+
+fn test_the_answer_to_a_status_query_gives_the_state_at_startup() {
+    let d = device();
+    d.feed(query_reply());
+    expect_props(d, #{ available: "true", cooking: "false", locked: "false", remote_start: "false" });
 }
 
 fn test_idle_every_burner_off_nothing_locked_no_remote_start() {
