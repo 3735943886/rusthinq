@@ -126,6 +126,7 @@ mod tests {
             mqtt_user: String::new(),
             mqtt_pass: String::new(),
             raw_prefix: Some("rusthinq-raw".into()),
+            raw: Default::default(),
             state_file: None,
         }
     }

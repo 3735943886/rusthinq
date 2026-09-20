@@ -32,6 +32,9 @@ type ClipHandler = Box<dyn Fn(serde_json::Value) + Send + Sync>;
 type StatusCallback = Box<dyn FnMut(&str) + Send>;
 /// See `note_urls` on [`Bridge`] and `set_note_urls_hook`.
 type NoteUrlsHook = Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
+/// See `traffic` on [`Bridge`] and `set_traffic_hook`. Arguments: device id, `true`
+/// for device->cloud (up) / `false` for cloud->device (down), the message as JSON.
+type TrafficHook = Arc<dyn Fn(&str, bool, &serde_json::Value) + Send + Sync>;
 /// See `on_session_change` on [`Bridge`] and `set_on_session_change_hook`.
 type SessionChangeHook = Arc<dyn Fn() + Send + Sync>;
 /// See `on_storage_orphaned` on [`Bridge`] and `set_on_storage_orphaned_hook`.
@@ -98,6 +101,12 @@ pub struct Bridge {
     /// `rusthinq-bridge` has no opinion on what this is used for; kept generic to
     /// avoid a dependency on rusthinq-cloud.
     note_urls: Mutex<Option<NoteUrlsHook>>,
+    /// Called with every ThinQ2 message the bridge sends up to, or receives from, the
+    /// real cloud, for a caller that wants to watch that traffic (rusthinq-cloud wires
+    /// this to its raw bus's `raw/lg/up|down`). Only sees what actually crosses:
+    /// messages the bridge refuses to relay (`NEVER_RELAYED_CMDS`) are not reported.
+    /// `rusthinq-bridge` has no opinion on what it's used for.
+    traffic: Mutex<Option<TrafficHook>>,
     /// Called every time a session is attached or detached, from *any* path —
     /// including `on_local_device`'s auto-restore, which runs on a spawned task the
     /// caller never awaits. rusthinq-cloud wires this to republish its retained
@@ -173,6 +182,7 @@ impl Bridge {
             want_enabled: Mutex::new(HashSet::new()),
             logged_in: Mutex::new(logged_in),
             note_urls: Mutex::new(None),
+            traffic: Mutex::new(None),
             on_session_change: Mutex::new(None),
             device_names: Mutex::new(HashMap::new()),
             name_refresh_notify: tokio::sync::Notify::new(),
@@ -242,6 +252,13 @@ impl Bridge {
     /// as this bridge exists — see `note_urls` above.
     pub fn set_note_urls_hook(&self, hook: NoteUrlsHook) {
         *self.note_urls.lock() = Some(hook);
+    }
+
+    /// Install a hook run against every ThinQ2 message crossing the bridge in either
+    /// direction, for as long as this bridge exists — see `traffic` above. Applies to
+    /// sessions started after this call.
+    pub fn set_traffic_hook(&self, hook: TrafficHook) {
+        *self.traffic.lock() = Some(hook);
     }
 
     pub fn is_logged_in(&self) -> bool {
@@ -668,6 +685,8 @@ impl Bridge {
             let dev = device.clone();
             let stop_f = stopped.clone();
             let note_urls = self.note_urls.lock().clone();
+            let traffic = self.traffic.lock().clone();
+            let id_down = id.clone();
             tokio::spawn(async move {
                 while let Some(payload) = from_lg.recv().await {
                     if stop_f.load(Ordering::SeqCst) {
@@ -676,15 +695,30 @@ impl Bridge {
                     if let Some(hook) = &note_urls {
                         hook(&payload);
                     }
+                    if let Some(hook) = &traffic {
+                        hook(&id_down, false, &payload);
+                    }
                     dev.send_clip_to_local(payload);
                 }
             });
 
             let h = handle.clone();
             let stop_l = stopped.clone();
+            let traffic_up = self.traffic.lock().clone();
+            let id_up = id.clone();
             device.on_data(Box::new(move |buf| {
                 if stop_l.load(Ordering::SeqCst) {
                     return;
+                }
+                if let Some(hook) = &traffic_up {
+                    hook(
+                        &id_up,
+                        true,
+                        &serde_json::json!({
+                            "cmd": "device_packet",
+                            "data": rusthinq_util::hex::encode_upper(buf),
+                        }),
+                    );
                 }
                 h.send_from_local(buf);
             }));
@@ -695,9 +729,14 @@ impl Bridge {
             // the cloud's side the appliance never answered at all.
             let h = handle.clone();
             let stop_c = stopped.clone();
+            let traffic_clip = self.traffic.lock().clone();
+            let id_clip = id.clone();
             device.on_unhandled_clip(Box::new(move |payload| {
                 if stop_c.load(Ordering::SeqCst) {
                     return;
+                }
+                if let Some(hook) = &traffic_clip {
+                    hook(&id_clip, true, &payload);
                 }
                 let h = h.clone();
                 tokio::spawn(async move {

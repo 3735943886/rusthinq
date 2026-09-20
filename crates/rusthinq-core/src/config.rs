@@ -19,6 +19,10 @@ pub struct MqttConfig {
     /// the rest of the control plane.
     #[serde(default)]
     pub raw_prefix: Option<String>,
+    /// Which raw-bus streams `raw_prefix` turns on, listed by name — see
+    /// [`RawStreams`]. Empty (the default) means none.
+    #[serde(default)]
+    pub raw: RawStreams,
     /// Where to persist the `id -> property names ever published` map used by
     /// `MqttConnection::clear_retained` to clean up a permanently-gone device's
     /// retained topics (see `mqtt.rs`). Unlike `raw_prefix`/`bridge`, this isn't an
@@ -27,6 +31,103 @@ pub struct MqttConfig {
     /// next to the config file rather than the feature being off.
     #[serde(default)]
     pub state_file: Option<String>,
+}
+
+/// Which raw-bus streams (`raw_bus.rs`) `raw_prefix` turns on, listed by name:
+/// `raw = ["rx", "tx", "clip"]`. Only what is listed is on; leaving `raw` out turns
+/// every stream off, so setting `raw_prefix` alone exposes nothing. An unknown name is a
+/// config error rather than being silently ignored, so a typo can't quietly leave a
+/// stream off.
+///
+/// Topics are `<raw_prefix>/<id>/raw/<stream>`:
+///
+/// | name | topic | what |
+/// |---|---|---|
+/// | `rx` | `raw/rx` | frames received from the device |
+/// | `tx` | `raw/tx` | everything sent to the device, whoever sent it (includes what the LG cloud sent down while bridged) |
+/// | `clip` | `raw/clip` | CLIP messages from the device that nothing local handles (only `device_packet`, `req_timesync` and the deploy handshake are), otherwise dropped unseen unless bridged |
+/// | `lg_up` | `raw/lg/up` | what the bridge sends up to the real LG cloud (`bridge` feature) |
+/// | `lg_down` | `raw/lg/down` | what the bridge receives from the real LG cloud (`bridge` feature) |
+/// | `inject` | `raw/inject/set` | send a raw frame to the device |
+/// | `inject_clip` | `raw/inject-clip/set` | send a named CLIP command to the device |
+/// | `emit` | `raw/emit/set` | feed a frame in as if the device had sent it; also reaches the LG cloud when bridged |
+/// | `sim` | `simdev/...` | the device simulator (`sim_device.rs`) |
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct RawStreams {
+    pub rx: bool,
+    pub tx: bool,
+    pub clip: bool,
+    pub lg_up: bool,
+    pub lg_down: bool,
+    pub inject: bool,
+    pub inject_clip: bool,
+    pub emit: bool,
+    pub sim: bool,
+}
+
+impl RawStreams {
+    /// Every stream on. Mostly for tests; a config lists the ones it wants.
+    pub fn all() -> Self {
+        Self {
+            rx: true,
+            tx: true,
+            clip: true,
+            lg_up: true,
+            lg_down: true,
+            inject: true,
+            inject_clip: true,
+            emit: true,
+            sim: true,
+        }
+    }
+
+    fn slots(&mut self) -> [(&'static str, &mut bool); 9] {
+        [
+            ("rx", &mut self.rx),
+            ("tx", &mut self.tx),
+            ("clip", &mut self.clip),
+            ("lg_up", &mut self.lg_up),
+            ("lg_down", &mut self.lg_down),
+            ("inject", &mut self.inject),
+            ("inject_clip", &mut self.inject_clip),
+            ("emit", &mut self.emit),
+            ("sim", &mut self.sim),
+        ]
+    }
+}
+
+impl TryFrom<Vec<String>> for RawStreams {
+    type Error = String;
+
+    fn try_from(names: Vec<String>) -> Result<Self, String> {
+        let mut streams = Self::default();
+        for name in &names {
+            let mut slots = streams.slots();
+            match slots.iter_mut().find(|(n, _)| n == name) {
+                Some((_, flag)) => **flag = true,
+                None => {
+                    let known: Vec<_> = Self::default().slots().iter().map(|(n, _)| *n).collect();
+                    return Err(format!(
+                        "unknown raw stream {name:?}, expected one of: {}",
+                        known.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(streams)
+    }
+}
+
+impl From<RawStreams> for Vec<String> {
+    fn from(mut streams: RawStreams) -> Self {
+        streams
+            .slots()
+            .into_iter()
+            .filter(|(_, on)| **on)
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
 }
 
 /// Either a bare port number (used verbatim, e.g. in a `mqttServer`/`apiServer` URL a
@@ -582,6 +683,68 @@ watch = true
         assert!(scripting.watch);
     }
 
+    #[test]
+    fn raw_streams_are_all_off_unless_listed() {
+        let base = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+raw_prefix = "rusthinq-raw"
+"#;
+        let off = parse_config_text(base).unwrap();
+        assert_eq!(off.mqtt.raw, RawStreams::default());
+
+        let listed =
+            parse_config_text(&format!("{base}raw = [\"rx\", \"clip\", \"lg_up\"]\n")).unwrap();
+        let raw = listed.mqtt.raw;
+        assert!(raw.rx && raw.clip && raw.lg_up);
+        assert!(
+            !raw.tx && !raw.lg_down && !raw.inject && !raw.inject_clip && !raw.emit && !raw.sim
+        );
+    }
+
+    #[test]
+    fn unknown_raw_stream_name_is_a_config_error() {
+        let text = r#"
+hostname = "x"
+ca_key_file = "k"
+ca_cert_file = "c"
+https_port = 443
+mqtts_port = 8883
+
+[mqtt]
+mqtt_url = "mqtt://localhost:1883"
+rusthinq_prefix = "rusthinq"
+raw_prefix = "rusthinq-raw"
+raw = ["rx", "clipp"]
+"#;
+        let err = parse_config_text(text).unwrap_err().to_string();
+        assert!(err.contains("clipp"), "{err}");
+    }
+
+    #[test]
+    fn raw_streams_round_trip_as_a_name_list() {
+        let names: Vec<String> = RawStreams::all().into();
+        assert_eq!(names.len(), 9);
+        assert_eq!(RawStreams::try_from(names).unwrap(), RawStreams::all());
+    }
+
+    #[test]
+    fn the_sample_config_toml_parses_and_lists_the_raw_streams_its_comments_promise() {
+        let cfg = parse_config_text(include_str!("../../../config.toml")).unwrap();
+        assert_eq!(cfg.mqtt.raw_prefix.as_deref(), Some("rusthinq-raw"));
+        let raw = cfg.mqtt.raw;
+        // dashboard monitor (rx, tx, inject, emit) + external driver (rx, inject, inject_clip)
+        assert!(raw.rx && raw.tx && raw.inject && raw.inject_clip && raw.emit);
+        // debugging aids stay off unless someone lists them
+        assert!(!raw.clip && !raw.lg_up && !raw.lg_down && !raw.sim);
+    }
 
     #[test]
     fn scripting_watch_defaults_to_false() {

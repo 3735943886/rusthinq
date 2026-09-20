@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
     // Raw wire-frame observer/inject bus, over the same MQTT connection (see
     // raw_bus.rs) — only exists at all when raw_prefix is configured.
     if config.mqtt.raw_prefix.is_some() {
-        raw_bus::register_inject(&mqtt_sink, manager.clone());
+        raw_bus::register_inject(&mqtt_sink, manager.clone(), &config.mqtt.raw);
     }
 
     // Optional LG cloud bridge (compiled out entirely without the `bridge`
@@ -291,11 +291,12 @@ async fn main() -> Result<()> {
         let mqtt_dyn = mqtt_dyn.clone();
         let device_list = device_list.clone();
         let raw_prefix = config.mqtt.raw_prefix.clone();
+        let raw_streams = config.mqtt.raw.clone();
         let known_devices = known_devices.clone();
         manager.on_new_device(move |dev| {
             known_devices.note_connected(&dev.id, &dev.meta, dev.platform);
             if let Some(ref raw_prefix) = raw_prefix {
-                raw_bus::attach(&mqtt_dyn, &dev, raw_prefix);
+                raw_bus::attach(&mqtt_dyn, &dev, raw_prefix, &raw_streams);
             }
             device_bridge.new_device(dev.clone());
             #[cfg(feature = "bridge")]
@@ -382,7 +383,9 @@ async fn main() -> Result<()> {
     // local RE/dev work), moved onto this same already-authenticated connection.
     // Registering it is the only thing that makes it reachable; without raw_prefix
     // there is no listener anywhere that could stand in for it.
-    if let Some(ref raw_prefix) = config.mqtt.raw_prefix {
+    if let Some(ref raw_prefix) = config.mqtt.raw_prefix
+        && config.mqtt.raw.sim
+    {
         sim_device::register(
             &mqtt_sink,
             t2_acceptor.clone(),
@@ -395,6 +398,21 @@ async fn main() -> Result<()> {
     if let Some(ref br) = lg_bridge {
         let fh = firmware_hosts.clone();
         br.set_note_urls_hook(Arc::new(move |payload| fh.note_urls_in(payload)));
+    }
+
+    // raw/lg/up|down (see raw_bus.rs): only hooked at all when one of them is on, so the
+    // default build/config adds no per-message work to the bridge.
+    #[cfg(feature = "bridge")]
+    if let Some(ref br) = lg_bridge
+        && let Some(ref raw_prefix) = config.mqtt.raw_prefix
+        && (config.mqtt.raw.lg_up || config.mqtt.raw.lg_down)
+    {
+        let mqtt = mqtt_dyn.clone();
+        let raw_prefix = raw_prefix.clone();
+        let streams = config.mqtt.raw.clone();
+        br.set_traffic_hook(Arc::new(move |id, up, payload| {
+            raw_bus::lg_tap(&mqtt, &raw_prefix, &streams, id, up, payload);
+        }));
     }
 
     // Device-facing TLS (HTTPS + MQTTS): OpenSSL with legacy CBC-SHA / TLS1.0

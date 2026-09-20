@@ -87,6 +87,9 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
 
 ## Usage
 
+**New here? Start with [`docs/getting-started.md`](docs/getting-started.md)** — install,
+configure, register a device, check it on MQTT, and (optionally) keep the official app working.
+
 Initial device setup (SoftAP adoption, or DNS/redirection for devices already paired to
 LG), the MQTT topic shape a device publishes under, and how to point an MQTT-based
 consumer at the result are all unchanged from upstream rethink — documented in

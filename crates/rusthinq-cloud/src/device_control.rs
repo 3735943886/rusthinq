@@ -98,6 +98,7 @@ mod tests {
             mqtt_user: String::new(),
             mqtt_pass: String::new(),
             raw_prefix: None,
+            raw: Default::default(),
             state_file: None,
         };
         let sink = MqttSink::new(sink_cfg);
