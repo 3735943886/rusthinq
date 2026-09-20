@@ -4,15 +4,18 @@
 
 use crate::device_trait::DeviceHandler;
 use crate::scripting::cache::{self, AstSlot};
-use crate::scripting::ctx::{DeviceCtx, DeviceHandle};
+use crate::scripting::ctx::{DeviceCtx, DeviceHandle, TimerHost};
 use crate::scripting::engine::engine;
 use rhai::{AST, CallFnOptions, Dynamic, EvalAltResult, Scope};
 use rusthinq_core::metadata::Metadata;
 use rusthinq_core::mqtt::MqttConnection;
 use rusthinq_core::panic_guard;
 use rusthinq_core::thinq::{Thinq1Device, Thinq2Device};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
 /// Call `fn_name(ctx, ..extra)` on `ast` if the script defines it, against a fresh
 /// `Scope` — deliberately *not* reused across calls. `call_fn`'s default
@@ -80,6 +83,49 @@ impl DeviceHandler for BrokenScript {
     fn publish_config(&self) {}
 }
 
+/// A device's named one-shot timers. Each `set` starts a sleeping thread holding only a
+/// `Weak` to the device and a generation number: when it wakes it fires `on_timer` only if
+/// its generation is still the current one for that name (re-arming or cancelling bumps or
+/// removes it), so a replaced timer never fires. Nothing here keeps the device alive.
+#[derive(Default)]
+struct TimerTable {
+    /// name -> (generation, delay in ms) of the armed timer.
+    armed: rusthinq_util::sync::Mutex<HashMap<String, (u64, u64)>>,
+    next_gen: AtomicU64,
+    owner: OnceLock<Weak<ScriptedDevice>>,
+}
+
+impl TimerTable {
+    fn fire(&self, name: &str) {
+        self.armed.lock().remove(name);
+        if let Some(dev) = self.owner.get().and_then(Weak::upgrade) {
+            dev.call("on_timer", vec![name.into()]);
+        }
+    }
+}
+
+impl TimerHost for Arc<TimerTable> {
+    fn set(&self, name: &str, after_ms: u64) {
+        let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        self.armed
+            .lock()
+            .insert(name.to_string(), (generation, after_ms));
+        let table = self.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(after_ms));
+            let current = table.armed.lock().get(&name).map(|(g, _)| *g);
+            if current == Some(generation) {
+                table.fire(&name);
+            }
+        });
+    }
+
+    fn cancel(&self, name: &str) {
+        self.armed.lock().remove(name);
+    }
+}
+
 pub struct ScriptedDevice {
     id: String,
     meta: Metadata,
@@ -90,9 +136,30 @@ pub struct ScriptedDevice {
     /// `DeviceCtx::state`'s doc comment for why this (not a top-level `let`) is what
     /// survives across calls.
     state: Dynamic,
+    timers: Arc<TimerTable>,
 }
 
 impl ScriptedDevice {
+    /// Timers currently armed, as `(name, delay_ms)` — a test hook (`ScriptHarness`).
+    pub(crate) fn pending_timers(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<_> = self
+            .timers
+            .armed
+            .lock()
+            .iter()
+            .map(|(n, (_, ms))| (n.clone(), *ms))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Fire `name` now, if armed — a test hook so a test need not wait out real time.
+    pub(crate) fn fire_timer(&self, name: &str) {
+        if self.timers.armed.lock().contains_key(name) {
+            self.timers.fire(name);
+        }
+    }
+
     fn call(&self, fn_name: &str, extra: Vec<Dynamic>) {
         let ast = self.ast_slot.read().clone();
         let ctx = DeviceCtx::new(
@@ -101,6 +168,8 @@ impl ScriptedDevice {
             self.mqtt.clone(),
             self.device.clone(),
             self.state.clone(),
+            Arc::new(self.timers.clone()),
+            crate::scripting::il_prefix(),
         );
         let id = self.id.clone();
         let fn_name_owned = fn_name.to_string();
@@ -127,7 +196,12 @@ impl DeviceHandler for ScriptedDevice {
     }
 
     fn drop_device(&self) {
+        self.cancel_pending_work();
         self.call("on_drop", vec![]);
+    }
+
+    fn cancel_pending_work(&self) {
+        self.timers.armed.lock().clear();
     }
 
     fn set_property(&self, prop: &str, value: &str) {
@@ -194,7 +268,7 @@ fn build_scripted_device(
     path: &std::path::Path,
     device: DeviceHandle,
     wire: impl FnOnce(&Arc<ScriptedDevice>),
-) -> Arc<dyn DeviceHandler> {
+) -> Result<Arc<ScriptedDevice>, Arc<dyn DeviceHandler>> {
     match cache::get_or_compile(path) {
         Ok(ast_slot) => {
             let handler = Arc::new(ScriptedDevice {
@@ -204,11 +278,13 @@ fn build_scripted_device(
                 device,
                 ast_slot,
                 state: Dynamic::from_map(rhai::Map::new()).into_shared(),
+                timers: Arc::new(TimerTable::default()),
             });
+            let _ = handler.timers.owner.set(Arc::downgrade(&handler));
             wire(&handler);
-            handler
+            Ok(handler)
         }
-        Err(error) => Arc::new(BrokenScript { id, mqtt, error }),
+        Err(error) => Err(Arc::new(BrokenScript { id, mqtt, error })),
     }
 }
 
@@ -223,6 +299,20 @@ pub(crate) fn build_t2(
     meta: Metadata,
     path: &std::path::Path,
 ) -> Arc<dyn DeviceHandler> {
+    match build_t2_scripted(mqtt, thinq, meta, path) {
+        Ok(dev) => dev,
+        Err(broken) => broken,
+    }
+}
+
+/// Like `build_t2`, but hands back the concrete `ScriptedDevice` (for `harness.rs`'s
+/// timer hooks); `Err` is the broken-script stub.
+pub(crate) fn build_t2_scripted(
+    mqtt: Arc<dyn MqttConnection>,
+    thinq: Arc<dyn Thinq2Device>,
+    meta: Metadata,
+    path: &std::path::Path,
+) -> Result<Arc<ScriptedDevice>, Arc<dyn DeviceHandler>> {
     let id = thinq.id().to_string();
     build_scripted_device(
         mqtt,
@@ -245,6 +335,18 @@ pub(crate) fn build_t1(
     meta: Metadata,
     path: &std::path::Path,
 ) -> Arc<dyn DeviceHandler> {
+    match build_t1_scripted(mqtt, thinq, meta, path) {
+        Ok(dev) => dev,
+        Err(broken) => broken,
+    }
+}
+
+pub(crate) fn build_t1_scripted(
+    mqtt: Arc<dyn MqttConnection>,
+    thinq: Arc<dyn Thinq1Device>,
+    meta: Metadata,
+    path: &std::path::Path,
+) -> Result<Arc<ScriptedDevice>, Arc<dyn DeviceHandler>> {
     let id = thinq.id().to_string();
     build_scripted_device(
         mqtt,

@@ -113,6 +113,7 @@ raw = ["rx", "tx", "clip_tx", "inject", "inject_clip", "emit"]
 # [scripting]
 # rhai_dir = "./scripts"
 # watch = true # hot-reload on save; keeps the previous version running if the new one fails to compile
+# il_prefix = "il" # let scripts publish an IL device descriptor (retained, <il_prefix>/<id>); unset = off
 
 # Optional web dashboard (rusthinq-gui, `gui` Cargo feature, off by default). Talks to
 # [mqtt] mqtt_url as its own client. The per-device monitor page also needs

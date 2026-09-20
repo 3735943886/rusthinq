@@ -223,6 +223,11 @@ pub struct ScriptingConfig {
     /// Hot-reload `rhai_dir` on save. Off by default.
     #[serde(default)]
     pub watch: bool,
+    /// Namespace a script's `ctx.publish_il(...)` publishes its IL device descriptor
+    /// under, as a retained `<il_prefix>/<id>`. Unset (the default) means no descriptor
+    /// is published. See the IL specification (a separate repository).
+    #[serde(default)]
+    pub il_prefix: Option<String>,
 }
 
 /// A port that's just bound and never advertised to anyone: `gui_port`'s shape

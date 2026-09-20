@@ -22,6 +22,15 @@ pub enum DeviceHandle {
     T2(Arc<dyn Thinq2Device>),
 }
 
+/// Where a script's named timers live (`ScriptedDevice` owns the real one). A driver only
+/// *asks* for a wake-up (`set_timer`) and later gets `on_timer(ctx, name)`; the host owns
+/// the clock and the scheduler, so the script never sleeps or spawns anything.
+pub trait TimerHost: Send + Sync {
+    /// Arm `name` to fire once after `after_ms`. Setting an existing name replaces it.
+    fn set(&self, name: &str, after_ms: u64);
+    fn cancel(&self, name: &str);
+}
+
 #[derive(Clone)]
 pub struct DeviceCtx {
     id: Arc<str>,
@@ -45,6 +54,9 @@ pub struct DeviceCtx {
     /// so the mutation is lost. Doing the get/set natively, locking this field
     /// directly, sidesteps that entirely.
     state: rhai::Dynamic,
+    timers: Arc<dyn TimerHost>,
+    /// `[scripting] il_prefix`; `None` means IL descriptors are not published.
+    il_prefix: Option<Arc<str>>,
 }
 
 impl DeviceCtx {
@@ -54,6 +66,8 @@ impl DeviceCtx {
         mqtt: Arc<dyn MqttConnection>,
         device: DeviceHandle,
         state: rhai::Dynamic,
+        timers: Arc<dyn TimerHost>,
+        il_prefix: Option<Arc<str>>,
     ) -> Self {
         Self {
             id,
@@ -61,7 +75,77 @@ impl DeviceCtx {
             mqtt,
             device,
             state,
+            timers,
+            il_prefix,
         }
+    }
+
+    /// Arm the one-shot timer `name` to call the script's `on_timer(ctx, name)` after
+    /// `after_ms` milliseconds; re-arming a name replaces it.
+    pub fn set_timer(&mut self, name: String, after_ms: i64) {
+        self.timers.set(&name, after_ms.max(0) as u64);
+    }
+
+    pub fn cancel_timer(&mut self, name: String) {
+        self.timers.cancel(&name);
+    }
+
+    /// Send a structured (CLIP) message to the appliance. T2 only — a no-op (logged) on
+    /// T1, which has `send_json` instead. `data_json` is the message's `data` as JSON.
+    pub fn send_clip(
+        &mut self,
+        cmd: String,
+        msg_type: i64,
+        data_json: String,
+    ) -> Result<(), Box<EvalAltResult>> {
+        match &self.device {
+            DeviceHandle::T2(dev) => {
+                let data: serde_json::Value = serde_json::from_str(&data_json)
+                    .map_err(|e| format!("ctx.send_clip: invalid JSON: {e}"))?;
+                dev.send(&cmd, msg_type as i32, data);
+                Ok(())
+            }
+            DeviceHandle::T1(_) => {
+                tracing::warn!(
+                    target: "rusthinq_scripting",
+                    id = %self.id,
+                    "ctx.send_clip() called on a ThinQ1 device (use send_json) — ignored"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Publish this device's IL descriptor (retained, at `<il_prefix>/<id>`). The script
+    /// supplies the device-neutral part as JSON; the host fills `id`/`source` if absent
+    /// and adds the `x-mqtt` binding pointing at this device's own property topics,
+    /// because a driver does not know topics. A no-op when `il_prefix` is not configured.
+    pub fn publish_il(&mut self, descriptor_json: String) -> Result<(), Box<EvalAltResult>> {
+        let Some(prefix) = self.il_prefix.clone() else {
+            return Ok(());
+        };
+        let mut doc: serde_json::Value = serde_json::from_str(&descriptor_json)
+            .map_err(|e| format!("ctx.publish_il: invalid JSON: {e}"))?;
+        let obj = doc
+            .as_object_mut()
+            .ok_or("ctx.publish_il: descriptor must be a JSON object")?;
+        obj.entry("id")
+            .or_insert_with(|| self.id.to_string().into());
+        obj.entry("source").or_insert_with(|| "rusthinq".into());
+        let base = self.mqtt.device_topic(&self.id).replace(&*self.id, "{id}");
+        obj.entry("x-mqtt").or_insert_with(|| {
+            serde_json::json!({
+                "state": format!("{base}/{{prop}}"),
+                "set": format!("{base}/{{prop}}/set"),
+                "reject": format!("{base}/reject"),
+            })
+        });
+        self.mqtt.publish_raw(
+            &format!("{prefix}/{}", self.id),
+            doc.to_string().as_bytes(),
+            true,
+        );
+        Ok(())
     }
 
     /// Read one key of this device's persistent state (`()` if unset — the same

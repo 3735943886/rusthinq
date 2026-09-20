@@ -87,6 +87,51 @@ pub fn build(elements: &[Tlv]) -> Vec<u8> {
     out
 }
 
+/// Build a complete TLV device frame: `[b0, b1, 04 00 00 00 65, b2, b3, b4, len, tlv.., crc16]`.
+/// `header` is `[b0, b1]` optionally followed by `b2, b3, b4` (defaults `2, 2, 1`) — the
+/// same shape `TlvDeviceCore::send` takes, so `[1, 1, 2, 2, 1]` is the values/caps query.
+pub fn frame_build(header: &[u8], elements: &[Tlv]) -> Option<Vec<u8>> {
+    if header.len() < 2 {
+        return None;
+    }
+    let tlv_array = build(elements);
+    let len = u8::try_from(tlv_array.len()).ok()?;
+    let mut body = vec![
+        0x04,
+        0x00,
+        0x00,
+        0x00,
+        0x65,
+        header.get(2).copied().unwrap_or(2),
+        header.get(3).copied().unwrap_or(2),
+        header.get(4).copied().unwrap_or(1),
+        len,
+    ];
+    body.extend_from_slice(&tlv_array);
+    let crc = crate::crc16::crc16(&body);
+    let mut out = vec![header[0], header[1]];
+    out.extend_from_slice(&body);
+    out.push((crc >> 8) as u8);
+    out.push((crc & 0xff) as u8);
+    Some(out)
+}
+
+/// Parse a device-to-host TLV state frame (the `0x87`/`0xa7`, `0x02` form
+/// `TlvDeviceCore::process_data` treats as the standard one). `None` for anything else
+/// — an ack, a private-command frame, a truncated buffer. The CRC is not checked, as in
+/// `process_data`.
+pub fn frame_parse(buf: &[u8]) -> Option<Vec<Tlv>> {
+    if buf.len() < 13 {
+        return None;
+    }
+    let standard = buf[2..6] == [0x04, 0x00, 0x00, 0x00]
+        && (buf[6] == 0x87 || buf[6] == 0xa7)
+        && buf[7] == 0x02
+        && (buf[8] == 0x01 || buf[8] == 0x04)
+        && buf[10] as usize == buf.len() - 13;
+    standard.then(|| parse(&buf[11..buf.len() - 2]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +236,24 @@ mod tests {
     #[test]
     fn parse_tolerates_1_byte_truncation() {
         assert!(parse(&[0x7e]).is_empty());
+    }
+
+    #[test]
+    fn frame_build_matches_the_values_query_seen_on_the_wire() {
+        // `01010400000065020201027d425a6e`, captured from a real device (query = 0x1f5 -> 2).
+        let frame = frame_build(&[1, 1, 2, 2, 1], &[Tlv::new(0x1f5, 2)]).unwrap();
+        assert_eq!(crate::hex::encode(&frame), "01010400000065020201027d425a6e");
+    }
+
+    #[test]
+    fn frame_parse_reads_a_captured_state_frame_and_rejects_an_ack() {
+        let state = crate::hex::decode(
+            "000004000000a702041a5a7dc07e50117e8294d0287f503e86c087008980c900d8008780cd902c8840ce80ab00a88187c1e801ee408c808cc0b5d011b600b642b5d012b600b642b5d013b600b642b5d014b600b642b5d015b600b642b5d016b600b642fa80bad3",
+        )
+        .unwrap();
+        let tlvs = frame_parse(&state).expect("standard state frame");
+        assert!(tlvs.iter().any(|t| t.t == 0x1f7));
+        let ack = crate::hex::decode("0301040000008701100000ec3c").unwrap();
+        assert!(frame_parse(&ack).is_none());
     }
 }

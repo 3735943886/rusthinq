@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "scripting")]
     if let Some(ref scripting) = config.scripting {
         rusthinq_devices::scripting::init(PathBuf::from(&scripting.rhai_dir), scripting.watch);
+        rusthinq_devices::scripting::set_il_prefix(scripting.il_prefix.clone());
         logging::log(
             "status",
             &[&format!(

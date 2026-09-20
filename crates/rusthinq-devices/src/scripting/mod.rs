@@ -21,6 +21,23 @@ use rusthinq_util::sync::RwLock;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+static IL_PREFIX: OnceLock<RwLock<Option<std::sync::Arc<str>>>> = OnceLock::new();
+
+fn il_prefix_slot() -> &'static RwLock<Option<std::sync::Arc<str>>> {
+    IL_PREFIX.get_or_init(|| RwLock::new(None))
+}
+
+/// `[scripting] il_prefix`, if set: the namespace `ctx.publish_il` publishes IL
+/// descriptors under. `None` (the default) means descriptors are not published.
+pub(crate) fn il_prefix() -> Option<std::sync::Arc<str>> {
+    il_prefix_slot().read().clone()
+}
+
+/// Set (or clear) the IL descriptor namespace. Called from `main.rs` after `init`.
+pub fn set_il_prefix(prefix: Option<String>) {
+    *il_prefix_slot().write() = prefix.map(std::sync::Arc::from);
+}
+
 static RHAI_DIR: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 fn rhai_dir_slot() -> &'static RwLock<Option<PathBuf>> {

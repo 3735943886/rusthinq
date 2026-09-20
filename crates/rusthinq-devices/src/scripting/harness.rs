@@ -9,7 +9,7 @@
 //! `Mock*` types are.
 
 use crate::device_trait::DeviceHandler;
-use crate::scripting::scripted_device::{build_t1, build_t2};
+use crate::scripting::scripted_device::{ScriptedDevice, build_t1_scripted, build_t2_scripted};
 use rusthinq_core::{
     Metadata, MockMqttConnection, MockThinq1Device, MockThinq2Device, MqttConnection, Thinq1Device,
     Thinq2Device,
@@ -24,12 +24,23 @@ enum HarnessDevice {
     T2(Arc<MockThinq2Device>),
 }
 
+fn split(
+    built: Result<Arc<ScriptedDevice>, Arc<dyn DeviceHandler>>,
+) -> (Arc<dyn DeviceHandler>, Option<Arc<ScriptedDevice>>) {
+    match built {
+        Ok(dev) => (dev.clone() as Arc<dyn DeviceHandler>, Some(dev)),
+        Err(broken) => (broken, None),
+    }
+}
+
 /// Drives one `.rhai` script end-to-end against mock connections. Construct with
 /// [`ScriptHarness::t2`]/[`ScriptHarness::t1`], feed it input, then read back what it
 /// published/sent.
 pub struct ScriptHarness {
     mqtt: Arc<MockMqttConnection>,
     handler: Arc<dyn DeviceHandler>,
+    /// `None` when the script failed to compile (`handler` is then the broken stub).
+    scripted: Option<Arc<ScriptedDevice>>,
     device: HarnessDevice,
 }
 
@@ -39,15 +50,17 @@ impl ScriptHarness {
         let mqtt = MockMqttConnection::new();
         let meta = Metadata::new(model_id, model_id, "1.0");
         let thinq = MockThinq2Device::new(HARNESS_DEVICE_ID, meta.clone());
-        let handler = build_t2(
+        let built = build_t2_scripted(
             mqtt.clone() as Arc<dyn MqttConnection>,
             thinq.clone() as Arc<dyn Thinq2Device>,
             meta,
             script_path.as_ref(),
         );
+        let (handler, scripted) = split(built);
         Self {
             mqtt,
             handler,
+            scripted,
             device: HarnessDevice::T2(thinq),
         }
     }
@@ -57,15 +70,17 @@ impl ScriptHarness {
         let mqtt = MockMqttConnection::new();
         let meta = Metadata::new(model_id, model_id, "1.0");
         let thinq = MockThinq1Device::new(HARNESS_DEVICE_ID, meta.clone());
-        let handler = build_t1(
+        let built = build_t1_scripted(
             mqtt.clone() as Arc<dyn MqttConnection>,
             thinq.clone() as Arc<dyn Thinq1Device>,
             meta,
             script_path.as_ref(),
         );
+        let (handler, scripted) = split(built);
         Self {
             mqtt,
             handler,
+            scripted,
             device: HarnessDevice::T1(thinq),
         }
     }
@@ -85,6 +100,36 @@ impl ScriptHarness {
     /// Run the script's `on_set_property(ctx, prop, value)`.
     pub fn set_property(&self, prop: &str, value: &str) -> &Self {
         self.handler.set_property(prop, value);
+        self
+    }
+
+    /// Structured (CLIP) messages the script sent via `ctx.send_clip`, as `(cmd, type, data)`.
+    /// T2 only; empty on a T1 harness.
+    pub fn sent_clip(&self) -> Vec<(String, i32, serde_json::Value)> {
+        match &self.device {
+            HarnessDevice::T2(dev) => dev
+                .sent()
+                .into_iter()
+                .map(|m| (m.cmd, m.msg_type, m.data))
+                .collect(),
+            HarnessDevice::T1(_) => Vec::new(),
+        }
+    }
+
+    /// Timers the script has armed and not yet fired, as `(name, delay_ms)`, sorted by name.
+    pub fn pending_timers(&self) -> Vec<(String, u64)> {
+        self.scripted
+            .as_ref()
+            .map(|d| d.pending_timers())
+            .unwrap_or_default()
+    }
+
+    /// Fire the armed timer `name` right now (its `on_timer(ctx, name)` runs), instead of
+    /// waiting out its delay. Does nothing if `name` is not armed.
+    pub fn fire_timer(&self, name: &str) -> &Self {
+        if let Some(d) = &self.scripted {
+            d.fire_timer(name);
+        }
         self
     }
 

@@ -122,7 +122,11 @@ fn build_engine() -> Engine {
         .register_fn("publish_event", DeviceCtx::publish_event)
         .register_fn("publish_raw", DeviceCtx::publish_raw)
         .register_fn("send_raw", DeviceCtx::send_raw)
-        .register_fn("send_json", DeviceCtx::send_json);
+        .register_fn("send_json", DeviceCtx::send_json)
+        .register_fn("send_clip", DeviceCtx::send_clip)
+        .register_fn("set_timer", DeviceCtx::set_timer)
+        .register_fn("cancel_timer", DeviceCtx::cancel_timer)
+        .register_fn("publish_il", DeviceCtx::publish_il);
 
     register_codec_helpers(&mut engine);
 
@@ -159,22 +163,28 @@ fn register_codec_helpers(engine: &mut Engine) {
         .register_fn(
             "tlv_build",
             |items: rhai::Array| -> Result<Vec<u8>, Box<EvalAltResult>> {
-                let mut tlvs = Vec::with_capacity(items.len());
-                for item in items {
-                    let map = item
-                        .try_cast::<rhai::Map>()
-                        .ok_or("tlv_build: expected an array of #{t: .., v: ..} maps")?;
-                    let t = map
-                        .get("t")
-                        .and_then(|d| d.as_int().ok())
-                        .ok_or("tlv_build: map missing integer field \"t\"")?;
-                    let v = map
-                        .get("v")
-                        .and_then(|d| d.as_int().ok())
-                        .ok_or("tlv_build: map missing integer field \"v\"")?;
-                    tlvs.push(rusthinq_util::tlv::Tlv::new(t as u16, v as u32));
-                }
+                let tlvs = array_to_tlvs(items).map_err(|e| format!("tlv_build: {e}"))?;
                 Ok(rusthinq_util::tlv::build(&tlvs))
+            },
+        )
+        .register_fn("tlv_frame_parse", |data: Vec<u8>| -> rhai::Dynamic {
+            match rusthinq_util::tlv::frame_parse(&data) {
+                Some(tlvs) => tlvs_to_array(tlvs).into(),
+                None => rhai::Dynamic::UNIT,
+            }
+        })
+        .register_fn(
+            "tlv_frame_build",
+            |header: rhai::Array, items: rhai::Array| -> Result<Vec<u8>, Box<EvalAltResult>> {
+                // A header is written `[1, 1, 2, 2, 1]`: an array of small integers.
+                let header: Vec<u8> = header
+                    .iter()
+                    .map(|d| d.as_int().ok().and_then(|n| u8::try_from(n).ok()))
+                    .collect::<Option<_>>()
+                    .ok_or("tlv_frame_build: header must be an array of byte values")?;
+                let tlvs = array_to_tlvs(items).map_err(|e| format!("tlv_frame_build: {e}"))?;
+                rusthinq_util::tlv::frame_build(&header, &tlvs)
+                    .ok_or_else(|| "tlv_frame_build: bad header or too many elements".into())
             },
         )
         .register_fn("known_tag_name", |id: i64| {
@@ -195,8 +205,30 @@ fn register_codec_helpers(engine: &mut Engine) {
 
 /// `Tlv { t, v }` -> `#{t: .., v: ..}`, as an array in wire order.
 fn tlv_parse(data: Vec<u8>) -> rhai::Array {
-    rusthinq_util::tlv::parse(&data)
-        .into_iter()
+    tlvs_to_array(rusthinq_util::tlv::parse(&data))
+}
+
+fn array_to_tlvs(items: rhai::Array) -> Result<Vec<rusthinq_util::tlv::Tlv>, Box<EvalAltResult>> {
+    let mut tlvs = Vec::with_capacity(items.len());
+    for item in items {
+        let map = item
+            .try_cast::<rhai::Map>()
+            .ok_or("expected an array of #{t: .., v: ..} maps")?;
+        let t = map
+            .get("t")
+            .and_then(|d| d.as_int().ok())
+            .ok_or("map missing integer field \"t\"")?;
+        let v = map
+            .get("v")
+            .and_then(|d| d.as_int().ok())
+            .ok_or("map missing integer field \"v\"")?;
+        tlvs.push(rusthinq_util::tlv::Tlv::new(t as u16, v as u32));
+    }
+    Ok(tlvs)
+}
+
+fn tlvs_to_array(tlvs: Vec<rusthinq_util::tlv::Tlv>) -> rhai::Array {
+    tlvs.into_iter()
         .map(|tlv| {
             let mut map = rhai::Map::new();
             map.insert("t".into(), Dynamic::from_int(i64::from(tlv.t)));
