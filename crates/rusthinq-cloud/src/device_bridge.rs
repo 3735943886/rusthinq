@@ -271,6 +271,7 @@ impl DeviceBridge {
     /// handler's config (a reload swaps code in but does not re-run `publish_config`, so
     /// a changed descriptor would otherwise stay unpublished until the next reconnect),
     /// then gives a handler to each connected device that had none and now has a script.
+    #[cfg(feature = "scripting")]
     pub fn remap(self: &Arc<Self>) {
         self.republish_all();
         let pending: Vec<_> = self.unmapped.lock().values().cloned().collect();
