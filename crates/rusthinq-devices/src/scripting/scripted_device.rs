@@ -223,6 +223,11 @@ impl DeviceHandler for ScriptedDevice {
     fn drop_device(&self) {
         self.cancel_pending_work();
         self.call("on_drop", vec![]);
+        // The link is down, so no value is current any more: publish them as absent
+        // (il.md R-4); `available`, which the script has just set to false, stays.
+        for prop in self.il_state.take_stale_props() {
+            self.mqtt.publish_property(&self.id, &prop, "");
+        }
     }
 
     fn cancel_pending_work(&self) {
@@ -239,10 +244,9 @@ impl DeviceHandler for ScriptedDevice {
                 self.call("on_set_property", vec![prop.into(), canonical.into()])
             }
             Ok(None) => self.call("on_set_property", vec![prop.into(), value.into()]),
-            Err(reason) => {
-                let body = serde_json::json!({ "prop": prop, "reason": reason });
+            Err(reject) => {
                 self.mqtt
-                    .publish_event(&self.id, "reject", &body.to_string());
+                    .publish_event(&self.id, "reject", &reject.body(prop).to_string())
             }
         }
     }

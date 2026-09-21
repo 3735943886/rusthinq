@@ -124,7 +124,13 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                     sink2.emit_discovery();
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
-                    sink2.handle_message(&p.topic, &p.payload);
+                    // A command is an instruction for now (il-mqtt.md M-9): a retained one
+                    // is a stale leftover the broker replays on every subscribe.
+                    if p.retain {
+                        tracing::debug!(topic = %p.topic, "ignoring a retained command");
+                    } else {
+                        sink2.handle_message(&p.topic, &p.payload);
+                    }
                 }
                 Ok(Event::Incoming(Incoming::Disconnect)) => {
                     *sink2.connected.lock() = false;

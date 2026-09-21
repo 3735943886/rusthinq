@@ -197,7 +197,7 @@ fn test_the_host_holds_start_back_until_remote_start_is_armed() {
     d.set("start", "");
     d.set("power_off", "");
     expect_eq(d.sent().len(), 0, "nothing is sent to an appliance that would refuse it");
-    expect_eq(d.event("reject"), "{\"prop\":\"power_off\",\"reason\":\"requires remote_start\"}");
+    expect_eq(d.event("reject"), "{\"code\":\"requires_unmet\",\"prop\":\"power_off\",\"reason\":\"requires remote_start\"}");
     d.feed(status(washing())); // now armed
     d.set("start", "");
     expect_eq(d.sent().len(), 1);

@@ -27,11 +27,17 @@ A runtime error in a hook is logged and also published as a `script_error` event
 
 **Commands are validated by the host, not by each script.** When a script has published a
 descriptor (`ctx.publish_il`), `ScriptedDevice::set_property` checks every `set` against it
-before `on_set_property` runs: the property must exist and be writable, `requires` must be
-satisfied by the last value the script published for that property, and the value must fit
-its type, options, `min`/`max` and `step` (see the Commands section of the IL). A failure is a
-`reject` event (`{"prop": .., "reason": ..}`) and nothing reaches the script; a valid value
-reaches it in canonical form. The host keeps the descriptor whether or not `il_prefix` is
+before `on_set_property` runs: the property must exist and be writable, `requires` (a binary
+that must be true, or a select whose value must be one of a list) must be satisfied by the
+last value the script published for that property, and the value must fit its type (a `text`
+must not be empty), options, `min`/`max` and `step` (see the Commands section of the IL). A
+failure is a `reject` event (`{"prop": .., "code": .., "reason": ..}`, `code` being the IL's
+`unknown_property`, `read_only`, `requires_unmet`, `invalid_value`, `out_of_range` or
+`bad_step`) and nothing reaches the script; a reject a script publishes itself
+(`ctx.publish_event("reject", ..)`, e.g. the appliance refused) gets the code `refused` unless
+it names one; a valid value
+reaches it in canonical form. A `set` that arrives retained is ignored (a command is an instruction for now, not state).
+The host keeps the descriptor whether or not `il_prefix` is
 set, so this does not depend on publishing. A script that publishes no descriptor is not
 checked. A `set` for a device that is not connected at all is still dropped silently, because
 the same `set` stream carries bridge control and raw injection that other handlers consume.
@@ -41,6 +47,12 @@ code takes effect on already-connected devices at once, every device's descripto
 published again (a reload does not re-run `start`, so a changed descriptor would otherwise
 wait for a reconnect), and a connected device that had no script when it connected is given
 one that has since appeared.
+
+The host also keeps the `available` property honest, so a driver need not: when a descriptor
+with an `available` role is published and the script has not reported it, the host publishes
+`false`; the script's own `available` report replaces that. When the link drops, after
+`on_drop` returns the host publishes every value the script had reported as absent (an empty
+retained payload) and forgets it, except `available`, which stays as the script left it.
 
 Timers are requests: the script never sleeps or spawns anything. The host arms one thread
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
@@ -107,7 +119,9 @@ driver can call (`hex_encode`, `tlv_frame_build`, `aabb_wrap`, …) is available
 drivers. Tests run against frames captured from real appliances wherever there is one.
 
 The host's own behaviour (timers, host-side command validation, the descriptor binding) is
-tested in Rust with `ScriptHarness`, which is what the runner drives.
+tested in Rust with `ScriptHarness`, which is what the runner drives. `tests/il_vectors.rs`
+runs the IL's `vectors/commands.json` through the validator when the `ildevice` checkout is
+next to this one.
 
 ## Drivers
 

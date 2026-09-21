@@ -199,7 +199,7 @@ fn test_a_stray_notification_before_the_values_does_not_end_the_retry() {
     d.feed(caps());
     d.feed(t::notify([[0x1fa, 6]])); // a change notification, not the state
     expect(has_timer(d, "values_retry"), "the values query is still being retried");
-    expect_eq(d.property("available"), ());
+    expect_eq(d.property("available"), "false"); // still down: no complete state yet
     d.feed(state());
     expect(!has_timer(d, "values_retry"), "the full state ends the retry");
     expect_eq(d.property("available"), "true");

@@ -150,7 +150,7 @@ fn test_the_host_enforces_requires_remote_start_before_the_script_is_asked() {
     d.set("power_off", "");
     d.set("right_remaining_time", "30");
     expect_eq(d.sent().len(), 0);
-    expect_eq(d.event("reject"), "{\"prop\":\"right_remaining_time\",\"reason\":\"requires remote_start\"}");
+    expect_eq(d.event("reject"), "{\"code\":\"requires_unmet\",\"prop\":\"right_remaining_time\",\"reason\":\"requires remote_start\"}");
 }
 
 fn test_switching_the_whole_cooktop_off() {

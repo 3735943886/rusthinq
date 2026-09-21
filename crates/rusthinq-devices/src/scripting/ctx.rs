@@ -129,24 +129,34 @@ impl DeviceCtx {
     }
 
     /// Publish this device's IL descriptor (retained, at `<il_prefix>/<id>`). The script
-    /// supplies the device-neutral part as JSON; the host fills `id`/`source` if absent
+    /// supplies the device-neutral part as JSON; the host sets `id`/`source`
     /// and adds the `x-mqtt` binding pointing at this device's own property topics,
     /// because a driver does not know topics. A no-op when `il_prefix` is not configured.
     pub fn publish_il(&mut self, descriptor_json: String) -> Result<(), Box<EvalAltResult>> {
-        let mut doc: serde_json::Value = serde_json::from_str(&descriptor_json)
+        let doc: serde_json::Value = serde_json::from_str(&descriptor_json)
             .map_err(|e| format!("ctx.publish_il: invalid JSON: {e}"))?;
         // The host keeps the descriptor to validate commands against, whether or not it is
         // published (`il_prefix` only controls the publishing).
         self.il_state.set_descriptor(&doc);
+        self.publish_descriptor(doc)?;
+        // A device not yet known to be reachable is unavailable (il.md A-2); the driver's own
+        // report replaces this.
+        if let Some(available) = self.il_state.unreported_available() {
+            self.publish_property(available, "false".into());
+        }
+        Ok(())
+    }
+
+    fn publish_descriptor(&self, mut doc: serde_json::Value) -> Result<(), Box<EvalAltResult>> {
         let Some(prefix) = self.il_prefix.clone() else {
             return Ok(());
         };
         let obj = doc
             .as_object_mut()
             .ok_or("ctx.publish_il: descriptor must be a JSON object")?;
-        obj.entry("id")
-            .or_insert_with(|| self.id.to_string().into());
-        obj.entry("source").or_insert_with(|| "rusthinq".into());
+        // The host owns the identity: a script cannot publish under another id or source.
+        obj.insert("id".into(), self.id.to_string().into());
+        obj.insert("source".into(), "rusthinq".into());
         // The owner's own name for the device beats the driver's generic label.
         if let Some(name) = crate::scripting::device_name(&self.id) {
             obj.insert("label".into(), name.into());
@@ -220,6 +230,11 @@ impl DeviceCtx {
     }
 
     pub fn publish_event(&mut self, topic_suffix: String, payload: String) {
+        let payload = if topic_suffix == "reject" {
+            crate::scripting::il::with_reject_code(&payload)
+        } else {
+            payload
+        };
         self.mqtt.publish_event(&self.id, &topic_suffix, &payload);
     }
 

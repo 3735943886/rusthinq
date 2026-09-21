@@ -113,7 +113,7 @@ fn test_a_stray_notification_before_the_values_does_not_end_the_retry() {
     d.feed(caps());
     d.feed(t::notify([[0x1fa, 6]]));
     expect_eq(d.timers(), [["values_retry", 15000]]);
-    expect_eq(d.property("available"), ());
+    expect_eq(d.property("available"), "false"); // still down: no complete state yet
     d.feed(values());
     expect_eq(d.timers(), [["refresh", 900000]]);
     expect_eq(d.property("available"), "true");

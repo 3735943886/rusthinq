@@ -122,7 +122,7 @@ fn an_invalid_command_is_a_reject_event_and_never_reaches_the_script() {
     }
     assert_eq!(
         h.event("reject").unwrap(),
-        r#"{"prop":"missing","reason":"unknown property"}"#
+        r#"{"code":"unknown_property","prop":"missing","reason":"unknown property"}"#
     );
 }
 
@@ -180,5 +180,38 @@ fn the_host_binds_a_published_descriptor_to_the_devices_own_topics() {
             .as_str()
             .unwrap()
             .ends_with("/{id}/reject")
+    );
+}
+
+const AVAILABILITY_SCRIPT: &str = r#"
+    fn start(ctx) { ctx.publish_property("power", "true"); }
+    fn publish_config(ctx) {
+        ctx.publish_il(json_stringify(#{ il: 0, props: #{
+            up: #{ type: "binary", role: "available" },
+            power: #{ type: "binary", rw: true }
+        } }));
+    }
+    fn on_data(ctx, data) { ctx.publish_property("up", "true"); }
+    fn on_drop(ctx) { ctx.publish_property("up", "false"); }
+"#;
+
+#[test]
+fn a_device_is_unavailable_until_its_script_says_otherwise() {
+    let (_dir, h) = harness(AVAILABILITY_SCRIPT);
+    h.start();
+    assert_eq!(h.property("up").as_deref(), Some("false"));
+}
+
+#[test]
+fn a_dropped_link_keeps_available_false_and_blanks_every_other_value() {
+    let (_dir, h) = harness(AVAILABILITY_SCRIPT);
+    h.start();
+    assert_eq!(h.property("power").as_deref(), Some("true"));
+    h.drop_device();
+    assert_eq!(h.property("up").as_deref(), Some("false"));
+    assert_eq!(
+        h.property("power").as_deref(),
+        Some(""),
+        "absent = empty retained"
     );
 }
