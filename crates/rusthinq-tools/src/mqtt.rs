@@ -112,6 +112,60 @@ pub fn subscribe_stream(
     Ok((client, rx))
 }
 
+/// Subscribe to `topic_filter` (typically a wildcard, e.g. `"rusthinq/+/+"`) and
+/// collect every message the broker delivers with its RETAIN flag set, for as
+/// long as `window` -- i.e. a one-shot snapshot of whatever's currently retained
+/// under that filter, not a live stream. A short `window` after subscribing is
+/// enough since retained messages are delivered immediately on subscribe ack;
+/// anything arriving with `retain: false` (live, non-retained traffic on an
+/// overlapping topic) is filtered out rather than mistaken for retained state.
+pub fn collect_retained(
+    client_id: &str,
+    host_port: &str,
+    topic_filter: &str,
+    window: Duration,
+) -> Result<Vec<Publish>> {
+    let (client, connection) = connect(client_id, host_port);
+    let (tx, rx) = mpsc::channel();
+    spawn_pump(connection, tx);
+    client
+        .subscribe(topic_filter, QoS::AtLeastOnce)
+        .map_err(|e| anyhow!("subscribe {topic_filter}: {e}"))?;
+
+    let deadline = Instant::now() + window;
+    let mut out = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(p) if p.retain => out.push(p),
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = client.disconnect();
+    Ok(out)
+}
+
+/// Delete each of `topics` from the broker's retained store by publishing an
+/// empty retained payload to it -- the standard MQTT way to clear a retained
+/// message (mirrors `MqttSink::clear_retained`'s own empty-payload republish).
+pub fn clear_retained_topics(client_id: &str, host_port: &str, topics: &[String]) -> Result<()> {
+    let (client, connection) = connect(client_id, host_port);
+    let (tx, _rx) = mpsc::channel();
+    spawn_pump(connection, tx);
+    for topic in topics {
+        client
+            .publish(topic, QoS::AtLeastOnce, true, Vec::<u8>::new())
+            .map_err(|e| anyhow!("clear {topic}: {e}"))?;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = client.disconnect();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +247,102 @@ mod tests {
         assert_eq!(got.topic, "rusthinq-mqtt-test/live/a");
         assert_eq!(got.payload.as_ref(), b"payload-a");
         let _ = client.disconnect();
+    }
+
+    fn seed_retained(broker: &TestBroker, topic: &str, payload: &[u8]) {
+        let (client, connection) = connect("seeder", &broker.addr());
+        let (tx, _rx) = mpsc::channel();
+        spawn_pump(connection, tx);
+        client
+            .publish(topic, QoS::AtLeastOnce, true, payload.to_vec())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = client.disconnect();
+    }
+
+    #[test]
+    fn collect_retained_snapshots_matching_topics_and_ignores_others() {
+        let Some(broker) = TestBroker::start() else {
+            return;
+        };
+        seed_retained(&broker, "rusthinq-gc-test/dev-1/power", b"on");
+        seed_retained(&broker, "rusthinq-gc-test/dev-2/power", b"off");
+        seed_retained(&broker, "rusthinq-gc-test/other", b"unrelated");
+
+        let mut got = collect_retained(
+            "collector",
+            &broker.addr(),
+            "rusthinq-gc-test/+/+",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        got.sort_by(|a, b| a.topic.cmp(&b.topic));
+        let topics: Vec<&str> = got.iter().map(|p| p.topic.as_str()).collect();
+        assert_eq!(
+            topics,
+            vec![
+                "rusthinq-gc-test/dev-1/power",
+                "rusthinq-gc-test/dev-2/power"
+            ]
+        );
+        assert!(got.iter().all(|p| p.retain));
+    }
+
+    #[test]
+    fn collect_retained_ignores_live_non_retained_publishes() {
+        let Some(broker) = TestBroker::start() else {
+            return;
+        };
+        let (client, rx) = subscribe_stream(
+            "collector-live-setup",
+            &broker.addr(),
+            "rusthinq-gc-live-test/+/+",
+        )
+        .unwrap();
+        // Just used to confirm the topic filter is live before the real collector
+        // subscribes; drop it immediately so it doesn't steal the message below.
+        drop(rx);
+        let _ = client.disconnect();
+
+        publish(
+            "publisher",
+            &broker.addr(),
+            "rusthinq-gc-live-test/dev-1/power",
+            b"on",
+        )
+        .unwrap();
+
+        let got = collect_retained(
+            "collector-live",
+            &broker.addr(),
+            "rusthinq-gc-live-test/+/+",
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(got.is_empty(), "non-retained publish must not be collected");
+    }
+
+    #[test]
+    fn clear_retained_topics_removes_them_from_the_broker() {
+        let Some(broker) = TestBroker::start() else {
+            return;
+        };
+        seed_retained(&broker, "rusthinq-gc-clear-test/dev-1/power", b"on");
+
+        clear_retained_topics(
+            "clearer",
+            &broker.addr(),
+            &["rusthinq-gc-clear-test/dev-1/power".to_string()],
+        )
+        .unwrap();
+
+        let got = fetch_one(
+            "verify",
+            &broker.addr(),
+            "rusthinq-gc-clear-test/dev-1/power",
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert_eq!(got, None, "topic must no longer be retained on the broker");
     }
 }

@@ -25,6 +25,10 @@ path = "src/bin/rusthinq_mcp.rs"
 name = "rusthinq-lgcloud-monitor"
 path = "src/bin/lgcloud_monitor.rs"
 
+[[bin]]
+name = "rusthinq-retained-gc"
+path = "src/bin/rusthinq_retained_gc.rs"
+
 [dependencies]
 rusthinq-util = { workspace = true }
 rusthinq-bridge = { workspace = true }
