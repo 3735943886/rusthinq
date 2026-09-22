@@ -4,6 +4,8 @@ rusthinq-specific notes for running drivers of the IL (a separate specification
 repository). rusthinq does device → IL only: a driver is a Rhai script, and every consumer
 of the IL (Home Assistant, Matter, …) is an external project.
 
+Writing one? See [writing-a-driver.md](writing-a-driver.md) for the step-by-step.
+
 ## What a driver is here
 
 A `<modelId>.rhai` script in `[scripting] rhai_dir`, using the existing hooks. The IL's
@@ -137,6 +139,7 @@ next to this one.
 | S3BF_POD_DN4 (LG styler, AABB monitoring record) | `scripts/S3BF_POD_DN4.rhai` | tested against a real idle frame from the cabinet (energy and downloaded course agree with what the rethink adapter had retained) and the 46-byte Fine Dust start the LG app sent, byte for byte; there is no power-on command (measured: the cabinet acknowledges and ignores them); not yet run live |
 | F24VDD (LG washer, AABB monitoring record) | `scripts/F24VDD.rhai` | tested against a real idle frame from the washer (energy, download course, Tub Clean count, last operating course and end sound agree with what the rethink adapter had retained) and the Colour Care, Heavy Duty and Steam Refresh starts the LG app sent, byte for byte; not yet run live |
 | CST_570004_WW (LG ceiling-cassette air conditioner, TLV) | `scripts/CST_570004_WW.rhai` | written for this model only; tested against the real capability and state frames a unit reported (from rethink's test suite); write frames follow rethink's write-attach rules (power on and mode writes carry the other core tags), not yet compared with frames the LG app sent, and not yet run live |
+| 2RSFL2DBN3K_Z (LG refrigerator, AABB) | `scripts/2RSFL2DBN3K_Z.rhai` | live against the real appliance, captured with `rusthinq-capture`: every property was read back after toggling the matching LG app control, including all three night-glare modes (off / sunset-to-sunrise / custom schedule). Fridge/freezer setpoint, express freeze, and AI Saving Mode (off/balanced/max, its own short F0 10 frame acked with an inner `0x67`, not the F0 17 template every other write here uses) were written from here (`rusthinq/<id>/<prop>/set`) and confirmed acked and reflected in the appliance's own next status frame; `ai_saving_max_schedule` (max mode's own active-hours window, same F0 10 frame) is decoded and reproduced byte-for-byte from a live nudge but never echoed by any status frame, so it publishes its own write back instead. Smart Care+, night-glare mode and the door-alarm-mute toggle are all confirmed writable at the protocol level too (night-glare via its own short F0 10 02 frame, which also carries a custom schedule's start/end time and LCD brightness, and for sunset-to-sunrise two bytes this driver could not pin down, none of it exposed) but are kept read-only here, as sensors rather than controls |
 
 TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
 

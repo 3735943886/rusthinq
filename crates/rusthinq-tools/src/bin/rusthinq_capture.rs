@@ -7,8 +7,11 @@
 //! Usage:
 //!   rusthinq-capture <mqtt-host[:port]> <device-uuid> [out.jsonl]
 //!
-//! Env: RUSTHINQ_PREFIX (default "rusthinq", must match rusthinq-cloud's
-//!      mqtt.rusthinq_prefix)
+//! Env: RUSTHINQ_PREFIX (default "rusthinq") -- despite the name, this is
+//!      rusthinq-cloud's `[mqtt] raw_prefix`, NOT `rusthinq_prefix`: the raw
+//!      bus this tool reads always lives under raw_prefix (see raw_bus.rs),
+//!      and the two commonly differ. Get this wrong and the tool subscribes
+//!      to a topic nothing publishes and silently captures nothing.
 //!
 //! Stdin lines become `{"k":"note","t":…,"text":…}` annotations.
 

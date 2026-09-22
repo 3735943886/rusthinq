@@ -8,6 +8,12 @@
 //! Run: rusthinq-mcp
 //! Env: RUSTHINQ_MQTT=host[:port] (default 127.0.0.1:1883), RUSTHINQ_PREFIX
 //!      (default "rusthinq", must match rusthinq-cloud's mqtt.rusthinq_prefix)
+//!      -- correct for list_devices/health, but NOT for `inject`: the raw bus
+//!      `inject` publishes to always lives under `[mqtt] raw_prefix` (see
+//!      raw_bus.rs), which commonly differs from rusthinq_prefix. There is no
+//!      separate override for it yet (see the `inject` match arm below), so on
+//!      a config where the two prefixes differ, `inject` currently publishes
+//!      to the wrong topic and nothing receives it.
 
 use anyhow::{Context, Result, anyhow};
 use rusthinq_tools::mqtt;
@@ -295,6 +301,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let leaf = if from_device { "emit" } else { "inject" };
+            // BUG: this should be raw_prefix, not rusthinq_prefix -- see the module doc comment.
             let topic = format!("{}/{device_id}/raw/{leaf}/set", prefix());
             mqtt::publish("rusthinq-mcp-inject", &mqtt_host(), &topic, hex.as_bytes())?;
             Ok(
