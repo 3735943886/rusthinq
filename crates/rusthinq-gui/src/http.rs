@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
-use rumqttc::QoS;
+use rumqttc::{PublishOptions, QoS};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -190,7 +190,7 @@ async fn run_panel_socket(mut socket: WebSocket, state: AppState) {
             }
             ev = events_rx.recv() => {
                 match ev {
-                    Ok(p) if p.topic.ends_with("/bridge/status") => {
+                    Ok(p) if p.topic.ends_with(b"/bridge/status") => {
                         let status = String::from_utf8_lossy(&p.payload).to_string();
                         if send_json(&mut socket, &json!({ "status": status })).await.is_err() {
                             break;
@@ -355,14 +355,22 @@ async fn handle_inject_message(state: &AppState, inject_topic: &str, emit_topic:
         let _ = state
             .mqtt
             .client
-            .publish(inject_topic, QoS::AtMostOnce, false, hex.as_bytes())
+            .publish(
+                inject_topic,
+                hex.as_bytes(),
+                PublishOptions::new(QoS::AtMostOnce),
+            )
             .await;
     }
     if let Some(hex) = json.get("sendFromDevice").and_then(|v| v.as_str()) {
         let _ = state
             .mqtt
             .client
-            .publish(emit_topic, QoS::AtMostOnce, false, hex.as_bytes())
+            .publish(
+                emit_topic,
+                hex.as_bytes(),
+                PublishOptions::new(QoS::AtMostOnce),
+            )
             .await;
     }
 }
@@ -415,7 +423,11 @@ async fn bridge_enable(
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, device_type.as_bytes())
+        .publish(
+            topic,
+            device_type.as_bytes(),
+            PublishOptions::new(QoS::AtLeastOnce),
+        )
         .await;
 
     let status_topic = state.mqtt.bridge_status_topic(&id);
@@ -441,7 +453,7 @@ async fn bridge_disable(Path(id): Path<String>, State(state): State<AppState>) -
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, b"".to_vec())
+        .publish(topic, b"".to_vec(), PublishOptions::new(QoS::AtLeastOnce))
         .await;
 
     let status_topic = state.mqtt.bridge_status_topic(&id);
@@ -463,7 +475,7 @@ async fn forget_device(Path(id): Path<String>, State(state): State<AppState>) ->
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, b"".to_vec())
+        .publish(topic, b"".to_vec(), PublishOptions::new(QoS::AtLeastOnce))
         .await;
 
     let status_topic = state.mqtt.forget_status_topic(&id);
@@ -486,7 +498,11 @@ async fn thinq_login(Query(q): Query<LoginQuery>, State(state): State<AppState>)
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, country_code.as_bytes())
+        .publish(
+            topic,
+            country_code.as_bytes(),
+            PublishOptions::new(QoS::AtLeastOnce),
+        )
         .await;
 
     let login_url_topic = state.mqtt.account_topic("login-url");
@@ -535,7 +551,11 @@ async fn thinq_login_accept(
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, body.url.as_bytes())
+        .publish(
+            topic,
+            body.url.as_bytes(),
+            PublishOptions::new(QoS::AtLeastOnce),
+        )
         .await;
 
     let status_topic = state.mqtt.account_topic("status");
@@ -560,7 +580,7 @@ async fn thinq_logout(State(state): State<AppState>) -> Response {
     let _ = state
         .mqtt
         .client
-        .publish(topic, QoS::AtLeastOnce, false, b"".to_vec())
+        .publish(topic, b"".to_vec(), PublishOptions::new(QoS::AtLeastOnce))
         .await;
 
     let status_topic = state.mqtt.account_topic("status");
@@ -608,7 +628,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
             let _ = client
-                .publish(topic, QoS::AtLeastOnce, false, msg.as_bytes())
+                .publish(topic, msg.as_bytes(), PublishOptions::new(QoS::AtLeastOnce))
                 .await;
         });
     }
@@ -670,7 +690,11 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = client
-                .publish(topic, QoS::AtLeastOnce, false, b"forgotten".to_vec())
+                .publish(
+                    topic,
+                    b"forgotten".to_vec(),
+                    PublishOptions::new(QoS::AtLeastOnce),
+                )
                 .await;
         });
 

@@ -8,6 +8,7 @@
 
 pub mod oauth2;
 pub mod pair;
+pub mod resolver;
 pub mod state;
 pub mod thinq1_conn;
 pub mod thinq2_conn;

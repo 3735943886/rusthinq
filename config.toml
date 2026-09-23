@@ -111,6 +111,15 @@ raw = ["rx", "tx", "clip_tx", "inject", "inject_clip", "emit"]
 # and from the real LG cloud, and this section is ignored.
 # [bridge]
 # storage_path = "./state" # LG account credentials (oauth2.json) and per-device bridge state
+#
+# The appliances find rusthinq through a DNS-level redirect of the ThinQ hostnames, and
+# the host running rusthinq usually sits behind the same resolver. If it does, the
+# bridge's own outbound connections would resolve straight back to rusthinq instead of
+# the real LG cloud unless told to use other servers here, tried in order: each is a
+# DNS-over-HTTPS URL or a plain DNS server address. DoH by IP address (as below) works
+# even where plain DNS on port 53 is intercepted too. Empty or absent means the system
+# resolver.
+# dns = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
 
 # Optional device scripting (rusthinq-devices::scripting, `scripting` Cargo feature). Absent
 # entirely = the feature doesn't exist. Put a <modelId>.rhai in rhai_dir to handle that

@@ -225,6 +225,7 @@ async fn connect_once(
     );
     if let Err(e) = reqwest::Client::builder()
         .timeout(RTI_CONNECT_TIMEOUT)
+        .dns_resolver(crate::resolver::dns_resolver())
         .build()?
         .post(&total_device_info_url)
         .header("Accept", "text/xml")
@@ -270,7 +271,7 @@ async fn connect_once(
     let connector = TlsConnector::from(Arc::new(config));
     let tcp = tokio::time::timeout(
         RTI_CONNECT_TIMEOUT,
-        TcpStream::connect((host.as_str(), port)),
+        crate::resolver::connect_tcp(&host, port),
     )
     .await
     .context("TCP connect to RTI server timed out")??;

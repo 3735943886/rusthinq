@@ -94,14 +94,18 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(1883);
 
-    use rumqttc::{AsyncClient, MqttOptions, QoS};
-    let mut opts = MqttOptions::new("packet-sender", host, port);
-    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE);
-    let (client, mut eventloop) = AsyncClient::new(opts, 10);
+    use rumqttc::{AsyncClient, MqttOptions, PublishOptions};
+    let mut opts = MqttOptions::new("packet-sender", (host, port));
+    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE.as_secs() as u16);
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(10).build();
     let topic = format!("lime/devices/{device_id}");
     // trailing space matches TS packet-sender
     client
-        .publish(&topic, QoS::AtMostOnce, false, format!("{messagestr} "))
+        .publish(
+            &topic,
+            format!("{messagestr} "),
+            PublishOptions::at_most_once(),
+        )
         .await?;
 
     // Drive eventloop until publish is flushed

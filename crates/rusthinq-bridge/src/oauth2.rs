@@ -45,7 +45,7 @@ pub async fn signed_request(
     }
     let signature = sign(&to_sign, &timestamp);
 
-    let client = reqwest::Client::new();
+    let client = crate::resolver::http_client();
     let mut req = if body.is_some() {
         client.post(url)
     } else {

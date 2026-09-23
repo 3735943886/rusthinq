@@ -757,7 +757,7 @@ fn encode_publish(p: &PublishPacket) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+    use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, PublishOptions, QoS};
     use tokio::net::TcpListener;
 
     /// Real `rumqttc` clients over a real loopback socket — no wire protocol is
@@ -785,15 +785,16 @@ mod tests {
         port: u16,
         client_id: &str,
     ) -> (AsyncClient, mpsc::UnboundedReceiver<(String, Vec<u8>)>) {
-        let mut opts = MqttOptions::new(client_id, "127.0.0.1", port);
-        opts.set_keep_alive(std::time::Duration::from_secs(30));
-        let (client, mut eventloop) = AsyncClient::new(opts, 32);
+        let mut opts = MqttOptions::new(client_id, ("127.0.0.1", port));
+        opts.set_keep_alive(30);
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(32).build();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Incoming::Publish(p))) => {
-                        let _ = tx.send((p.topic, p.payload.to_vec()));
+                        let topic = String::from_utf8_lossy(&p.topic).to_string();
+                        let _ = tx.send((topic, p.payload.to_vec()));
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -821,7 +822,11 @@ mod tests {
 
         let (pub_client, _) = connect(port, "pub").await;
         pub_client
-            .publish("device/1/state", QoS::AtMostOnce, false, b"on".to_vec())
+            .publish(
+                "device/1/state",
+                b"on".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
 
@@ -839,15 +844,23 @@ mod tests {
 
         let (pub_client, _) = connect(port, "pub").await;
         pub_client
-            .publish("device/1/x/y", QoS::AtMostOnce, false, b"a".to_vec())
+            .publish(
+                "device/1/x/y",
+                b"a".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
         pub_client
-            .publish("device/2/x", QoS::AtMostOnce, false, b"b".to_vec())
+            .publish("device/2/x", b"b".to_vec(), PublishOptions::at_most_once())
             .await
             .unwrap();
         pub_client
-            .publish("device/1/x/y", QoS::AtMostOnce, false, b"c".to_vec())
+            .publish(
+                "device/1/x/y",
+                b"c".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
 
@@ -874,14 +887,17 @@ mod tests {
         pub_client
             .publish(
                 "device/1/state/extra",
-                QoS::AtMostOnce,
-                false,
                 b"nope".to_vec(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
         pub_client
-            .publish("device/1/state", QoS::AtMostOnce, false, b"yes".to_vec())
+            .publish(
+                "device/1/state",
+                b"yes".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
 
@@ -895,7 +911,11 @@ mod tests {
         let (_broker, port) = listening_broker().await;
         let (pub_client, _) = connect(port, "pub").await;
         pub_client
-            .publish("device/1/config", QoS::AtMostOnce, true, b"cfg".to_vec())
+            .publish(
+                "device/1/config",
+                b"cfg".to_vec(),
+                PublishOptions::at_most_once().retained(),
+            )
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -916,11 +936,19 @@ mod tests {
         let (_broker, port) = listening_broker().await;
         let (pub_client, _) = connect(port, "pub").await;
         pub_client
-            .publish("device/1/config", QoS::AtMostOnce, true, b"cfg".to_vec())
+            .publish(
+                "device/1/config",
+                b"cfg".to_vec(),
+                PublishOptions::at_most_once().retained(),
+            )
             .await
             .unwrap();
         pub_client
-            .publish("device/1/config", QoS::AtMostOnce, true, Vec::new())
+            .publish(
+                "device/1/config",
+                Vec::new(),
+                PublishOptions::at_most_once().retained(),
+            )
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -936,9 +964,8 @@ mod tests {
         pub_client
             .publish(
                 "device/1/other",
-                QoS::AtMostOnce,
-                false,
                 b"only-this".to_vec(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -956,14 +983,14 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let mut opts = MqttOptions::new("will-client", "127.0.0.1", port);
+        let mut opts = MqttOptions::new("will-client", ("127.0.0.1", port));
         opts.set_last_will(rumqttc::LastWill::new(
             "device/1/lwt",
             b"offline".to_vec(),
             QoS::AtMostOnce,
             false,
         ));
-        let (client, mut eventloop) = AsyncClient::new(opts, 32);
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(32).build();
         let poll_task = tokio::spawn(async move {
             loop {
                 if eventloop.poll().await.is_err() {
@@ -997,14 +1024,14 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let mut opts = MqttOptions::new("will-client-2", "127.0.0.1", port);
+        let mut opts = MqttOptions::new("will-client-2", ("127.0.0.1", port));
         opts.set_last_will(rumqttc::LastWill::new(
             "device/1/lwt",
             b"offline".to_vec(),
             QoS::AtMostOnce,
             false,
         ));
-        let (client, mut eventloop) = AsyncClient::new(opts, 32);
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(32).build();
         tokio::spawn(async move {
             loop {
                 if eventloop.poll().await.is_err() {
@@ -1021,7 +1048,11 @@ mod tests {
         let (pub_client, _) = connect(port, "pub").await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         pub_client
-            .publish("device/1/lwt", QoS::AtMostOnce, false, b"canary".to_vec())
+            .publish(
+                "device/1/lwt",
+                b"canary".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
         let (topic, payload) = wait_for(&mut rx).await;
@@ -1047,7 +1078,11 @@ mod tests {
 
         // A client->broker publish must NOT fire on_outgoing.
         client
-            .publish("client/topic", QoS::AtMostOnce, false, b"a".to_vec())
+            .publish(
+                "client/topic",
+                b"a".to_vec(),
+                PublishOptions::at_most_once(),
+            )
             .await
             .unwrap();
         // A server-originated publish (from=None, e.g. a CLIP response) must.

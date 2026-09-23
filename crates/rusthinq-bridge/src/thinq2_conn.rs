@@ -4,7 +4,9 @@ use crate::pair::{
     Thinq2DeviceState, format_device_packet, format_pre_deploy, format_relayed_clip,
     is_relayable_cmd, parse_lg_packet_payload,
 };
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, Event, Incoming, MqttOptions, PublishOptions, QoS, TlsConfiguration, Transport,
+};
 use rusthinq_util::backoff::ExponentialBackoff;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -70,7 +72,7 @@ impl Thinq2Handle {
         let m = self.mid.fetch_add(1, Ordering::SeqCst) + 1;
         let payload = format_relayed_clip(payload, m, &self.device_id, &self.model_name);
         self.client
-            .publish(&self.pub_topic, QoS::AtLeastOnce, false, payload)
+            .publish(&self.pub_topic, payload, PublishOptions::at_least_once())
             .await?;
         Ok(())
     }
@@ -107,8 +109,13 @@ pub async fn connect_thinq2(
         &[&format!("{device_id} connecting to {}", state.mqtt_server)],
     );
 
-    let mut opts = MqttOptions::new(device_id, host, port);
-    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE);
+    let mut opts = MqttOptions::new(device_id, (host, port));
+    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE.as_secs() as u16);
+    // Resolve `host` through the configured DNS/DoH servers (see
+    // `resolver.rs`), independent of the `host` string above -- which stays
+    // the TLS `ServerName` this connection verifies its certificate against,
+    // regardless of which address it actually dials.
+    crate::resolver::install_socket_connector(&mut opts);
     opts.set_transport(Transport::tls_with_config(TlsConfiguration::Simple {
         ca: state.ca_certificate.as_bytes().to_vec(),
         alpn: None,
@@ -118,7 +125,7 @@ pub async fn connect_thinq2(
         )),
     }));
 
-    let (client, mut eventloop) = AsyncClient::new(opts, 32);
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(32).build();
     let (tx, rx) = mpsc::unbounded_channel();
     let mid = Arc::new(AtomicU32::new(10000));
     let stopped = Arc::new(AtomicBool::new(false));
@@ -172,7 +179,7 @@ pub async fn connect_thinq2(
                     // must not leave the session silently stuck never having
                     // introduced itself upstream, with nothing to retry it.
                     if let Err(e) = client_c
-                        .publish(&prov_topic, QoS::AtLeastOnce, false, pre)
+                        .publish(&prov_topic, pre, PublishOptions::at_least_once())
                         .await
                     {
                         rusthinq_core::logging::log(
@@ -204,7 +211,7 @@ pub async fn connect_thinq2(
                             "rssi": -48, "fs": "idle", "data": null, "type": 1,
                         });
                         let _ = client_c
-                            .publish(&pub_topic, QoS::AtMostOnce, false, ack.to_string())
+                            .publish(&pub_topic, ack.to_string(), PublishOptions::at_most_once())
                             .await;
                         continue;
                     }
@@ -266,7 +273,7 @@ pub async fn connect_thinq2(
                 break;
             }
             if let Err(e) = client_w
-                .publish(&pub_topic_w, QoS::AtMostOnce, false, payload)
+                .publish(&pub_topic_w, payload, PublishOptions::at_most_once())
                 .await
             {
                 rusthinq_core::logging::log(

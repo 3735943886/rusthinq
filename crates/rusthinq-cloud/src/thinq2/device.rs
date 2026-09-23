@@ -410,7 +410,7 @@ impl DeviceAcceptor {
 mod tests {
     use super::*;
     use crate::test_support::wait_for;
-    use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+    use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, PublishOptions, QoS};
     use tokio::net::TcpListener;
 
     #[test]
@@ -444,9 +444,9 @@ mod tests {
     /// wire protocol a physical appliance would to the real `Broker`/`DeviceAcceptor`,
     /// over a real loopback TCP socket.
     async fn connect_fake_device(port: u16, did: &str) -> AsyncClient {
-        let mut opts = MqttOptions::new(format!("fake-{did}"), "127.0.0.1", port);
-        opts.set_keep_alive(std::time::Duration::from_secs(30));
-        let (client, mut eventloop) = AsyncClient::new(opts, 32);
+        let mut opts = MqttOptions::new(format!("fake-{did}"), ("127.0.0.1", port));
+        opts.set_keep_alive(30);
+        let (client, mut eventloop) = AsyncClient::builder(opts).capacity(32).build();
         client
             .subscribe(format!("lime/devices/{did}"), QoS::AtMostOnce)
             .await
@@ -473,9 +473,10 @@ mod tests {
         AsyncClient,
         tokio::sync::mpsc::UnboundedReceiver<rumqttc::Publish>,
     ) {
-        let mut opts = MqttOptions::new(format!("fake-{reader_id}-reader"), "127.0.0.1", port);
-        opts.set_keep_alive(std::time::Duration::from_secs(30));
-        let (reader_client, mut reader_eventloop) = AsyncClient::new(opts, 32);
+        let topic: String = topic.into();
+        let mut opts = MqttOptions::new(format!("fake-{reader_id}-reader"), ("127.0.0.1", port));
+        opts.set_keep_alive(30);
+        let (reader_client, mut reader_eventloop) = AsyncClient::builder(opts).capacity(32).build();
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
         let (subacked_tx, subacked_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -543,9 +544,8 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 deploy.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -556,9 +556,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 ack.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -607,9 +606,8 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 deploy.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -618,9 +616,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 ack.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -639,9 +636,8 @@ mod tests {
             client
                 .publish(
                     format!("clip/message/devices/{did}"),
-                    QoS::AtMostOnce,
-                    false,
                     handled.to_string(),
+                    PublishOptions::at_most_once(),
                 )
                 .await
                 .unwrap();
@@ -655,9 +651,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 resp.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -710,9 +705,8 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 deploy.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -726,9 +720,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 packet.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -748,9 +741,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 packet2.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -805,9 +797,8 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 deploy.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -818,9 +809,8 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 ack.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -877,24 +867,18 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 serde_json::json!({
                     "did": did, "mid": 1, "kind": "RAC", "cmd": "deploy", "type": 0,
                     "data": {},
                 })
                 .to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
         client
-            .publish(
-                format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
-                serde_json::json!({"did": did, "mid": 2, "cmd": "completeProvisioning_ack", "type": 1})
-                    .to_string(),
-            )
+            .publish(format!("clip/message/devices/{did}"), serde_json::json!({"did": did, "mid": 2, "cmd": "completeProvisioning_ack", "type": 1})
+                    .to_string(), PublishOptions::at_most_once())
             .await
             .unwrap();
 
@@ -961,13 +945,12 @@ mod tests {
         client
             .publish(
                 format!("$aws/rules/clip_provisioning_rule/clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 serde_json::json!({
                     "did": did, "mid": 1, "kind": "WBEY3GT", "cmd": "deploy", "type": 0,
                     "data": {},
                 })
                 .to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -993,7 +976,12 @@ mod tests {
         assert_eq!(received.get("did").and_then(|v| v.as_str()), Some(did));
     }
 
-    async fn complete_provisioning_for(port: u16, did: &str) {
+    /// Returns the still-connected client -- the caller must hold onto it for as
+    /// long as this device's session needs to stay live. Unlike the old rumqttc,
+    /// rumqttc-v4-next disconnects for real once the last `AsyncClient` handle for
+    /// a connection is dropped, rather than leaving its eventloop task's socket
+    /// open until something explicit closes it.
+    async fn complete_provisioning_for(port: u16, did: &str) -> AsyncClient {
         let client = connect_fake_device(port, did).await;
         let deploy = serde_json::json!({
             "did": did, "mid": 1, "kind": "MODEL", "cmd": "deploy", "type": 0,
@@ -1002,9 +990,8 @@ mod tests {
         client
             .publish(
                 format!("clip/provisioning/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 deploy.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
@@ -1014,12 +1001,12 @@ mod tests {
         client
             .publish(
                 format!("clip/message/devices/{did}"),
-                QoS::AtMostOnce,
-                false,
                 ack.to_string(),
+                PublishOptions::at_most_once(),
             )
             .await
             .unwrap();
+        client
     }
 
     /// The exact race #23 was filed for: a fast reconnect for the same device id
@@ -1055,13 +1042,18 @@ mod tests {
 
         let did = "dev-reconnect-race";
 
-        complete_provisioning_for(port, did).await;
+        // Held for the rest of the test: rumqttc-v4-next disconnects for real once
+        // a connection's last `AsyncClient` handle is dropped (see
+        // `complete_provisioning_for`'s doc comment), and both A and B's sessions
+        // must stay live on their own merits, not because nothing got around to
+        // closing them.
+        let _client_a = complete_provisioning_for(port, did).await;
         let client_id_a = wait_for(|| acceptor.clients_by_id.lock().get(did).copied()).await;
 
         // A fast reconnect: a second client for the same device id completes
         // provisioning (rebinding clients_by_id[did] and destroy_client()-ing A)
         // before A's own disconnect has necessarily been processed yet.
-        complete_provisioning_for(port, did).await;
+        let _client_b = complete_provisioning_for(port, did).await;
         let client_id_b = wait_for(|| {
             acceptor
                 .clients_by_id

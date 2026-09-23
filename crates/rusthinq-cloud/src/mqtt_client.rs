@@ -8,7 +8,9 @@
 //! needs and trigger its own resync.
 
 use anyhow::{Context, Result};
-use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS, Transport};
+use rumqttc::{
+    AsyncClient, Event, Incoming, LastWill, MqttOptions, PublishOptions, QoS, Transport,
+};
 use rusthinq_core::mqtt::MqttSink;
 use rusthinq_util::backoff::ExponentialBackoff;
 use std::sync::Arc;
@@ -18,10 +20,10 @@ use url::Url;
 pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
     let cfg = sink.config.clone();
     let (host, port, use_tls) = parse_mqtt_url(&cfg.mqtt_url)?;
-    let mut opts = MqttOptions::new("rusthinq-cloud", host, port);
-    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE);
+    let mut opts = MqttOptions::new("rusthinq-cloud", (host, port));
+    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE.as_secs() as u16);
     if !cfg.mqtt_user.is_empty() {
-        opts.set_credentials(&cfg.mqtt_user, &cfg.mqtt_pass);
+        opts.set_credentials(cfg.mqtt_user.clone(), cfg.mqtt_pass.clone());
     }
     let will = LastWill::new(
         format!("{}/availability", cfg.rusthinq_prefix),
@@ -35,7 +37,7 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
         opts.set_transport(Transport::tls_with_default_config());
     }
 
-    let (client, mut eventloop) = AsyncClient::new(opts, 64);
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(64).build();
 
     // Single ordered publisher task: preserves retain order for discovery bursts
     // and surfaces publish errors instead of fire-and-forget spawns.
@@ -44,7 +46,11 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
     tokio::spawn(async move {
         while let Some((topic, payload, retain)) = pub_rx.recv().await {
             if let Err(e) = client_pub
-                .publish(&topic, QoS::AtLeastOnce, retain, payload)
+                .publish(
+                    &topic,
+                    payload,
+                    PublishOptions::at_least_once().retain(retain),
+                )
                 .await
             {
                 tracing::warn!(
@@ -116,9 +122,8 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                     let _ = client
                         .publish(
                             format!("{prefix}/availability"),
-                            QoS::AtLeastOnce,
-                            true,
                             b"online".to_vec(),
+                            PublishOptions::at_least_once().retained(),
                         )
                         .await;
                     sink2.emit_discovery();
@@ -126,10 +131,11 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     // A command is an instruction for now (il-mqtt.md M-9): a retained one
                     // is a stale leftover the broker replays on every subscribe.
+                    let topic = String::from_utf8_lossy(&p.topic);
                     if p.retain {
-                        tracing::debug!(topic = %p.topic, "ignoring a retained command");
+                        tracing::debug!(%topic, "ignoring a retained command");
                     } else {
-                        sink2.handle_message(&p.topic, &p.payload);
+                        sink2.handle_message(&topic, &p.payload);
                     }
                 }
                 Ok(Event::Incoming(Incoming::Disconnect)) => {

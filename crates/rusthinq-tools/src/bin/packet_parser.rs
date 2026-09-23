@@ -74,9 +74,9 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(1883);
 
-    let mut opts = MqttOptions::new("packet-parser", host, port);
-    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE);
-    let (client, mut eventloop) = AsyncClient::new(opts, 10);
+    let mut opts = MqttOptions::new("packet-parser", (host, port));
+    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE.as_secs() as u16);
+    let (client, mut eventloop) = AsyncClient::builder(opts).capacity(10).build();
     let topic = format!("clip/message/devices/{device_id}");
     client.subscribe(&topic, QoS::AtMostOnce).await?;
 

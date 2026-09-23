@@ -231,6 +231,9 @@ async fn main() -> Result<()> {
     // feature — see bridge_handle.rs).
     #[cfg(feature = "bridge")]
     let lg_bridge: Option<Arc<Bridge>> = config.bridge.as_ref().map(|b| {
+        if let Err(e) = rusthinq_bridge::resolver::set_servers(&b.dns) {
+            tracing::warn!("bridge.dns: {e} -- falling back to the system resolver");
+        }
         let storage = Arc::new(rusthinq_bridge::JsonStorage::new(&b.storage_path));
         Bridge::new(storage)
     });

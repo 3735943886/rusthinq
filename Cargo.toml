@@ -59,7 +59,13 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
-rumqttc = "0.25"
+# Explicit MQTT 3.1.1 crate from the rumqttc-next family (keeps the `rumqttc` library
+# name, so `use rumqttc::...` is unchanged) -- needed over plain `rumqttc` 0.25 for
+# `MqttOptions::set_socket_connector`, which lets the bridge's outbound ThinQ2 MQTT
+# connection resolve through a custom DNS/DoH server (see rusthinq-bridge's
+# `resolver.rs`) while still validating TLS against the original hostname, not
+# whatever address the custom resolver connected to.
+rumqttc = { package = "rumqttc-v4-next", version = "0.34" }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

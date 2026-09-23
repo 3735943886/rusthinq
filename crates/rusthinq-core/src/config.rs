@@ -214,6 +214,16 @@ impl Port {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConfig {
     pub storage_path: String,
+    /// Resolvers for the bridge's own outbound connections to the real LG cloud
+    /// (`rusthinq_bridge::resolver`), tried in order: each entry is a DNS-over-HTTPS
+    /// URL (`https://.../dns-query`) or a plain DNS server address, optionally with a
+    /// port. Empty or absent means the system resolver -- the only reason to set this
+    /// is that the appliances typically find rusthinq through a DNS-level redirect of
+    /// the ThinQ hostnames, and the host running rusthinq usually sits behind the same
+    /// resolver; left alone, the bridge's own connections would resolve back to
+    /// rusthinq instead of the real LG cloud.
+    #[serde(default)]
+    pub dns: Vec<String>,
 }
 
 /// Rhai device-scripting support (`rusthinq-devices::scripting`). Absent `[scripting]`

@@ -56,7 +56,7 @@ async fn api_fetch_json(
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let client = reqwest::Client::new();
+    let client = crate::resolver::http_client();
     let mut req = match method {
         "POST" => client.post(url),
         _ => client.get(url),

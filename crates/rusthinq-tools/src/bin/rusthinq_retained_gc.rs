@@ -109,13 +109,14 @@ fn main() -> Result<()> {
         Duration::from_secs(args.window_secs),
     )?;
     for p in &prop_msgs {
-        if let Some((id, _property)) = reconcile::parse_property_topic(&p.topic, &prefix)
+        let topic = String::from_utf8_lossy(&p.topic);
+        if let Some((id, _property)) = reconcile::parse_property_topic(&topic, &prefix)
             && !known_ids.contains(id)
         {
             orphan_topics
                 .entry(id.to_string())
                 .or_default()
-                .push(p.topic.clone());
+                .push(topic.to_string());
         }
     }
 
@@ -132,13 +133,14 @@ fn main() -> Result<()> {
             Duration::from_secs(args.window_secs),
         )?;
         for p in &il_msgs {
-            if let Some(id) = reconcile::parse_il_topic(&p.topic, il_prefix)
+            let topic = String::from_utf8_lossy(&p.topic);
+            if let Some(id) = reconcile::parse_il_topic(&topic, il_prefix)
                 && !known_ids.contains(id)
             {
                 orphan_topics
                     .entry(id.to_string())
                     .or_default()
-                    .push(p.topic.clone());
+                    .push(topic.to_string());
             }
         }
     }

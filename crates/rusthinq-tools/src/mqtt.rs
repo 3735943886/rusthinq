@@ -7,7 +7,7 @@
 //! with a background thread draining its `Connection` ([`spawn_pump`]).
 
 use anyhow::{Result, anyhow};
-use rumqttc::{Client, Connection, Event, Incoming, MqttOptions, Publish, QoS};
+use rumqttc::{Client, Connection, Event, Incoming, MqttOptions, Publish, PublishOptions, QoS};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,9 @@ pub fn parse_host_port(host_port: &str) -> (String, u16) {
 
 pub fn connect(client_id: &str, host_port: &str) -> (Client, Connection) {
     let (host, port) = parse_host_port(host_port);
-    let mut opts = MqttOptions::new(client_id, host, port);
-    opts.set_keep_alive(Duration::from_secs(5));
-    Client::new(opts, 16)
+    let mut opts = MqttOptions::new(client_id, (host, port));
+    opts.set_keep_alive(5);
+    Client::builder(opts).capacity(16).build()
 }
 
 /// Drive `connection` on a background thread, forwarding every incoming
@@ -87,7 +87,7 @@ pub fn publish(client_id: &str, host_port: &str, topic: &str, payload: &[u8]) ->
     let (tx, _rx) = mpsc::channel();
     spawn_pump(connection, tx);
     client
-        .publish(topic, QoS::AtLeastOnce, false, payload)
+        .publish(topic, payload, PublishOptions::at_least_once())
         .map_err(|e| anyhow!("publish {topic}: {e}"))?;
     std::thread::sleep(Duration::from_millis(300));
     let _ = client.disconnect();
@@ -158,7 +158,11 @@ pub fn clear_retained_topics(client_id: &str, host_port: &str, topics: &[String]
     spawn_pump(connection, tx);
     for topic in topics {
         client
-            .publish(topic, QoS::AtLeastOnce, true, Vec::<u8>::new())
+            .publish(
+                topic,
+                Vec::<u8>::new(),
+                PublishOptions::at_least_once().retained(),
+            )
             .map_err(|e| anyhow!("clear {topic}: {e}"))?;
     }
     std::thread::sleep(Duration::from_millis(300));
@@ -201,7 +205,11 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         spawn_pump(connection, tx);
         client
-            .publish(topic, QoS::AtLeastOnce, true, b"hello-retained".to_vec())
+            .publish(
+                topic,
+                b"hello-retained".to_vec(),
+                PublishOptions::at_least_once().retained(),
+            )
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let _ = client.disconnect();
@@ -254,7 +262,11 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         spawn_pump(connection, tx);
         client
-            .publish(topic, QoS::AtLeastOnce, true, payload.to_vec())
+            .publish(
+                topic,
+                payload.to_vec(),
+                PublishOptions::at_least_once().retained(),
+            )
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let _ = client.disconnect();
@@ -277,7 +289,10 @@ mod tests {
         )
         .unwrap();
         got.sort_by(|a, b| a.topic.cmp(&b.topic));
-        let topics: Vec<&str> = got.iter().map(|p| p.topic.as_str()).collect();
+        let topics: Vec<&str> = got
+            .iter()
+            .map(|p| std::str::from_utf8(&p.topic).unwrap())
+            .collect();
         assert_eq!(
             topics,
             vec![

@@ -123,9 +123,9 @@ fn main() -> Result<()> {
     let tx_wire = tx.clone();
     thread::spawn(move || {
         while let Ok(p) = mqtt_rx.recv() {
-            let dir = if p.topic.ends_with("/raw/rx") {
+            let dir = if p.topic.ends_with(b"/raw/rx") {
                 "rx"
-            } else if p.topic.ends_with("/raw/tx") || p.topic.ends_with("/raw/clip/tx") {
+            } else if p.topic.ends_with(b"/raw/tx") || p.topic.ends_with(b"/raw/clip/tx") {
                 "tx"
             } else {
                 continue;

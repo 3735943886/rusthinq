@@ -122,7 +122,7 @@ impl Client {
         method: &str,
         body: Option<Value>,
     ) -> anyhow::Result<Value> {
-        let client = reqwest::Client::new();
+        let client = crate::resolver::http_client();
         let mut last_err: Option<reqwest::Error> = None;
         for _ in 0..4 {
             let mut req = match method {

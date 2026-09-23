@@ -60,15 +60,15 @@ impl Handle {
 /// queues outbound work until the connection is up.
 pub fn start(cfg: MqttConfig, state: Arc<Shared>) -> Result<Handle> {
     let (host, port, use_tls) = parse_mqtt_url(&cfg.mqtt_url)?;
-    let mut opts = MqttOptions::new("rusthinq-gui", host, port);
-    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE);
+    let mut opts = MqttOptions::new("rusthinq-gui", (host, port));
+    opts.set_keep_alive(rusthinq_util::MQTT_KEEP_ALIVE.as_secs() as u16);
     if !cfg.mqtt_user.is_empty() {
-        opts.set_credentials(&cfg.mqtt_user, &cfg.mqtt_pass);
+        opts.set_credentials(cfg.mqtt_user.clone(), cfg.mqtt_pass.clone());
     }
     if use_tls {
         opts.set_transport(Transport::tls_with_default_config());
     }
-    let (client, eventloop) = AsyncClient::new(opts, 64);
+    let (client, eventloop) = AsyncClient::builder(opts).capacity(64).build();
     let (events_tx, _) = broadcast::channel(256);
 
     let handle = Handle {
