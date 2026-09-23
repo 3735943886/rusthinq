@@ -15,13 +15,19 @@ use std::sync::Arc;
 pub struct T2HttpState {
     pub config: Arc<Config>,
     pub ca: Arc<Ca>,
+    /// What `/route/certificate` hands out: the builtin CA's own certificate, unless
+    /// `custom_root_cert_file` (config.rs) points `main.rs` at a reverse proxy's root
+    /// instead. Devices still get certificates signed by `ca` either way -- this only
+    /// changes what they're told to trust.
+    pub root_certificate: Arc<str>,
     pub csr_gate: Arc<CsrGate>,
 }
 
-pub fn routes(config: Arc<Config>, ca: Arc<Ca>) -> Router {
+pub fn routes(config: Arc<Config>, ca: Arc<Ca>, root_certificate: impl Into<Arc<str>>) -> Router {
     let state = T2HttpState {
         config,
         ca,
+        root_certificate: root_certificate.into(),
         csr_gate: Arc::new(CsrGate::new()),
     };
     Router::new()
@@ -86,7 +92,7 @@ async fn route_certificate(
     if q.name.is_some() {
         Json(json!({
             "resultCode": "0000",
-            "result": { "certificatePem": state.ca.cert_pem }
+            "result": { "certificatePem": &*state.root_certificate }
         }))
     } else {
         Json(json!({
@@ -250,11 +256,48 @@ mod tests {
     fn test_state() -> T2HttpState {
         let (key_path, cert_path) = crate::certs::test_support::temp_ca_paths();
         let ca = crate::certs::test_support::fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let root_certificate: Arc<str> = ca.cert_pem.clone().into();
         T2HttpState {
             config: Arc::new(test_config(false)),
             ca: Arc::new(ca),
+            root_certificate,
             csr_gate: Arc::new(CsrGate::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn route_certificate_serves_the_ca_by_default() {
+        let state = test_state();
+        let expected = state.ca.cert_pem.clone();
+        let Json(body) = route_certificate(
+            State(state),
+            Query(CertQuery {
+                name: Some("common-server".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(body["result"]["certificatePem"], json!(expected));
+    }
+
+    /// `custom_root_cert_file` (config.rs) points devices at a different root than the
+    /// builtin CA -- e.g. a reverse proxy's -- without changing what signs their own
+    /// certificates (still `state.ca`, exercised in `device_certificate_signs_a_real_csr`).
+    #[tokio::test]
+    async fn route_certificate_serves_a_configured_custom_root_instead_of_the_ca() {
+        let mut state = test_state();
+        state.root_certificate = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+            .to_string()
+            .into();
+        let expected = state.root_certificate.to_string();
+        let Json(body) = route_certificate(
+            State(state.clone()),
+            Query(CertQuery {
+                name: Some("common-server".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(body["result"]["certificatePem"], json!(expected));
+        assert_ne!(expected, state.ca.cert_pem);
     }
 
     fn real_csr_pem() -> String {

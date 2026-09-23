@@ -21,6 +21,9 @@ let reconnectTimer
 const STATUS_OK = `<i class="tiny material-icons green-text">check</i>`
 const STATUS_ERROR = `<i class="tiny material-icons red-text">error</i>`
 const STATUS_UNKNOWN = `<i class="tiny material-icons red-text">question_mark</i>`
+// Not an error: the bridge feature is compiled in, but rusthinq-cloud's own [bridge]
+// config section is absent, so there's no LG account to log into at all.
+const STATUS_DISABLED = `<i class="tiny material-icons grey-text">block</i>`
 let bridge_status = false
 // Whether this build could possibly map *any* device (scripting compiled in)
 // -- gates the per-device "no script handler" warning,
@@ -387,7 +390,13 @@ function connect() {
 
             if (typeof json.bridge === 'object' && json.bridge !== null) {
                 bridge_status = json.bridge.loggedIn
-                if (json.bridge.loggedIn === true) {
+                if (json.bridge.loggedIn === null) {
+                    document.getElementById('btn_thinq_login').classList.add('hide')
+                    document.getElementById('btn_thinq_logout').classList.add('hide')
+
+                    get('status_bridge').innerHTML = STATUS_DISABLED
+                    get('status_bridge_text').innerText = 'Disabled by configuration file'
+                } else if (json.bridge.loggedIn === true) {
                     document.getElementById('btn_thinq_login').classList.add('hide')
                     document.getElementById('btn_thinq_logout').classList.remove('hide')
 

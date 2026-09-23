@@ -13,6 +13,14 @@
             })();
         </script>
         <style>
+            /* Materialize sets dark text but no background, which leaves the canvas transparent.
+               Standalone the browser paints it white, but embedded -- in a Home Assistant ingress
+               iframe, say -- a dark host page shows through and the text becomes unreadable. */
+            :root {
+                color-scheme: light;
+                background: #fff;
+            }
+
             /*
              * Materialize only repositions a tooltip's floating div when it opens - closing it just
              * fades it out in place. If the devices table's column widths shift afterwards (another

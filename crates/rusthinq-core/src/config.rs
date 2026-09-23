@@ -295,6 +295,15 @@ pub struct RawConfig {
     pub mqtt: MqttConfig,
     pub ca_key_file: String,
     pub ca_cert_file: String,
+    /// The root certificate handed to devices at `/route/certificate` during
+    /// provisioning, in place of the builtin CA's own certificate. Only useful
+    /// running behind a reverse TLS proxy whose own certificate doesn't chain to
+    /// the builtin CA -- point this at whatever validates the proxy's certificate
+    /// instead. rusthinq's own listeners, and the certificates it signs for
+    /// devices, are unaffected either way; devices cache what they were given, so
+    /// changing this does not reach already-paired ones.
+    #[serde(default)]
+    pub custom_root_cert_file: Option<String>,
     pub https_port: PortSpec,
     pub mqtts_port: PortSpec,
     /// Optional unencrypted HTTP listener alongside `https_port`, for a reverse proxy
@@ -339,6 +348,7 @@ pub struct Config {
     pub mqtt: MqttConfig,
     pub ca_key_file: String,
     pub ca_cert_file: String,
+    pub custom_root_cert_file: Option<String>,
     pub https_port: Port,
     pub mqtts_port: Port,
     pub http_port: Option<PlainPortSpec>,
@@ -388,6 +398,7 @@ pub fn normalize(raw: RawConfig) -> Config {
         mqtt: raw.mqtt,
         ca_key_file: raw.ca_key_file,
         ca_cert_file: raw.ca_cert_file,
+        custom_root_cert_file: raw.custom_root_cert_file,
         https_port: raw.https_port.into(),
         mqtts_port: raw.mqtts_port.into(),
         http_port: raw.http_port,

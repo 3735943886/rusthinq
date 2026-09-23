@@ -99,6 +99,14 @@ with `rethink-cloud`/`rethink-setup` there corresponding to `rusthinq-cloud`/`ru
 The [wiki](https://github.com/anszom/rethink/wiki) is also the best source for
 protocol/device reverse-engineering notes in general.
 
+In bridge mode, a device's name (as cached from the LG account and exposed via
+`Bridge::name`) is refreshed from LG every 15 minutes
+(`run_name_refresh_loop`/`NAME_REFRESH_INTERVAL` in `crates/rusthinq-bridge/src/lib.rs`) —
+renaming a device in the official app is not picked up immediately, only on the next
+periodic refresh. The only things that trigger an immediate refresh are a fresh LG
+account login and a rusthinq restart (the refresh loop does one refresh right away on
+start); enabling/registering a device by itself does not.
+
 ## Build & run
 
 Requirements: Rust **1.88+**, OpenSSL CLI (CA / device CSR signing).

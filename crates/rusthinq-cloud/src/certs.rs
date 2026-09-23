@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rusthinq_util::sync::Mutex;
 use std::collections::HashMap;
@@ -50,12 +50,47 @@ fn try_load(hostname: &str, key_path: &Path, cert_path: &Path) -> Result<Ca> {
         );
         bail!("CA certificate subject/SAN does not match hostname {hostname:?}");
     }
+    // A key that doesn't belong to this cert is worse than a hostname mismatch:
+    // `mint_leaf` would go on signing every leaf with it, producing certificates
+    // that fail to chain to the CA actually being handed out at
+    // `/route/certificate`, indistinguishable from random TLS failures. Detected
+    // the same way a hostname mismatch is (bail here, `load_or_create` recreates)
+    // rather than as a separate hard-failure mode -- e.g. `ca.key`/`ca.cert` from
+    // two different runs ending up side by side after a manual copy.
+    if !keypair_matches_cert(&key_pem, &cert_pem) {
+        rusthinq_core::logging::log(
+            "status",
+            &[&format!(
+                "Existing CA key at {} does not belong to the certificate at {}; recreating both",
+                key_path.display(),
+                cert_path.display()
+            )],
+        );
+        bail!("CA private key does not belong to the CA certificate");
+    }
     Ok(Ca {
         key_pem,
         cert_pem,
         key_path: key_path.to_path_buf(),
         cert_path: cert_path.to_path_buf(),
     })
+}
+
+/// Whether `key_pem` is the private key that signed `cert_pem` -- compares public
+/// keys rather than re-verifying a signature, so it works the same for both the
+/// openssl (RSA) and rcgen (EC) creation paths. A key or cert that fails to parse
+/// counts as not matching, same as [`cert_covers_hostname`]'s parse failures.
+fn keypair_matches_cert(key_pem: &str, cert_pem: &str) -> bool {
+    let Ok(key) = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()) else {
+        return false;
+    };
+    let Ok(cert) = openssl::x509::X509::from_pem(cert_pem.as_bytes()) else {
+        return false;
+    };
+    let Ok(cert_public_key) = cert.public_key() else {
+        return false;
+    };
+    key.public_eq(&cert_public_key)
 }
 
 /// Whether `cert_pem`'s subject CommonName or a subjectAltName DNSName equals
@@ -89,6 +124,24 @@ fn cert_covers_hostname(cert_pem: &str, hostname: &str) -> bool {
                 .any(|name| matches!(name, x509_parser::extensions::GeneralName::DNSName(n) if *n == hostname))
         });
     cn_matches || san_matches
+}
+
+/// Read and sanity-check a custom `custom_root_cert_file` (config.rs) at startup, not per
+/// request: a missing or unusable file should stop rusthinq before it ever hands a device a
+/// broken trust anchor, not fail silently down the line. Only the first PEM block is parsed,
+/// as a check that the file really is a certificate; it's still served byte-for-byte.
+pub fn load_root_certificate(path: &Path) -> Result<String> {
+    let pem = fs::read_to_string(path)
+        .with_context(|| format!("read custom_root_cert_file {}", path.display()))?;
+    let ders = rustls_pemfile::certs(&mut pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("{} is not a certificate", path.display()))?;
+    let der = ders
+        .first()
+        .with_context(|| format!("{} contains no certificate", path.display()))?;
+    x509_parser::parse_x509_certificate(der)
+        .with_context(|| format!("{} is not a certificate", path.display()))?;
+    Ok(pem)
 }
 
 fn create_with_openssl(hostname: &str, key_path: &Path, cert_path: &Path) -> Result<()> {
@@ -396,15 +449,59 @@ pub async fn accept_device_tls(
 /// A serial no other certificate of ours will carry. Certificates from one issuer
 /// are identified by their serial, so a fixed one would mean every appliance holds
 /// a certificate claiming to be the same one. The top bit is cleared so openssl,
-/// which reads this as a signed big-endian integer, doesn't see it as negative.
-fn random_serial() -> String {
+/// which reads this as a signed big-endian integer, doesn't see it as negative
+/// (rcgen's `SerialNumber` wants the same big-endian-positive shape).
+fn random_serial_bytes() -> [u8; 16] {
     let mut bytes = *uuid::Uuid::new_v4().as_bytes();
     bytes[0] &= 0x7f;
-    format!("0x{}", rusthinq_util::hex::encode(bytes))
+    bytes
 }
 
-/// Sign a device CSR with the CA (openssl x509 -req, matching TypeScript).
+fn random_serial() -> String {
+    format!("0x{}", rusthinq_util::hex::encode(random_serial_bytes()))
+}
+
+/// Sign a device CSR with the CA, in-process (rcgen) when possible, falling back to
+/// [`sign_csr_openssl`] for a CSR shape rcgen's parser doesn't recognize (its
+/// extension support is narrower than openssl's) — the appliance still gets a
+/// certificate either way, at the cost of one subprocess spawn instead of zero.
 pub async fn sign_csr(ca: &Ca, csr_pem: &str) -> Result<String> {
+    match sign_csr_in_process(ca, csr_pem) {
+        Ok(pem) => Ok(pem),
+        Err(e) => {
+            rusthinq_core::logging::log(
+                "status",
+                &[&format!(
+                    "in-process CSR signing failed ({e:#}); falling back to openssl"
+                )],
+            );
+            sign_csr_openssl(ca, csr_pem).await
+        }
+    }
+}
+
+/// Sign a device CSR with the CA, entirely in-process (no subprocess). Only the
+/// CSR's subject and public key are used — like bare `openssl x509 -req` (no
+/// `-copy_extensions`), any extensions the CSR itself requested (SAN, key usage,
+/// …) are dropped rather than carried into the issued certificate, so switching
+/// from the openssl subprocess to this doesn't change what devices are handed.
+fn sign_csr_in_process(ca: &Ca, csr_pem: &str) -> Result<String> {
+    let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
+    csr.params.is_ca = IsCa::NoCa;
+    csr.params.key_usages.clear();
+    csr.params.extended_key_usages.clear();
+    csr.params.subject_alt_names.clear();
+    csr.params.serial_number = Some(random_serial_bytes().to_vec().into());
+
+    let ca_key_pair = KeyPair::from_pem(&ca.key_pem).context("parse CA key")?;
+    let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, ca_key_pair).context("parse CA cert")?;
+    let cert = csr.signed_by(&issuer).context("sign CSR")?;
+    Ok(cert.pem())
+}
+
+/// Sign a device CSR with the CA via a subprocess (openssl x509 -req) — the
+/// original implementation, kept as [`sign_csr`]'s fallback.
+async fn sign_csr_openssl(ca: &Ca, csr_pem: &str) -> Result<String> {
     let mut child = Command::new("openssl")
         .args([
             "x509",
@@ -548,6 +645,29 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    #[test]
+    fn load_root_certificate_reads_back_a_real_cert_verbatim() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        let loaded = load_root_certificate(&cert_path).expect("load a real certificate");
+        assert_eq!(loaded, ca.cert_pem);
+    }
+
+    /// A missing or unusable `custom_root_cert_file` must fail startup outright, not
+    /// hand a device a broken trust anchor the first time it asks.
+    #[test]
+    fn load_root_certificate_rejects_a_missing_file() {
+        let (_key_path, cert_path) = temp_ca_paths();
+        assert!(load_root_certificate(&cert_path).is_err());
+    }
+
+    #[test]
+    fn load_root_certificate_rejects_a_file_that_is_not_a_certificate() {
+        let (_key_path, cert_path) = temp_ca_paths();
+        fs::write(&cert_path, "not a certificate").unwrap();
+        assert!(load_root_certificate(&cert_path).is_err());
+    }
+
     /// The regression this test exists for: every appliance certificate used to carry
     /// the same fixed `-set_serial 0100`, so certificates from our CA could only be
     /// told apart by inspecting more than the serial — a serial is supposed to be
@@ -617,6 +737,36 @@ mod tests {
         );
     }
 
+    /// Mirrors upstream's "a key belonging to another CA is refused" case (rusthinq
+    /// issue #46's investigation): a `ca.key` from one CA sitting next to a
+    /// `ca.cert` from another (e.g. after a partial manual copy) must not be
+    /// silently accepted as a working CA.
+    #[test]
+    fn try_load_rejects_a_key_that_does_not_belong_to_the_certificate() {
+        let (key_path_a, cert_path_a) = temp_ca_paths();
+        let (key_path_b, cert_path_b) = temp_ca_paths();
+        fast_test_ca("rusthinq.local", &key_path_a, &cert_path_a);
+        fast_test_ca("rusthinq.local", &key_path_b, &cert_path_b);
+
+        // cert_a paired with key_b: same hostname, unrelated keypairs.
+        assert!(
+            try_load("rusthinq.local", &key_path_b, &cert_path_a).is_err(),
+            "a key belonging to a different CA must be refused, not silently trusted"
+        );
+    }
+
+    #[test]
+    fn keypair_matches_cert_true_for_a_real_pair_false_for_a_mismatched_one() {
+        let (key_path_a, cert_path_a) = temp_ca_paths();
+        let (key_path_b, cert_path_b) = temp_ca_paths();
+        let ca_a = fast_test_ca("rusthinq.local", &key_path_a, &cert_path_a);
+        let ca_b = fast_test_ca("rusthinq.local", &key_path_b, &cert_path_b);
+
+        assert!(keypair_matches_cert(&ca_a.key_pem, &ca_a.cert_pem));
+        assert!(!keypair_matches_cert(&ca_b.key_pem, &ca_a.cert_pem));
+        assert!(!keypair_matches_cert("not a key", &ca_a.cert_pem));
+    }
+
     #[test]
     fn cert_covers_hostname_matches_cn_only_certs_like_the_openssl_path() {
         // Mimics `openssl req -subj "/CN={hostname}"`: CN set, no SAN extension —
@@ -648,6 +798,55 @@ mod tests {
             .expect("serialize CSR")
             .pem()
             .expect("CSR to PEM")
+    }
+
+    /// #45: replacing the `openssl x509 -req` subprocess with in-process (rcgen)
+    /// signing must not start carrying the CSR's own requested extensions into the
+    /// issued certificate -- bare `openssl x509 -req` (no `-copy_extensions`) always
+    /// dropped them, and every already-paired device has only ever gotten a leaf
+    /// signed that way.
+    #[tokio::test]
+    async fn sign_csr_produces_a_leaf_chaining_to_the_ca_without_the_csrs_own_san() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        // test_csr_pem() requests a `device.local` SAN -- must not survive signing.
+        let pem = sign_csr(&ca, &test_csr_pem()).await.expect("sign CSR");
+
+        let leaf = openssl::x509::X509::from_pem(pem.as_bytes()).expect("parse signed leaf");
+        let ca_x509 = openssl::x509::X509::from_pem(ca.cert_pem.as_bytes()).expect("parse CA");
+        assert!(
+            leaf.verify(&ca_x509.public_key().unwrap()).unwrap(),
+            "leaf must be signed by the CA"
+        );
+        assert!(
+            !pem.contains("device.local"),
+            "the CSR's own SAN must be dropped, not carried into the issued certificate"
+        );
+    }
+
+    /// A CSR rcgen's narrower extension support can't parse (or any other in-process
+    /// parse failure) must still get the appliance a certificate: `sign_csr` falls
+    /// back to the openssl subprocess rather than failing provisioning outright. The
+    /// openssl path itself is exercised directly since crafting a real CSR that
+    /// only rcgen chokes on isn't practical here.
+    #[tokio::test]
+    async fn sign_csr_falls_back_to_openssl_when_in_process_signing_cannot_parse_the_csr() {
+        let (key_path, cert_path) = temp_ca_paths();
+        let ca = fast_test_ca("rusthinq.test", &key_path, &cert_path);
+        assert!(sign_csr_in_process(&ca, "not a csr").is_err());
+
+        if std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: openssl not found on PATH");
+            return;
+        }
+        let pem = sign_csr_openssl(&ca, &test_csr_pem())
+            .await
+            .expect("openssl fallback must still sign a real CSR");
+        assert!(pem.contains("BEGIN CERTIFICATE"));
     }
 
     /// #26: `/device/{id}/certificate` spawned a real `openssl` subprocess per request

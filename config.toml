@@ -8,6 +8,19 @@ hostname = "rusthinq.local" # this can't be an IP address
 ca_key_file = "ca.key" # created on first run if missing
 ca_cert_file = "ca.cert" # created on first run if missing
 
+# During provisioning each device fetches a root certificate from rusthinq and keeps it to
+# validate its TLS connections. By default this is the builtin CA above, which is what a
+# typical configuration wants.
+#
+# If rusthinq sits behind a reverse HTTPS/TLS proxy, the certificate that proxy presents has
+# to chain to whatever was distributed here. Either derive the proxy's certificate from
+# rusthinq's CA and leave this commented out, or point this at the root certificate that
+# validates the proxy's. It changes nothing else: rusthinq's own listeners, and the
+# certificates it signs for devices, still come from the builtin CA.
+#
+# Devices cache what they were given, so changing this does not reach already-paired ones.
+# custom_root_cert_file = "root.cert"
+
 # Override bind vs. advertised port/address when forwarding or redirection changes what
 # devices connect to vs. what rusthinq listens on:
 #   https_port = { bind = 4433, advertise = 443 }

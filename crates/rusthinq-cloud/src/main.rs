@@ -106,6 +106,10 @@ async fn main() -> Result<()> {
         .join(&config.ca_cert_file)
         .to_string_lossy()
         .into();
+    config.custom_root_cert_file = config
+        .custom_root_cert_file
+        .as_ref()
+        .map(|p| config_dir.join(p).to_string_lossy().into_owned());
     if let Some(ref mut bridge) = config.bridge {
         bridge.storage_path = config_dir
             .join(&bridge.storage_path)
@@ -161,6 +165,16 @@ async fn main() -> Result<()> {
         Path::new(&config.ca_cert_file),
     )?;
     logging::log("status", &["CA certificate ready"]);
+
+    // What devices are told to trust at `/route/certificate`: the builtin CA unless a
+    // reverse TLS proxy in front of rusthinq presents a certificate from some other
+    // chain and its root was configured. Read now, not per request -- a missing or
+    // unusable file should stop rusthinq at startup rather than hand out a broken
+    // trust anchor once a device asks.
+    let root_certificate = match &config.custom_root_cert_file {
+        Some(path) => certs::load_root_certificate(Path::new(path))?,
+        None => ca.cert_pem.clone(),
+    };
 
     let manager = devmgr::DeviceManager::new();
     let known_devices = known_devices::KnownDevices::new(Some(known_devices_path));
@@ -524,7 +538,7 @@ async fn main() -> Result<()> {
     // when `https_port` itself is unbound (a reverse proxy terminating TLS).
     let ca_arc = Arc::new(ca.clone());
     let cfg_arc = Arc::new(config.clone());
-    let t2_router = thinq2::provisioning::routes(cfg_arc, ca_arc);
+    let t2_router = thinq2::provisioning::routes(cfg_arc, ca_arc, root_certificate);
 
     // HTTPS ThinQ2 provisioning (/route, certificate, …)
     if let Some(ssl_acceptor) = device_tls.clone()

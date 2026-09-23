@@ -66,9 +66,15 @@ impl Shared {
     /// sends it to every `/ws` subscriber.
     fn recompute(&self) {
         let raw = self.last_raw.lock().clone();
+        // Present (even if `null`) means devlist.rs actually reported bridge state --
+        // `null` there means rusthinq-cloud's own `[bridge]` config section is absent
+        // (disabled by configuration, not merely "not logged in yet"), which
+        // `panel.js` needs to tell apart from `loggedIn: false`. Only the *key*'s
+        // absence entirely (before the first snapshot ever arrives) collapses to no
+        // `bridge` object at all.
         let bridge = raw
             .get("bridgeLoggedIn")
-            .filter(|v| !v.is_null())
+            .cloned()
             .map(|logged_in| json!({ "loggedIn": logged_in }));
         let translated = json!({
             "mqtt": raw.get("mqtt").cloned().unwrap_or(Value::Bool(false)),
@@ -178,10 +184,25 @@ mod tests {
         assert_eq!(shared.current()["mqtt"], json!(true));
     }
 
+    /// `bridgeLoggedIn: null` means rusthinq-cloud's own `[bridge]` config section is
+    /// absent -- disabled by configuration, not merely "not logged in yet" -- and
+    /// `panel.js` shows a distinct "Disabled" status for it (`bridge.loggedIn ===
+    /// null`, vs. `false` for "configured but not logged in"). It must still come
+    /// through as `{loggedIn: null}`, not collapse to a top-level `null` the way
+    /// "no snapshot has arrived yet" does (see `default_snapshot`).
     #[test]
-    fn set_snapshot_leaves_bridge_null_when_bridge_logged_in_is_null() {
+    fn set_snapshot_reports_bridge_logged_in_null_as_disabled_not_absent() {
         let shared = Shared::new();
         shared.set_snapshot(br#"{"mqtt":false,"bridgeLoggedIn":null,"devices":{}}"#);
+        assert_eq!(shared.current()["bridge"], json!({"loggedIn": null}));
+    }
+
+    /// Before the first devlist.rs payload ever arrives, there's no `bridgeLoggedIn`
+    /// key at all (`last_raw` starts as `{}`) -- that's the one case that still
+    /// collapses to a top-level `null` `bridge`, matching `default_snapshot`.
+    #[test]
+    fn bridge_is_null_before_any_snapshot_has_arrived() {
+        let shared = Shared::new();
         assert_eq!(shared.current()["bridge"], Value::Null);
     }
 

@@ -267,3 +267,35 @@ fn test_night_glare_cannot_be_written() {
     expect_eq(d.sent().len(), n);
     expect(d.event("reject") != (), "a reject event is published");
 }
+
+// Two real captures of the unprompted ~15-minute 0xC5 report, spanning a live door test
+// (both freezer doors, then the fridge door, opened and closed once each): offset 9 (fridge)
+// moved 14 -> 15, offset 15 (freezer) moved 10 -> 12, matching the LG app's own per-compartment
+// counts for that hour exactly.
+fn test_door_open_counts_before_the_door_test() {
+    let d = device();
+    d.feed("AA2010C50C0401000000000E03000000000A11000000033A13000000009C9DBB");
+    expect_props(d, #{ door_open_count_fridge: "14", door_open_count_freezer: "10" });
+}
+
+fn test_door_open_counts_after_the_door_test() {
+    let d = device();
+    d.feed("AA2010C5110401000100000F03000200000C11000400033E1300060000A2B2BB");
+    expect_props(d, #{ door_open_count_fridge: "15", door_open_count_freezer: "12" });
+}
+
+// Two real captures of the unprompted ~15-minute 0x3E report, taken ~48 minutes apart with no
+// door or setting changes in between (just the compressor running): the cumulative total
+// climbed from 234 to 312, confirmed against the LG app's own energy-monitoring figure at a
+// later point in the same sequence (503 on the wire, 503 Wh in the app).
+fn test_energy_today_first_reading() {
+    let d = device();
+    d.feed("AA0B103E001E00EA0747BB");
+    expect_props(d, #{ energy_today: "234" });
+}
+
+fn test_energy_today_climbs_with_no_state_change() {
+    let d = device();
+    d.feed("AA0B103E001E01380A31BB");
+    expect_props(d, #{ energy_today: "312" });
+}

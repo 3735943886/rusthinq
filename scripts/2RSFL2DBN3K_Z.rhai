@@ -3,6 +3,21 @@
 // app sends on connect. Frames are discriminated by inner bytes 0-1 (always 0x10, then):
 //   0xEB  the answer to the query: one status record
 //   0xEC  a spontaneous update: the previous record then the current one, stacked
+//   0xC5  an unprompted report the appliance sends on its own every ~15 minutes (never asked
+//         for): a 28-byte record, mostly unidentified, but offsets 9 and 15 are confirmed live
+//         as today's cumulative fridge-door and freezer-door open counts (see door_stats()) --
+//         this is where the LG app's per-compartment door-open counts actually come from; the
+//         0xEC/0xEB status record carries only a single "any door open" bit (offset 7 below),
+//         with no per-compartment information anywhere in it
+//   0x3E  a second unprompted report on the same ~15-minute cadence, 7 bytes: a big-endian
+//         uint16 (offsets 2-3) that is this report's energy delta, a big-endian uint16
+//         (offsets 4-5) that is the running total for the day (each report's total is exactly
+//         the previous total plus that report's delta -- confirmed exactly across 12 live
+//         reports), and a one-byte sequence number (offset 6, increments with every report,
+//         shared with nothing else). The running total matches the LG app's own "전력
+//         사용량" (energy monitoring) figure exactly (503 on the wire, 503 Wh in the app), so
+//         the unit is Wh and this is genuinely the appliance's power consumption -- see
+//         energy_today() below. Resets on some cycle not yet observed, presumably daily
 //
 // Status record offsets (index within the record, matching this model's own field layout;
 // the fields beyond these were never exercised in a real capture, so only these are
@@ -13,7 +28,12 @@
 //   3  expressFreeze    -- 1 off, 2 on
 //   7  anyDoorOpen      -- 1 open; 0 and (per this model family's own documentation) 2 both
 //                          mean closed, so only 1 counts, matching the value this driver
-//                          reports
+//                          reports. Confirmed live it really is just one shared bit: opening
+//                          and closing three different physical doors in a row (both freezer
+//                          doors, then the fridge door) produced six identical transitions on
+//                          this one byte and nothing else changed anywhere in the record --
+//                          the per-compartment counts the LG app shows come from the 0xC5
+//                          report instead (see door_stats() below), not from here
 //   8  tempUnit         -- 0 Fahrenheit, 1 Celsius; the unit the appliance's own display
 //                          (and so its wire encoding) is currently set to
 //   17 smartCare        -- 0 off, 1 on. Offset 4 moves in lockstep (2 when off, 7 when on --
@@ -111,6 +131,14 @@ fn descriptor(ctx) {
                                   min: freezer_min(u), max: freezer_max(u), step: 1, label: "Freezer temperature" },
             express_freeze: #{ type: "binary", rw: true, label: "Express freeze" },
             door: #{ type: "binary", class: "door" },
+            // Cumulative for the current day (matches the LG app's own "1일" door-open-count
+            // view); resets at some point not yet observed, presumably midnight.
+            door_open_count_fridge: #{ type: "number", label: "Fridge compartment door opens today" },
+            door_open_count_freezer: #{ type: "number", label: "Freezer compartment door opens today" },
+            // Confirmed live against the LG app's own energy-monitoring figure (503 on the
+            // wire, 503 Wh in the app). Cumulative for the current day, same as the door
+            // counts above; resets on some cycle not yet observed.
+            energy_today: #{ type: "number", class: "energy", unit: "Wh", label: "Energy used today" },
             smart_care: #{ type: "binary", label: "Smart Care+" },
             night_glare: #{ type: "select", options: ["off", "sunset_to_sunrise", "custom_schedule"],
                             label: "Night glare prevention" },
@@ -145,7 +173,22 @@ fn on_data(ctx, data) {
         let block = inner.len() - 2;
         if block < 18 { return; }
         status(ctx, inner, 2);
+    } else if inner[1] == 0xc5 {
+        if inner.len() < 16 { return; }
+        door_stats(ctx, inner);
+    } else if inner[1] == 0x3e {
+        if inner.len() < 6 { return; }
+        ctx.publish_property("energy_today", (inner[4] * 256 + inner[5]).to_string());
     }
+}
+
+// The unprompted ~15-minute report; only offsets 9 and 15 are understood (see the frame-family
+// comment at the top of this file). The other bytes that move alongside them, confirmed live,
+// are not published: two more counters whose deltas (this report's door test moved them by 4
+// and 6) do not match either door count or their sum, so what they count is not identified.
+fn door_stats(ctx, r) {
+    ctx.publish_property("door_open_count_fridge", r[9].to_string());
+    ctx.publish_property("door_open_count_freezer", r[15].to_string());
 }
 
 fn status(ctx, r, o) {
