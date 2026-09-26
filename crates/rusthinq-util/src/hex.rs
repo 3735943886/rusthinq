@@ -45,19 +45,14 @@ fn nibble(c: u8) -> Option<u8> {
 /// Decode a hex string (even length, no `0x` prefix). Whitespace is not allowed
 /// (callers that accept mixed input should strip first).
 pub fn decode(s: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
-    let bytes = s.as_ref();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut pairs = bytes.chunks_exact(2);
-    for pair in pairs.by_ref() {
-        let &[h, l] = pair else {
-            return Err(DecodeError);
-        };
-        out.push((nibble(h).ok_or(DecodeError)? << 4) | nibble(l).ok_or(DecodeError)?);
-    }
-    if !pairs.remainder().is_empty() {
+    let (pairs, rest) = s.as_ref().as_chunks::<2>();
+    if !rest.is_empty() {
         return Err(DecodeError);
     }
-    Ok(out)
+    pairs
+        .iter()
+        .map(|&[h, l]| Ok((nibble(h).ok_or(DecodeError)? << 4) | nibble(l).ok_or(DecodeError)?))
+        .collect()
 }
 
 #[cfg(test)]
