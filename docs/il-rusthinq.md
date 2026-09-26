@@ -4,7 +4,8 @@ rusthinq-specific notes for running drivers of the IL (a separate specification
 repository). rusthinq does device → IL only: a driver is a Rhai script, and every consumer
 of the IL (Home Assistant, Matter, …) is an external project.
 
-Writing one? See [writing-a-driver.md](writing-a-driver.md) for the step-by-step.
+The drivers themselves live in their own repository, [rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts). Writing
+one? See its [docs/writing-a-driver.md](https://github.com/3735943886/rusthinq-scripts/blob/main/docs/writing-a-driver.md) for the step-by-step.
 
 ## What a driver is here
 
@@ -60,9 +61,7 @@ Timers are requests: the script never sleeps or spawns anything. The host arms o
 per timer that holds only a weak reference to the device, and a re-armed or cancelled
 timer never fires. `cancel_pending_work` / `drop_device` clear them all.
 
-The washer / dryer / styler family shares `scripts/monitoring_common.rhai` (record parsing for the 0xEC / 0xEB / 0xE2 frames, command acknowledgements reported as rejections, the course a Start will ask for), which itself imports `aabb_common`.
-
-AABB drivers share `scripts/aabb_common.rhai` (`import "aabb_common" as c;`): frame check, name/flag/bit helpers, reject.
+Drivers share modules (`aabb_common`, `monitoring_common`, `tlv_common`, each imported with `import "<name>" as c;`) that sit beside them in the drivers repository.
 
 Pure helpers for AABB devices: `aabb_wrap(inner)` (array or blob) and `aabb_unwrap(frame)` (`()` if not `AA..BB`; the checksum is not validated, as elsewhere).
 
@@ -73,7 +72,7 @@ state frame, or `()`) and `tlv_frame_build(header, tlvs)` (header and CRC includ
 
 ```toml
 [scripting]
-rhai_dir = "./scripts"
+rhai_dir = "./rusthinq-scripts"
 il_prefix = "il"      # unset (the default) = descriptors are not published
 ```
 
@@ -88,19 +87,18 @@ Forgetting a device (`<rusthinq_prefix>/<id>/forget/set`) also clears its retain
 
 ## Testing
 
-A driver's tests are written in Rhai and live beside it, so a driver and its tests can be
-kept apart from the Rust source (in their own repository, say): `scripts/tests/<Model>.test.rhai`
-tests `scripts/<Model>.rhai`. Every zero-argument `test_*` function in it is one test, run
-against a fresh device; it fails on the first failed `expect*` or runtime error. Run them with
+A driver's tests are written in Rhai and live beside it in the drivers repository:
+`tests/<Model>.test.rhai` tests `<Model>.rhai`. Every zero-argument `test_*` function in it is
+one test, run against a fresh device; it fails on the first failed `expect*` or runtime error.
+Run them, and the checks every driver must pass (a test file per driver, a descriptor well
+formed against the IL), from this repository with
 
 ```
-cargo run -p rusthinq-devices --features scripting --bin rusthinq-script-test -- scripts
+cargo run -p rusthinq-devices --features scripting --bin rusthinq-script-test -- <drivers dir>
 ```
-
-(or `cargo test`, which runs the same files and also checks that every driver has tests).
 
 ```rhai
-import "tlv_test" as t;                       // helpers in scripts/tests/
+import "tlv_test" as t;                       // helpers in the drivers' tests/ directory
 
 fn caps() { "0000…" }                          // captured frames (functions: constants are not visible)
 fn test_target_write_attaches_power_and_mode() {
@@ -117,7 +115,7 @@ look at what happened, `property(name)`, `event(name)`, `script_error()`, `sent(
 as blobs), `sent_tlvs(i)`, `timers()`, `clips()`, `descriptor()`. Assertions are `expect(cond,
 msg)`, `expect_eq(actual, expected[, msg])` and `expect_props(dev, #{prop: "value"})`. Everything a
 driver can call (`hex_encode`, `tlv_frame_build`, `aabb_wrap`, …) is available to a test too.
-`tests/tlv_test.rhai` and `tests/aabb_test.rhai` hold the helpers shared by the TLV and AABB
+In the drivers repository, `tests/tlv_test.rhai` and `tests/aabb_test.rhai` hold the helpers shared by the TLV and AABB
 drivers. Tests run against frames captured from real appliances wherever there is one.
 
 The host's own behaviour (timers, host-side command validation, the descriptor binding) is
@@ -127,21 +125,5 @@ next to this one.
 
 ## Drivers
 
-| model | script | status |
-|---|---|---|
-| DHUM_056905_WW (LG dehumidifier) | `scripts/DHUM_056905_WW.rhai` | tested against captured frames; not yet run against the live appliance |
-| AIR_910604_WW (LG air purifier) | `scripts/AIR_910604_WW.rhai` | same |
-| 1WPU4CIGCR__2 (LG water purifier, AABB) | `scripts/1WPU4CIGCR__2.rhai` | tested against real captured frames and the write frames the appliance accepted (both from rethink's test suite); not yet run live |
-| D140110 (LG dishwasher, AABB, read-only) | `scripts/D140110.rhai` | tested against nine real frames of a full cycle (from rethink's test suite); not yet run live |
-| WBEY3GT (LG cooktop, AABB) | `scripts/WBEY3GT.rhai` | tested against real frames and the command frames the LG app sent, byte for byte; not yet run live. Writes are rejected unless the panel has granted remote start, and no command lights a ring |
-| Pd0F_F (LG mini washer, AABB monitoring record) | `scripts/Pd0F_F.rhai` | commands byte for byte as the LG app sent them (from rethink's test suite); status frames built from the documented offsets and the state the rethink adapter had retained, not yet checked against a live capture |
-| RH14_N_KR (LG dryer, AABB monitoring record) | `scripts/RH14_N_KR.rhai` | tested against three real frames captured from the appliance while it ran a cycle (their previous records agree with what the rethink adapter had retained at that moment) and the start frame the LG app sent; not yet run live |
-| S3BF_POD_DN4 (LG styler, AABB monitoring record) | `scripts/S3BF_POD_DN4.rhai` | tested against a real idle frame from the cabinet (energy and downloaded course agree with what the rethink adapter had retained) and the 46-byte Fine Dust start the LG app sent, byte for byte; there is no power-on command (measured: the cabinet acknowledges and ignores them); not yet run live |
-| F24VDD (LG washer, AABB monitoring record) | `scripts/F24VDD.rhai` | tested against a real idle frame from the washer (energy, download course, Tub Clean count, last operating course and end sound agree with what the rethink adapter had retained) and the Colour Care, Heavy Duty and Steam Refresh starts the LG app sent, byte for byte; not yet run live |
-| CST_570004_WW (LG ceiling-cassette air conditioner, TLV) | `scripts/CST_570004_WW.rhai` | written for this model only; tested against the real capability and state frames a unit reported (from rethink's test suite); write frames follow rethink's write-attach rules (power on and mode writes carry the other core tags), not yet compared with frames the LG app sent, and not yet run live |
-| 2RSFL2DBN3K_Z (LG refrigerator, AABB) | `scripts/2RSFL2DBN3K_Z.rhai` | live against the real appliance, captured with `rusthinq-capture`: every property was read back after toggling the matching LG app control, including all three night-glare modes (off / sunset-to-sunrise / custom schedule). Fridge/freezer setpoint, express freeze, and AI Saving Mode (off/balanced/max, its own short F0 10 frame acked with an inner `0x67`, not the F0 17 template every other write here uses) were written from here (`rusthinq/<id>/<prop>/set`) and confirmed acked and reflected in the appliance's own next status frame; `ai_saving_max_schedule` (max mode's own active-hours window, same F0 10 frame) is decoded and reproduced byte-for-byte from a live nudge but never echoed by any status frame, so it publishes its own write back instead. Smart Care+, night-glare mode and the door-alarm-mute toggle are all confirmed writable at the protocol level too (night-glare via its own short F0 10 02 frame, which also carries a custom schedule's start/end time and LCD brightness, and for sunset-to-sunrise two bytes this driver could not pin down, none of it exposed) but are kept read-only here, as sensors rather than controls. `door_open_count_fridge`/`door_open_count_freezer` and `energy_today` come from two more unprompted ~15-minute reports (`0xC5` and `0x3E`) the appliance sends on its own — neither is part of the main status record's single "any door open" bit — and both were confirmed against the LG app's own figures directly: the door counts matched a live three-door test exactly, and the energy total matched the app's energy-monitoring screen byte for byte (503 on the wire, 503 Wh shown) |
-
-TLV drivers share `scripts/tlv_common.rhai` (`import "tlv_common" as c;`): the capability to values handshake with retries, the slow refresh, and write framing. A module cannot call back into its importer, so each device script keeps the hooks and delegates to it.
-
-Do not run a driver alongside another consumer that already drives the same appliance
-(for example the rusthinq-adapter): two unaware drivers would both write to it.
+The drivers, and what each was verified against, are listed in the
+[rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts#drivers) repository.

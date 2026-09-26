@@ -1,0 +1,38 @@
+# Guards the host against breaking the drivers: builds the driver runner from this
+# checkout and runs it over the current drivers in https://github.com/3735943886/rusthinq-scripts.
+# A host change that (intentionally) breaks drivers fails here until the drivers repository
+# has been updated to match; update it, bump its RUSTHINQ_REF, then re-run.
+name: drivers
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  drivers:
+    name: drivers (rusthinq-scripts@main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the drivers
+        uses: actions/checkout@v4
+        with:
+          repository: 3735943886/rusthinq-scripts
+          path: rusthinq-scripts
+          # Both repositories are private: the default GITHUB_TOKEN cannot read the other
+          # one, so this needs a token secret with read access to it.
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the driver runner
+        run: cargo build --release -p rusthinq-devices --features scripting --bin rusthinq-script-test
+
+      - name: Test and check the drivers
+        run: target/release/rusthinq-script-test rusthinq-scripts

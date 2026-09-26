@@ -124,7 +124,8 @@ raw = ["rx", "tx", "clip_tx", "inject", "inject_clip", "emit"]
 # Optional device scripting (rusthinq-devices::scripting, `scripting` Cargo feature). Absent
 # entirely = the feature doesn't exist. Put a <modelId>.rhai in rhai_dir to handle that
 # model (e.g. rhai_dir/RAC_056905_WW.rhai); shared logic can live in its own .rhai file and
-# be imported with `import "common" as common;`.
+# be imported with `import "common" as common;`. The drivers for specific models are the
+# separate repository https://github.com/3735943886/rusthinq-scripts -- point rhai_dir at a checkout of it.
 #
 # raw_prefix and a model's .rhai script are independent and never arbitrated - both run
 # on every frame for a matching device, with no priority between them. Fine for debug/RE
@@ -133,7 +134,7 @@ raw = ["rx", "tx", "clip_tx", "inject", "inject_clip", "emit"]
 # the same data and publishing separately - no crash, but no guarantee they agree.
 #
 # [scripting]
-# rhai_dir = "./scripts"
+# rhai_dir = "./rusthinq-scripts"
 # watch = true # hot-reload on save; keeps the previous version running if the new one fails to compile
 # il_prefix = "il" # let scripts publish an IL device descriptor (retained, <il_prefix>/<id>); unset = off
 

@@ -73,8 +73,8 @@ Optional sections (each needs its Cargo feature and its section in the file, see
 [bridge]                           # keep the official app working, see step 7
 storage_path = "./state"
 
-[scripting]                        # drive a model with a .rhai script
-rhai_dir = "./scripts"
+[scripting]                        # drive a model with a .rhai script; the drivers are
+rhai_dir = "./rusthinq-scripts"    # https://github.com/3735943886/rusthinq-scripts
 watch = true
 
 [gui]                              # web dashboard
