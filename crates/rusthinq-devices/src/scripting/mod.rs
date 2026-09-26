@@ -8,6 +8,7 @@
 
 pub mod cache;
 pub mod ctx;
+pub mod driver_check;
 pub mod engine;
 pub mod harness;
 pub mod il;
