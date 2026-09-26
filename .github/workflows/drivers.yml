@@ -11,7 +11,7 @@ on:
 
 jobs:
   drivers:
-    name: drivers (rusthinq-scripts@main)
+    name: drivers (rusthinq-scripts@master)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

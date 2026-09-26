@@ -5,7 +5,7 @@ repository). rusthinq does device → IL only: a driver is a Rhai script, and ev
 of the IL (Home Assistant, Matter, …) is an external project.
 
 The drivers themselves live in their own repository, [rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts). Writing
-one? See its [docs/writing-a-driver.md](https://github.com/3735943886/rusthinq-scripts/blob/main/docs/writing-a-driver.md) for the step-by-step.
+one? See its [docs/writing-a-driver.md](https://github.com/3735943886/rusthinq-scripts/blob/master/docs/writing-a-driver.md) for the step-by-step.
 
 ## What a driver is here
 

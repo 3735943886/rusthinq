@@ -54,7 +54,7 @@ for the initial Rust port belongs to [BluSyn](https://github.com/BluSyn).
      `scripting::ctx` for the exact script-facing API. The drivers for specific models live in
      their own repository, [rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts); writing one:
      [docs/il-rusthinq.md](docs/il-rusthinq.md) and that repository's
-     [docs/writing-a-driver.md](https://github.com/3735943886/rusthinq-scripts/blob/main/docs/writing-a-driver.md).
+     [docs/writing-a-driver.md](https://github.com/3735943886/rusthinq-scripts/blob/master/docs/writing-a-driver.md).
   2. **A custom consumer, in any language.** Setting `[mqtt] raw_prefix` taps every
      connected device's raw rx/tx frames onto MQTT
      (`<raw_prefix>/<id>/raw/rx|tx`, plus `raw/clip/rx|tx` for the CLIP layer), with an
