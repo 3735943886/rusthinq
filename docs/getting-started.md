@@ -232,9 +232,9 @@ results appear on `rusthinq/bridge/status` and `rusthinq/<id>/bridge/status`. Th
 
 The LG account is read every 15 minutes for the devices' names and for devices removed
 from the account, so renaming a device in the official app shows up on the next read. A
-fresh LG login or a rusthinq restart reads it immediately (enabling a device does not), and
-a failed read is retried sooner with backoff. A read that lists no devices at all while some
-are known is ignored unless the next one, a minute later, agrees.
+fresh LG login or a rusthinq restart reads it immediately (enabling a device does not). A
+read that lists no devices at all while some are known is ignored unless the next one, a
+minute later, agrees.
 
 ## 8. Next steps
 

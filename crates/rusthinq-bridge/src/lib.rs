@@ -17,7 +17,7 @@ pub mod util;
 
 /// How often the ThinQ account is read for device names and for devices removed from it.
 /// Neither changes often and each read costs several LG API calls, so this is slow; a
-/// fresh login reads it at once, and a failed read is retried sooner (with backoff).
+/// fresh login reads it at once. A failed read simply waits for the next cycle.
 const ACCOUNT_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// When to look again after an account read that listed no devices at all while some are
@@ -34,7 +34,6 @@ pub use state::{BridgeState, Credentials, Environment, JsonStorage};
 pub use util::{SubprocessError, SubprocessOptions, subprocess};
 
 use pair::{Thinq1DeviceState, Thinq2DeviceState};
-use rusthinq_util::backoff::ExponentialBackoff;
 use rusthinq_util::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -324,24 +323,17 @@ impl Bridge {
     }
 
     async fn run_account_sync_loop(self: Arc<Self>) {
-        let mut backoff = ExponentialBackoff::for_external_upstream();
         loop {
             let delay = if self.is_logged_in() {
                 match self.sync_with_account().await {
-                    Ok(AccountSync::Done) => {
-                        backoff.reset();
-                        ACCOUNT_SYNC_INTERVAL
-                    }
-                    Ok(AccountSync::EmptyListDeferred) => {
-                        backoff.reset();
-                        EMPTY_LIST_RECHECK
-                    }
+                    Ok(AccountSync::Done) => ACCOUNT_SYNC_INTERVAL,
+                    Ok(AccountSync::EmptyListDeferred) => EMPTY_LIST_RECHECK,
                     Err(e) => {
-                        let delay = backoff.next_delay();
                         tracing::warn!(
-                            "could not read the ThinQ account (retrying in {delay:?}): {e:#}"
+                            "could not read the ThinQ account (next attempt in \
+                             {ACCOUNT_SYNC_INTERVAL:?}): {e:#}"
                         );
-                        delay
+                        ACCOUNT_SYNC_INTERVAL
                     }
                 }
             } else {
@@ -742,8 +734,10 @@ impl Bridge {
             }));
             UpstreamHandle::Mock
         } else if is_t2 {
+            let account = self.storage.get_credentials();
+            let account_country = account.as_ref().map(|c| c.env.country_code.as_str());
             let state: Thinq2DeviceState =
-                serde_json::from_value(normalize_t2_state(lg_state.clone()))?;
+                serde_json::from_value(normalize_t2_state(lg_state.clone(), account_country)?)?;
             if state.mqtt_server.is_empty() {
                 anyhow::bail!("ThinQ2 state missing mqttServer — re-enable to re-pair");
             }
@@ -958,10 +952,31 @@ impl Bridge {
     }
 }
 
-fn normalize_t2_state(v: serde_json::Value) -> serde_json::Value {
+/// The saved state's country, else the logged-in account's. A state with neither is an
+/// error: guessing a region would send the wrong app info to LG's cloud without a sign.
+fn saved_country(
+    v: &serde_json::Value,
+    account_country: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    v.get("countryCode")
+        .or_else(|| v.get("country_code"))
+        .cloned()
+        .or_else(|| account_country.map(serde_json::Value::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "saved ThinQ2 state has no country code and there is no LG login to take it from"
+            )
+        })
+}
+
+fn normalize_t2_state(
+    v: serde_json::Value,
+    account_country: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let country = saved_country(&v, account_country)?;
     if v.get("mqtt_server").is_some() && v.get("mqttServer").is_none() {
-        return serde_json::json!({
-            "countryCode": v.get("country_code").cloned().unwrap_or(serde_json::json!("US")),
+        return Ok(serde_json::json!({
+            "countryCode": country,
             "apiServer": v.get("api_server").cloned().unwrap_or(serde_json::json!("")),
             "mqttServer": v.get("mqtt_server").cloned().unwrap_or(serde_json::json!("")),
             "caCertificate": v.get("ca_certificate").cloned().unwrap_or(serde_json::json!("")),
@@ -972,10 +987,10 @@ fn normalize_t2_state(v: serde_json::Value) -> serde_json::Value {
             "subTopic": v.get("sub_topic").cloned().unwrap_or(serde_json::json!("")),
             "deployAppInfo": v.get("deployAppInfo").cloned().unwrap_or(serde_json::Value::Null),
             "deployPlatformInfo": v.get("deployPlatformInfo").cloned().unwrap_or(serde_json::Value::Null),
-        });
+        }));
     }
-    serde_json::json!({
-        "countryCode": v.get("countryCode").or_else(|| v.get("country_code")).cloned().unwrap_or(serde_json::json!("US")),
+    Ok(serde_json::json!({
+        "countryCode": country,
         "apiServer": v.get("apiServer").or_else(|| v.get("api_server")).cloned().unwrap_or(serde_json::json!("")),
         "mqttServer": v.get("mqttServer").or_else(|| v.get("mqtt_server")).cloned().unwrap_or(serde_json::json!("")),
         "caCertificate": v.get("caCertificate").or_else(|| v.get("ca_certificate")).cloned().unwrap_or(serde_json::json!("")),
@@ -986,7 +1001,7 @@ fn normalize_t2_state(v: serde_json::Value) -> serde_json::Value {
         "subTopic": v.get("subTopic").or_else(|| v.get("sub_topic")).cloned().unwrap_or(serde_json::json!("")),
         "deployAppInfo": v.get("deployAppInfo").cloned().unwrap_or(serde_json::Value::Null),
         "deployPlatformInfo": v.get("deployPlatformInfo").cloned().unwrap_or(serde_json::Value::Null),
-    })
+    }))
 }
 
 fn parse_t1_state(v: &serde_json::Value) -> anyhow::Result<Thinq1DeviceState> {
@@ -1755,13 +1770,31 @@ mod lifecycle_tests {
             "deployAppInfo": app_info,
             "deployPlatformInfo": platform_info,
         });
-        let state: Thinq2DeviceState = serde_json::from_value(normalize_t2_state(saved)).unwrap();
+        let state: Thinq2DeviceState =
+            serde_json::from_value(normalize_t2_state(saved, None).unwrap()).unwrap();
         assert_eq!(state.deploy_app_info, Some(app_info));
         assert_eq!(state.deploy_platform_info, Some(platform_info));
     }
 
     /// A state saved before this field existed has neither key — must deserialize as
     /// `None`, not fail, so an old saved session keeps reconnecting.
+    /// A saved state without a country takes the logged-in account's; one that has its own
+    /// keeps it; one with neither is an error rather than a guessed region.
+    #[test]
+    fn normalize_t2_state_takes_the_country_from_the_account_never_a_guess() {
+        let mut saved = serde_json::json!({
+            "apiServer": "https://api",
+            "mqttServer": "ssl://mqtt:8883",
+        });
+        let normalized = normalize_t2_state(saved.clone(), Some("KR")).unwrap();
+        assert_eq!(normalized["countryCode"], "KR");
+        assert!(normalize_t2_state(saved.clone(), None).is_err());
+
+        saved["countryCode"] = serde_json::json!("JP");
+        let normalized = normalize_t2_state(saved, Some("KR")).unwrap();
+        assert_eq!(normalized["countryCode"], "JP");
+    }
+
     #[test]
     fn normalize_t2_state_defaults_deploy_info_to_none_for_old_states() {
         let saved = serde_json::json!({
@@ -1775,7 +1808,8 @@ mod lifecycle_tests {
             "provTopic": "prov",
             "subTopic": "sub",
         });
-        let state: Thinq2DeviceState = serde_json::from_value(normalize_t2_state(saved)).unwrap();
+        let state: Thinq2DeviceState =
+            serde_json::from_value(normalize_t2_state(saved, None).unwrap()).unwrap();
         assert_eq!(state.deploy_app_info, None);
         assert_eq!(state.deploy_platform_info, None);
     }
