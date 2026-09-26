@@ -54,7 +54,7 @@ pub async fn run_connection_with_acks<S>(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         idle.reset();
-                        match splitter.feed(&buf[..n]) {
+                        match splitter.feed(buf.get(..n).unwrap_or_default()) {
                             Ok(frames) => {
                                 for payload in frames {
                                     if !process_one(&payload, &mut device_id, &events, &ack_tx) {

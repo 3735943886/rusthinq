@@ -11,24 +11,24 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-const HEX_LO: &[u8; 16] = b"0123456789abcdef";
-const HEX_UP: &[u8; 16] = b"0123456789ABCDEF";
-
 /// Lowercase hex encoding (like `hex::encode`).
 pub fn encode(data: impl AsRef<[u8]>) -> String {
-    encode_with(data.as_ref(), HEX_LO)
+    use std::fmt::Write;
+    let data = data.as_ref();
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Uppercase hex encoding (like `hex::encode_upper`).
 pub fn encode_upper(data: impl AsRef<[u8]>) -> String {
-    encode_with(data.as_ref(), HEX_UP)
-}
-
-fn encode_with(data: &[u8], alphabet: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let data = data.as_ref();
     let mut out = String::with_capacity(data.len() * 2);
-    for &b in data {
-        out.push(alphabet[(b >> 4) as usize] as char);
-        out.push(alphabet[(b & 0x0f) as usize] as char);
+    for b in data {
+        let _ = write!(out, "{b:02X}");
     }
     out
 }
@@ -46,16 +46,16 @@ fn nibble(c: u8) -> Option<u8> {
 /// (callers that accept mixed input should strip first).
 pub fn decode(s: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
     let bytes = s.as_ref();
-    if bytes.len() % 2 != 0 {
-        return Err(DecodeError);
-    }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = nibble(bytes[i]).ok_or(DecodeError)?;
-        let lo = nibble(bytes[i + 1]).ok_or(DecodeError)?;
-        out.push((hi << 4) | lo);
-        i += 2;
+    let mut pairs = bytes.chunks_exact(2);
+    for pair in pairs.by_ref() {
+        let &[h, l] = pair else {
+            return Err(DecodeError);
+        };
+        out.push((nibble(h).ok_or(DecodeError)? << 4) | nibble(l).ok_or(DecodeError)?);
+    }
+    if !pairs.remainder().is_empty() {
+        return Err(DecodeError);
     }
     Ok(out)
 }

@@ -407,8 +407,10 @@ impl Client {
             "platformType": platform_type,
             "initDevice": false,
         });
-        if let Some(ct) = ciphertext_b64 {
-            body["ciphertext"] = json!(ct);
+        if let Some(ct) = ciphertext_b64
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("ciphertext".into(), json!(ct));
         }
         match self
             .api_fetch(

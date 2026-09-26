@@ -62,12 +62,8 @@ impl Splitter {
         self.accum.extend_from_slice(buf);
         let mut out = Vec::new();
 
-        loop {
-            if self.accum.len() < 4 {
-                break;
-            }
-            let payload_len =
-                i32::from_be_bytes([self.accum[0], self.accum[1], self.accum[2], self.accum[3]]);
+        while let Some(&head) = self.accum.first_chunk::<4>() {
+            let payload_len = i32::from_be_bytes(head);
             if payload_len < 0 {
                 self.failed = true;
                 self.accum.clear();
@@ -79,12 +75,11 @@ impl Splitter {
                 self.accum.clear();
                 return Err(FrameError::PayloadExceeded);
             }
-            if self.accum.len() >= 4 + payload_len {
-                out.push(self.accum[4..4 + payload_len].to_vec());
-                self.accum.drain(..4 + payload_len);
-            } else {
+            let Some(payload) = self.accum.get(4..4 + payload_len) else {
                 break;
-            }
+            };
+            out.push(payload.to_vec());
+            self.accum.drain(..4 + payload_len);
         }
         Ok(out)
     }

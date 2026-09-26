@@ -14,9 +14,10 @@
 //! `TcpStream::connect` would.
 
 use anyhow::{Context, Result, anyhow, bail};
+use rusthinq_util::sync::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
@@ -87,17 +88,17 @@ pub fn set_servers(entries: &[String]) -> Result<()> {
         .iter()
         .map(|e| parse_server(e))
         .collect::<Result<Vec<_>>>()?;
-    *SERVERS.lock().unwrap() = servers;
-    CACHE.lock().unwrap().clear();
+    *SERVERS.lock() = servers;
+    CACHE.lock().clear();
     Ok(())
 }
 
 fn has_servers() -> bool {
-    !SERVERS.lock().unwrap().is_empty()
+    !SERVERS.lock().is_empty()
 }
 
 fn cache_get(hostname: &str) -> Option<Vec<IpAddr>> {
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock();
     cache
         .get(hostname)
         .filter(|e| e.expires > Instant::now())
@@ -105,7 +106,7 @@ fn cache_get(hostname: &str) -> Option<Vec<IpAddr>> {
 }
 
 fn cache_put(hostname: &str, addrs: Vec<IpAddr>, ttl: u64) {
-    CACHE.lock().unwrap().insert(
+    CACHE.lock().insert(
         hostname.to_string(),
         CacheEntry {
             addrs,
@@ -130,7 +131,7 @@ pub async fn resolve_host(hostname: &str) -> Result<Vec<IpAddr>> {
     }
 
     let cell = {
-        let mut pending = PENDING.lock().unwrap();
+        let mut pending = PENDING.lock();
         pending
             .entry(hostname.to_string())
             .or_insert_with(|| Arc::new(OnceCell::new()))
@@ -140,7 +141,7 @@ pub async fn resolve_host(hostname: &str) -> Result<Vec<IpAddr>> {
         .get_or_init(|| query_servers(hostname.to_string()))
         .await
         .clone();
-    PENDING.lock().unwrap().remove(hostname);
+    PENDING.lock().remove(hostname);
     result.map_err(|e| anyhow!(e))
 }
 
@@ -154,7 +155,7 @@ async fn system_lookup(hostname: &str) -> Result<Vec<IpAddr>> {
 }
 
 async fn query_servers(hostname: String) -> ResolveResult {
-    let servers = SERVERS.lock().unwrap().clone();
+    let servers = SERVERS.lock().clone();
     let mut last_err: Option<String> = None;
     for server in &servers {
         match query_server(server, &hostname).await {
@@ -217,6 +218,10 @@ async fn query_type(server: &Server, hostname: &str, qtype: u16) -> Result<Vec<R
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the client only fails to build if the TLS backend cannot initialise"
+)]
 fn doh_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     // Deliberately the plain system-resolver client, never `http_client()` --
@@ -271,7 +276,7 @@ async fn plain_query(addr: SocketAddr, hostname: &str, qtype: u16) -> Result<Vec
         }
         let mut buf = [0u8; 4096];
         match tokio::time::timeout(TIMEOUT, socket.recv(&mut buf)).await {
-            Ok(Ok(n)) => return parse_response(&buf[..n], qtype),
+            Ok(Ok(n)) => return parse_response(buf.get(..n).unwrap_or_default(), qtype),
             Ok(Err(e)) => last_err = Some(anyhow!(e)),
             Err(_) => last_err = Some(anyhow!("timeout querying {addr}")),
         }
@@ -282,9 +287,8 @@ async fn plain_query(addr: SocketAddr, hostname: &str, qtype: u16) -> Result<Vec
 /// Encode a DNS query for `hostname`/`qtype` in wire format (RFC 1035 §4.1),
 /// recursion desired, ID left at 0 as RFC 8484 recommends for DoH.
 fn encode_query(hostname: &str, qtype: u16) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; 12];
-    buf[2] = 0x01; // RD flag (header flags 0x0100)
-    buf[5] = 0x01; // QDCOUNT = 1
+    // ID 0, flags 0x0100 (RD), QDCOUNT 1, no other records.
+    let mut buf = vec![0, 0, 0x01, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0];
 
     let trimmed = hostname.strip_suffix('.').unwrap_or(hostname);
     for label in trimmed.split('.') {
@@ -305,10 +309,14 @@ fn encode_query(hostname: &str, qtype: u16) -> Result<Vec<u8>> {
 /// CNAME records the server followed on the way come along in the answer
 /// section and are skipped (any `rtype` other than `qtype` is).
 fn parse_response(msg: &[u8], qtype: u16) -> Result<Vec<Record>> {
+    let truncated = || anyhow!("truncated DNS message");
+    let &[_, _, _, flags_lo, qd_hi, qd_lo, an_hi, an_lo, ..] = msg else {
+        return Err(truncated());
+    };
     if msg.len() < 12 {
-        bail!("truncated DNS message");
+        return Err(truncated());
     }
-    let rcode = msg[3] & 0x0f;
+    let rcode = flags_lo & 0x0f;
     if rcode == 3 {
         return Ok(Vec::new()); // NXDOMAIN
     }
@@ -316,48 +324,44 @@ fn parse_response(msg: &[u8], qtype: u16) -> Result<Vec<Record>> {
         bail!("DNS error code {rcode}");
     }
 
-    let questions = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let answers = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let questions = u16::from_be_bytes([qd_hi, qd_lo]) as usize;
+    let answers = u16::from_be_bytes([an_hi, an_lo]) as usize;
 
     let mut offset = 12;
     for _ in 0..questions {
-        offset = skip_name(msg, offset)? + 4;
+        offset = skip_name(msg, offset)?.saturating_add(4);
     }
 
     let mut records = Vec::new();
     for _ in 0..answers {
         offset = skip_name(msg, offset)?;
-        if offset + 10 > msg.len() {
-            bail!("truncated DNS message");
-        }
-        let rtype = u16::from_be_bytes([msg[offset], msg[offset + 1]]);
-        let ttl = u32::from_be_bytes([
-            msg[offset + 4],
-            msg[offset + 5],
-            msg[offset + 6],
-            msg[offset + 7],
-        ]);
-        let length = u16::from_be_bytes([msg[offset + 8], msg[offset + 9]]) as usize;
+        let header: &[u8; 10] = msg
+            .get(offset..offset.saturating_add(10))
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(truncated)?;
+        let &[t_hi, t_lo, _, _, ttl0, ttl1, ttl2, ttl3, len_hi, len_lo] = header;
+        let rtype = u16::from_be_bytes([t_hi, t_lo]);
+        let ttl = u32::from_be_bytes([ttl0, ttl1, ttl2, ttl3]);
+        let length = u16::from_be_bytes([len_hi, len_lo]) as usize;
         let data_start = offset + 10;
-        let data_end = data_start
-            .checked_add(length)
-            .filter(|&e| e <= msg.len())
-            .ok_or_else(|| anyhow!("truncated DNS message"))?;
-        let data = &msg[data_start..data_end];
+        let data_end = data_start.saturating_add(length);
+        let data = msg.get(data_start..data_end).ok_or_else(truncated)?;
         offset = data_end;
 
         if rtype != qtype {
             continue;
         }
-        if qtype == TYPE_A && length == 4 {
+        if qtype == TYPE_A
+            && let &[a, b, c, d] = data
+        {
             records.push(Record {
-                addr: IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                addr: IpAddr::V4(Ipv4Addr::new(a, b, c, d)),
                 ttl,
             });
         }
-        if qtype == TYPE_AAAA && length == 16 {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(data);
+        if qtype == TYPE_AAAA
+            && let Ok(octets) = <[u8; 16]>::try_from(data)
+        {
             records.push(Record {
                 addr: IpAddr::V6(Ipv6Addr::from(octets)),
                 ttl,
@@ -389,6 +393,10 @@ fn skip_name(msg: &[u8], mut offset: usize) -> Result<usize> {
 /// A `reqwest::Client` sharing this module's resolver -- a drop-in for
 /// `reqwest::Client::new()` that behaves identically when no servers are
 /// configured (falls through to [`system_lookup`]).
+#[allow(
+    clippy::expect_used,
+    reason = "the client only fails to build if the TLS backend cannot initialise"
+)]
 pub fn http_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
@@ -571,6 +579,31 @@ mod tests {
             Vec::new()
         );
         assert!(parse_response(&build_response(&q, &[], 2), TYPE_A).is_err());
+    }
+
+    #[test]
+    fn parse_response_never_panics_on_truncated_or_corrupted_input() {
+        let a = encode_query("common.lgthinq.com", TYPE_A).unwrap();
+        let v4 = build_response(&a, &[(TYPE_A, 120, &[52, 1, 2, 3])], 0);
+        let aaaa = encode_query("common.lgthinq.com", TYPE_AAAA).unwrap();
+        let v6 = build_response(
+            &aaaa,
+            &[(TYPE_AAAA, 60, &hex("20010db8000000000000000000000001"))],
+            0,
+        );
+        for (msg, qtype) in [(&v4, TYPE_A), (&v6, TYPE_AAAA)] {
+            for cut in 0..=msg.len() {
+                let _ = parse_response(&msg[..cut], qtype);
+            }
+            for i in 0..msg.len() {
+                for v in [0x00u8, 0x01, 0x3f, 0x7f, 0xc0, 0xff] {
+                    let mut m = msg.clone();
+                    m[i] = v;
+                    let _ = parse_response(&m, qtype);
+                    let _ = parse_response(&m[..i], qtype);
+                }
+            }
+        }
     }
 
     #[test]

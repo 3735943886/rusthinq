@@ -57,6 +57,11 @@ fn kind_label(kind: u8) -> String {
     }
 }
 
+/// Byte at `i`, or 0 past the end -- the analyzers guard lengths, this makes it total.
+fn at(buf: &[u8], i: usize) -> u8 {
+    buf.get(i).copied().unwrap_or(0)
+}
+
 fn frame_type_label(ft: u8) -> String {
     match ft {
         0xeb => "single status (EB)".into(),
@@ -72,19 +77,19 @@ fn dryer_record_fields(rec: &[u8], base: usize, label: &str) -> Vec<AabbField> {
     if rec.len() < 27 {
         return Vec::new();
     }
-    let phase = rec[2];
-    let programmed_min = rec[0] as u32 * 60 + rec[1] as u32;
-    let live_rem = rec[4] as u32;
+    let phase = at(rec, 2);
+    let programmed_min = at(rec, 0) as u32 * 60 + at(rec, 1) as u32;
+    let live_rem = at(rec, 4) as u32;
     let remaining_min = if live_rem > 0 {
         live_rem
     } else {
         programmed_min
     };
-    let course = rec[6] as u32;
-    let dry_level = rec[7] as u32;
-    let temp = rec[10] as u32;
-    let flags = rec[17] as u32;
-    let tick = rec[20] as u32;
+    let course = at(rec, 6) as u32;
+    let dry_level = at(rec, 7) as u32;
+    let temp = at(rec, 10) as u32;
+    let flags = at(rec, 17) as u32;
+    let tick = at(rec, 20) as u32;
     let phase_name = dryer_phase_name(phase);
     let prefix = if label == "status" {
         String::new()
@@ -92,7 +97,7 @@ fn dryer_record_fields(rec: &[u8], base: usize, label: &str) -> Vec<AabbField> {
         format!("{label} ")
     };
     let rem_note = if live_rem > 0 {
-        format!("{remaining_min} min (live rec[4]; programmed H:M={programmed_min})")
+        format!("{remaining_min} min (live at(rec, 4); programmed H:M={programmed_min})")
     } else if phase == 0 && programmed_min > 0 {
         format!("{programmed_min} min (H:M; non-zero while Off — residual/display)")
     } else {
@@ -180,7 +185,7 @@ pub fn analyze_aabb_body(
     };
 
     // Host command F0 ED … (monitor enable / set)
-    if body.len() >= 2 && body[0] == 0xf0 {
+    if body.first() == Some(&0xf0) && body.len() >= 2 {
         let hx = crate::hex::encode(body);
         if body == hex_decode_static("f0ed1121010000001800") {
             fields.push(AabbField {
@@ -206,16 +211,24 @@ pub fn analyze_aabb_body(
     }
 
     // Dryer family 0x30
-    if body.len() >= 2 && body[0] == 0x30 {
-        let ft = body[1];
+    if body.first() == Some(&0x30) && body.len() >= 2 {
+        let ft = at(body, 1);
         const REC: usize = 27;
         if ft == 0xeb && body.len() == 2 + REC {
-            fields.extend(dryer_record_fields(&body[2..], 2, "status"));
+            fields.extend(dryer_record_fields(
+                body.get(2..).unwrap_or_default(),
+                2,
+                "status",
+            ));
             re_notes.push("0x30 EB: single 27-byte dryer status record (RH10V9_CH layout).".into());
         } else if ft == 0xec && body.len() == 2 + 2 * REC {
-            fields.extend(dryer_record_fields(&body[2..2 + REC], 2, "prev"));
             fields.extend(dryer_record_fields(
-                &body[2 + REC..2 + 2 * REC],
+                body.get(2..2 + REC).unwrap_or_default(),
+                2,
+                "prev",
+            ));
+            fields.extend(dryer_record_fields(
+                body.get(2 + REC..2 + 2 * REC).unwrap_or_default(),
                 2 + REC,
                 "cur",
             ));

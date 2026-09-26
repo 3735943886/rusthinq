@@ -118,7 +118,12 @@ impl Splitter {
                     return Err(MtospError::InvalidTrailer);
                 }
                 self.state = 0;
-                let xml = String::from_utf8_lossy(&self.buf[3..self.buf.len() - 3]).into_owned();
+                let xml = String::from_utf8_lossy(
+                    self.buf
+                        .get(3..self.buf.len().saturating_sub(3))
+                        .unwrap_or_default(),
+                )
+                .into_owned();
                 self.buf.clear();
                 result = Some(xml);
             }

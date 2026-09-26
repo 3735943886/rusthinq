@@ -191,42 +191,56 @@ pub fn decode_packet(hex_str: &str) -> Decoded {
     };
 
     // AABB: AA <len> ...body <checksum> BB
-    if buf.len() >= 5 && buf[0] == 0xaa && buf[buf.len() - 1] == 0xbb {
-        let expected = aabb_checksum(&buf[..buf.len() - 2]);
+    if buf.len() >= 5
+        && let [0xaa, length, body @ .., checksum, 0xbb] = buf.as_slice()
+        && let Some(covered) = buf.get(..buf.len() - 2)
+    {
         return Decoded::Aabb(DecodedAabb {
-            checksum_ok: buf[buf.len() - 2] == expected,
-            length: buf[1],
-            body: crate::hex::encode(&buf[2..buf.len() - 2]),
+            checksum_ok: *checksum == aabb_checksum(covered),
+            length: *length,
+            body: crate::hex::encode(body),
         });
     }
 
     // UART envelope: 04 00 00 00 | kind | b5 b6 b7 | len | body | crc16
     // Standard climate TLV uses kind 0x87/0xa7 (fromDevice) or 0x65 (toDevice).
     // Other kinds (e.g. 0xa8 SUPERSET/private blobs) share the envelope but are not TLV.
-    if buf.len() >= 13 && buf[2] == 0x04 && buf[3] == 0x00 && buf[4] == 0x00 && buf[5] == 0x00 {
-        let kind = buf[6];
-        let len = buf[10] as usize;
-        if 11 + len + 2 > buf.len() {
+    if buf.len() >= 13
+        && let &[
+            a,
+            s,
+            0x04,
+            0x00,
+            0x00,
+            0x00,
+            kind,
+            b5,
+            b6,
+            b7,
+            len_byte,
+            ref rest @ ..,
+        ] = buf.as_slice()
+    {
+        let len = len_byte as usize;
+        let Some(body) = rest.get(..len).filter(|_| rest.len() >= len + 2) else {
             return Decoded::Unknown(DecodedUnknown {
                 hex: cleaned,
                 reason: "UART length field overruns buffer".into(),
             });
-        }
-        let crc_ok = crc16(&buf[2..]) == 0;
-        let body = &buf[11..11 + len];
+        };
+        let crc_ok = crc16(buf.get(2..).unwrap_or_default()) == 0;
         let frame = TlvFrame {
             kind,
-            byte5: buf[7],
-            byte6: buf[8],
-            byte7: buf[9],
-            len: buf[10],
+            byte5: b5,
+            byte6: b6,
+            byte7: b7,
+            len: len_byte,
         };
         let from_device = kind != 0x65;
         let is_standard_tlv_kind = kind == 0x87 || kind == 0xa7 || kind == 0x65;
         // Values/query path: b5 in {1,2} and b6 in {1,2,4} is the climate TLV dialect.
-        let looks_like_climate_tlv = is_standard_tlv_kind
-            && (buf[7] == 0x01 || buf[7] == 0x02)
-            && matches!(buf[8], 0x01 | 0x02 | 0x04);
+        let looks_like_climate_tlv =
+            is_standard_tlv_kind && (b5 == 0x01 || b5 == 0x02) && matches!(b6, 0x01 | 0x02 | 0x04);
         // Empty-body frames on standard kinds (often b6=0x10 ACK) are still TLV envelope —
         // not binary blobs. Surface as Tlv with empty tag list.
         let empty_standard_ack = is_standard_tlv_kind && len == 0;
@@ -248,8 +262,8 @@ pub fn decode_packet(hex_str: &str) -> Decoded {
                     crc_ok,
                     tlv,
                     frame,
-                    a: Some(buf[0]),
-                    s: Some(buf[1]),
+                    a: Some(a),
+                    s: Some(s),
                 })
             };
         }
@@ -259,8 +273,7 @@ pub fn decode_packet(hex_str: &str) -> Decoded {
         return Decoded::Unknown(DecodedUnknown {
             hex: cleaned,
             reason: format!(
-                "uart_binary kind=0x{kind:02x} b5=0x{:02x} b6=0x{:02x} b7=0x{:02x} body_len={len} crc_ok={crc_ok}",
-                buf[7], buf[8], buf[9]
+                "uart_binary kind=0x{kind:02x} b5=0x{b5:02x} b6=0x{b6:02x} b7=0x{b7:02x} body_len={len} crc_ok={crc_ok}"
             ),
         });
     }

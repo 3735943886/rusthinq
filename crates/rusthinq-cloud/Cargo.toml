@@ -28,6 +28,9 @@ scripting = ["rusthinq-devices/scripting"]
 # needs both this feature and a `[gui]` config section.
 gui = ["dep:rusthinq-gui"]
 
+[lints]
+workspace = true
+
 [dependencies]
 rusthinq-util = { workspace = true }
 rusthinq-core = { workspace = true }

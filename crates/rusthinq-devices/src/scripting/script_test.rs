@@ -175,10 +175,13 @@ fn register(engine: &mut Engine, driver: &Path, model: &str) {
                 .ok()
                 .and_then(|i| sent.get(i))
                 .ok_or_else(|| format!("sent_tlvs({i}): only {} frame(s) were sent", sent.len()))?;
-            if frame.len() < 13 {
+            let Some(tlv_bytes) = frame
+                .get(11..frame.len().saturating_sub(2))
+                .filter(|_| frame.len() >= 13)
+            else {
                 return fail(format!("sent_tlvs({i}): not a TLV frame"));
-            }
-            Ok(rusthinq_util::tlv::parse(&frame[11..frame.len() - 2])
+            };
+            Ok(rusthinq_util::tlv::parse(tlv_bytes)
                 .into_iter()
                 .map(|t| {
                     Dynamic::from(vec![

@@ -44,10 +44,15 @@ pub fn b6_hint(b6: u8) -> &'static str {
     }
 }
 
+/// Byte at `i`, or 0 past the end -- the analyzers guard lengths, this makes it total.
+fn at(body: &[u8], i: usize) -> u8 {
+    body.get(i).copied().unwrap_or(0)
+}
+
 /// DHUM kind=0xa8 fixed 73-byte body — fields proven vs concurrent climate TLV.
 ///
-/// Long capture (2026-08-10, ~91 min, 71 binary frames): body[+44] tracks 0x1fd
-/// (half-°C ambient), body[+45] tracks 0x336 (RH % on DHUM), body[+4] increments
+/// Long capture (2026-08-10, ~91 min, 71 binary frames): at(body, +44) tracks 0x1fd
+/// (half-°C ambient), at(body, +45) tracks 0x336 (RH % on DHUM), at(body, +4) increments
 /// every push (sequence).
 pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
     if body.len() < 46 {
@@ -59,7 +64,7 @@ pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
             offset: 4,
             width: 1,
             endian: "u8",
-            raw: body[4] as u32,
+            raw: at(body, 4) as u32,
             interpretation: "stream sequence (increments each 0xa8 push)".into(),
             confidence: "high",
         });
@@ -69,15 +74,15 @@ pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
             offset: 3,
             width: 1,
             endian: "u8",
-            raw: body[3] as u32,
+            raw: at(body, 3) as u32,
             interpretation: format!(
                 "body subtype 0x{:02x} (0x0d≈periodic stream, 0x10≈snapshot; often mirrors envelope b6)",
-                body[3]
+                at(body, 3)
             ),
             confidence: "medium",
         });
     }
-    let amb = body[44];
+    let amb = at(body, 44);
     out.push(HeuristicHit {
         offset: 44,
         width: 1,
@@ -89,7 +94,7 @@ pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
         ),
         confidence: "high",
     });
-    let rh = body[45];
+    let rh = at(body, 45);
     out.push(HeuristicHit {
         offset: 45,
         width: 1,
@@ -103,7 +108,7 @@ pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
             offset: 29,
             width: 1,
             endian: "u8",
-            raw: body[29] as u32,
+            raw: at(body, 29) as u32,
             interpretation: "slow counter A (steps with +33; minutes-scale)".into(),
             confidence: "medium",
         });
@@ -111,7 +116,7 @@ pub fn dhum_a8_layout_fields(body: &[u8]) -> Vec<HeuristicHit> {
             offset: 33,
             width: 1,
             endian: "u8",
-            raw: body[33] as u32,
+            raw: at(body, 33) as u32,
             interpretation: "slow counter B (paired with +29)".into(),
             confidence: "medium",
         });
@@ -167,7 +172,9 @@ pub fn analyze_uart_binary(
     let mut hist = [0u32; 256];
     let mut zero = 0usize;
     for &b in body {
-        hist[b as usize] += 1;
+        if let Some(c) = hist.get_mut(b as usize) {
+            *c += 1;
+        }
         if b == 0 {
             zero += 1;
         }
@@ -224,8 +231,8 @@ pub fn analyze_uart_binary(
             if known_offsets.contains(&i) {
                 continue;
             }
-            let le = u16::from_le_bytes([body[i], body[i + 1]]) as u32;
-            let be = u16::from_be_bytes([body[i], body[i + 1]]) as u32;
+            let le = u16::from_le_bytes([at(body, i), at(body, i + 1)]) as u32;
+            let be = u16::from_be_bytes([at(body, i), at(body, i + 1)]) as u32;
             for (raw, endian) in [(le, "u16le"), (be, "u16be")] {
                 if (200..=1000).contains(&raw) && raw % 10 == 0 {
                     heuristics.push(HeuristicHit {

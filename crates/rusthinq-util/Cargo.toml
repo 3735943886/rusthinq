@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Pure protocol codecs for rusthinq (TLV, CRC16, packet framing, MTOSP, JSON splitter)"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

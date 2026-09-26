@@ -12,6 +12,9 @@ default = ["scripting"]
 # leaving no way to drive a device.
 scripting = ["dep:rhai", "dep:notify", "dep:notify-debouncer-mini"]
 
+[lints]
+workspace = true
+
 [dependencies]
 notify = { version = "8.2.0", optional = true }
 notify-debouncer-mini = { version = "0.7.0", optional = true }

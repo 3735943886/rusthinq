@@ -30,7 +30,7 @@ pub fn crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &v in data {
         let idx = (((crc >> 8) ^ u16::from(v)) & 0x00ff) as usize;
-        crc = (crc << 8) ^ CRC16TAB[idx];
+        crc = (crc << 8) ^ CRC16TAB.get(idx).copied().unwrap_or(0);
     }
     crc
 }

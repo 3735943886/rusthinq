@@ -13,9 +13,67 @@ use rumqttc::{
 };
 use rusthinq_core::mqtt::MqttSink;
 use rusthinq_util::backoff::ExponentialBackoff;
+use rusthinq_util::sync::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 use url::Url;
+
+/// Most publishes held while the broker is unreachable. Past this the oldest are
+/// dropped: state is retained per topic and `emit_discovery()` republishes everything on
+/// reconnect, so an old value is always superseded, whereas an unbounded queue would grow
+/// for as long as the broker stays down.
+const MAX_QUEUED_PUBLISHES: usize = 5000;
+
+type QueuedPublish = (String, Vec<u8>, bool);
+
+#[derive(Default)]
+struct PublishQueue {
+    items: Mutex<VecDeque<QueuedPublish>>,
+    ready: Notify,
+    dropped: AtomicU64,
+}
+
+impl PublishQueue {
+    fn push(&self, item: QueuedPublish) {
+        {
+            let mut items = self.items.lock();
+            if items.len() >= MAX_QUEUED_PUBLISHES {
+                items.pop_front();
+                if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        target: "rusthinq_mqtt",
+                        limit = MAX_QUEUED_PUBLISHES,
+                        "MQTT publish queue full (broker unreachable?); dropping the oldest"
+                    );
+                }
+            }
+            items.push_back(item);
+        }
+        self.ready.notify_one();
+    }
+
+    async fn pop(&self) -> QueuedPublish {
+        loop {
+            let (next, now_empty) = {
+                let mut items = self.items.lock();
+                let next = items.pop_front();
+                (next, items.is_empty())
+            };
+            if let Some(item) = next {
+                if now_empty {
+                    let dropped = self.dropped.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        tracing::info!(target: "rusthinq_mqtt", dropped, "MQTT publish queue drained");
+                    }
+                }
+                return item;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
 
 pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
     let cfg = sink.config.clone();
@@ -41,10 +99,12 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
 
     // Single ordered publisher task: preserves retain order for discovery bursts
     // and surfaces publish errors instead of fire-and-forget spawns.
-    let (pub_tx, mut pub_rx) = mpsc::unbounded_channel::<(String, Vec<u8>, bool)>();
+    let queue = Arc::new(PublishQueue::default());
+    let consumer = queue.clone();
     let client_pub = client.clone();
     tokio::spawn(async move {
-        while let Some((topic, payload, retain)) = pub_rx.recv().await {
+        loop {
+            let (topic, payload, retain) = consumer.pop().await;
             if let Err(e) = client_pub
                 .publish(
                     &topic,
@@ -64,16 +124,7 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
     });
 
     sink.set_publish_fn(move |topic, payload, retain| {
-        if pub_tx
-            .send((topic.to_string(), payload.to_vec(), retain))
-            .is_err()
-        {
-            tracing::warn!(
-                target: "rusthinq_mqtt",
-                %topic,
-                "MQTT publisher channel closed; dropping publish"
-            );
-        }
+        queue.push((topic.to_string(), payload.to_vec(), retain));
     });
 
     let prefix = cfg.rusthinq_prefix.clone();
@@ -189,5 +240,32 @@ mod tests {
         let (_, port, tls) = parse_mqtt_url("ssl://10.0.0.1:8884").unwrap();
         assert_eq!(port, 8884);
         assert!(tls);
+    }
+
+    fn item(n: usize) -> QueuedPublish {
+        (format!("t/{n}"), vec![], false)
+    }
+
+    #[tokio::test]
+    async fn queue_keeps_order_and_drops_the_oldest_when_full() {
+        let q = PublishQueue::default();
+        for n in 0..MAX_QUEUED_PUBLISHES + 3 {
+            q.push(item(n));
+        }
+        assert_eq!(q.items.lock().len(), MAX_QUEUED_PUBLISHES);
+        assert_eq!(q.pop().await.0, "t/3");
+        assert_eq!(q.pop().await.0, "t/4");
+    }
+
+    #[tokio::test]
+    async fn pop_waits_for_a_push() {
+        let q = Arc::new(PublishQueue::default());
+        let waiter = tokio::spawn({
+            let q = q.clone();
+            async move { q.pop().await }
+        });
+        tokio::task::yield_now().await;
+        q.push(item(7));
+        assert_eq!(waiter.await.unwrap().0, "t/7");
     }
 }

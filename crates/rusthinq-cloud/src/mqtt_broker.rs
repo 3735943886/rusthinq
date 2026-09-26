@@ -356,8 +356,18 @@ impl Broker {
                             break;
                         }
                         Ok(n) => {
-                            buf.extend_from_slice(&tmp[..n]);
-                            while let Some(packet) = try_decode_packet(&mut buf) {
+                            buf.extend_from_slice(tmp.get(..n).unwrap_or_default());
+                            let mut close_client = false;
+                            loop {
+                                let packet = match try_decode_packet(&mut buf) {
+                                    Ok(Some(packet)) => packet,
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        tracing::warn!(client_id, connect_seen, error = %e, "mqtt client closed (protocol error)");
+                                        close_client = true;
+                                        break;
+                                    }
+                                };
                                 if let MqttPacket::Connect { keep_alive, .. } = &packet {
                                     idle_timeout = idle_timeout_for(*keep_alive);
                                     connect_seen = true;
@@ -371,6 +381,9 @@ impl Broker {
                                 if !self.dispatch(client_id, packet, &tx).await {
                                     break;
                                 }
+                            }
+                            if close_client {
+                                break;
                             }
                             idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                         }
@@ -460,8 +473,8 @@ impl Broker {
                         }
                     }
                     if let Some(c) = st.clients.get_mut(&client_id) {
-                        for (i, t) in topics.iter().enumerate() {
-                            c.subscriptions.insert(t.clone(), new_subs[i].clone_sub());
+                        for (t, sub) in topics.iter().zip(&new_subs) {
+                            c.subscriptions.insert(t.clone(), sub.clone_sub());
                         }
                     }
                     let mut out = Vec::new();
@@ -561,38 +574,70 @@ struct PublishIn {
     message_id: Option<u16>,
 }
 
-fn try_decode_packet(buf: &mut BytesMut) -> Option<MqttPacket> {
-    if buf.len() < 2 {
-        return None;
+/// Largest MQTT packet body this broker will buffer. Appliance traffic is small; a
+/// claimed length past this is a broken or hostile client, and buffering up to the
+/// protocol's 256 MB limit would let one connection exhaust the process's memory.
+const MAX_PACKET_LEN: usize = 1 << 20;
+
+#[derive(Debug)]
+enum PacketError {
+    MalformedLength,
+    TooLarge(usize),
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedLength => f.write_str("malformed remaining-length field"),
+            Self::TooLarge(n) => write!(f, "packet of {n} bytes exceeds {MAX_PACKET_LEN}"),
+        }
     }
-    let first = buf[0];
-    let (rem_len, rl_bytes) = decode_remaining_length(&buf[1..])?;
+}
+
+/// `Ok(None)`: not enough bytes yet. `Err`: the stream is not valid MQTT (or is
+/// absurdly large) and the connection must be closed.
+fn try_decode_packet(buf: &mut BytesMut) -> Result<Option<MqttPacket>, PacketError> {
+    let Some((&first, rest)) = buf.split_first() else {
+        return Ok(None);
+    };
+    let (rem_len, rl_bytes) = match decode_remaining_length(rest) {
+        RemainingLength::Incomplete => return Ok(None),
+        RemainingLength::Malformed => return Err(PacketError::MalformedLength),
+        RemainingLength::Done(len, n) => (len, n),
+    };
+    if rem_len > MAX_PACKET_LEN {
+        return Err(PacketError::TooLarge(rem_len));
+    }
     let header_len = 1 + rl_bytes;
     if buf.len() < header_len + rem_len {
-        return None;
+        return Ok(None);
     }
     let _ = buf.split_to(header_len);
-    let mut body = buf.split_to(rem_len);
+    let body = buf.split_to(rem_len);
+    Ok(Some(decode_packet_body(first, body)))
+}
+
+fn decode_packet_body(first: u8, mut body: BytesMut) -> MqttPacket {
     let packet_type = first >> 4;
     let flags = first & 0x0f;
 
-    Some(match packet_type {
+    match packet_type {
         1 => decode_connect(&mut body),
         3 => {
             let dup = flags & 0x08 != 0;
             let qos = (flags >> 1) & 0x03;
             let retain = flags & 0x01 != 0;
             if body.remaining() < 2 {
-                return Some(MqttPacket::Unknown);
+                return MqttPacket::Unknown;
             }
             let tlen = body.get_u16() as usize;
             if body.remaining() < tlen {
-                return Some(MqttPacket::Unknown);
+                return MqttPacket::Unknown;
             }
             let topic = String::from_utf8_lossy(&body.copy_to_bytes(tlen)).into_owned();
             let message_id = if qos > 0 {
                 if body.remaining() < 2 {
-                    return Some(MqttPacket::Unknown);
+                    return MqttPacket::Unknown;
                 }
                 Some(body.get_u16())
             } else {
@@ -610,7 +655,7 @@ fn try_decode_packet(buf: &mut BytesMut) -> Option<MqttPacket> {
         }
         8 => {
             if body.remaining() < 2 {
-                return Some(MqttPacket::Unknown);
+                return MqttPacket::Unknown;
             }
             let message_id = body.get_u16();
             let mut topics = Vec::new();
@@ -627,7 +672,7 @@ fn try_decode_packet(buf: &mut BytesMut) -> Option<MqttPacket> {
         }
         10 => {
             if body.remaining() < 2 {
-                return Some(MqttPacket::Unknown);
+                return MqttPacket::Unknown;
             }
             let message_id = body.get_u16();
             let mut topics = Vec::new();
@@ -643,7 +688,7 @@ fn try_decode_packet(buf: &mut BytesMut) -> Option<MqttPacket> {
         12 => MqttPacket::PingReq,
         14 => MqttPacket::Disconnect,
         _ => MqttPacket::Unknown,
-    })
+    }
 }
 
 fn decode_connect(body: &mut BytesMut) -> MqttPacket {
@@ -704,20 +749,26 @@ fn decode_connect(body: &mut BytesMut) -> MqttPacket {
     MqttPacket::Connect { will, keep_alive }
 }
 
-fn decode_remaining_length(data: &[u8]) -> Option<(usize, usize)> {
+enum RemainingLength {
+    Incomplete,
+    Malformed,
+    Done(usize, usize),
+}
+
+fn decode_remaining_length(data: &[u8]) -> RemainingLength {
     let mut multiplier = 1usize;
     let mut value = 0usize;
     for (i, &b) in data.iter().enumerate() {
         value += (b as usize & 127) * multiplier;
         multiplier *= 128;
         if b & 128 == 0 {
-            return Some((value, i + 1));
+            return RemainingLength::Done(value, i + 1);
         }
         if i >= 3 {
-            return None;
+            return RemainingLength::Malformed;
         }
     }
-    None
+    RemainingLength::Incomplete
 }
 
 fn encode_remaining_length(out: &mut Vec<u8>, mut len: usize) {
@@ -759,6 +810,68 @@ mod tests {
     use super::*;
     use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, PublishOptions, QoS};
     use tokio::net::TcpListener;
+
+    fn decode(bytes: &[u8]) -> Result<Option<MqttPacket>, PacketError> {
+        try_decode_packet(&mut BytesMut::from(bytes))
+    }
+
+    #[test]
+    fn incomplete_packet_waits_for_more_bytes() {
+        assert!(matches!(decode(&[]), Ok(None)));
+        assert!(matches!(decode(&[0xc0]), Ok(None)));
+        assert!(matches!(decode(&[0xc0, 0x03]), Ok(None)));
+        assert!(matches!(decode(&[0xc0, 0x80]), Ok(None)));
+    }
+
+    #[test]
+    fn a_complete_pingreq_decodes() {
+        assert!(matches!(
+            decode(&[0xc0, 0x00]),
+            Ok(Some(MqttPacket::PingReq))
+        ));
+    }
+
+    #[test]
+    fn malformed_remaining_length_is_an_error_not_a_wait() {
+        // Five continuation bytes: invalid per MQTT 3.1.1 §2.2.3. Treating this as
+        // "incomplete" would let a client hold the connection open and grow the buffer.
+        assert!(matches!(
+            decode(&[0x30, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Err(PacketError::MalformedLength)
+        ));
+    }
+
+    #[test]
+    fn oversized_packet_is_rejected_before_it_is_buffered() {
+        // Remaining length 0x80 0x80 0x80 0x01 = 2 MiB, with none of the body present.
+        assert!(matches!(
+            decode(&[0x30, 0x80, 0x80, 0x80, 0x01]),
+            Err(PacketError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_the_decoder() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..4000 {
+            let len = (next() % 200) as usize;
+            let mut bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            if let Some(first) = bytes.first_mut() {
+                *first = ((round % 16) as u8) << 4 | (next() as u8 & 0x0f);
+            }
+            if let Some(rl) = bytes.get_mut(1) {
+                *rl = len.saturating_sub(2).min(127) as u8;
+            }
+            let mut buf = BytesMut::from(bytes.as_slice());
+            while let Ok(Some(_)) = try_decode_packet(&mut buf) {}
+        }
+    }
 
     /// Real `rumqttc` clients over a real loopback socket — no wire protocol is
     /// hand-built here; the broker's own decode/encode is what gets exercised, same as

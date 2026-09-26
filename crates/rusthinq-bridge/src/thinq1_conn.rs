@@ -331,7 +331,7 @@ async fn run_session(
                         return;
                     }
                     Ok(n) => {
-                        let Ok(frames) = splitter.feed(&buf[..n]) else {
+                        let Ok(frames) = splitter.feed(buf.get(..n).unwrap_or_default()) else {
                             return;
                         };
                         for payload in frames {

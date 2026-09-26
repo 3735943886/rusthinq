@@ -21,6 +21,8 @@ fn oauth_date() -> String {
 }
 
 fn sign(path_and_maybe_body: &str, timestamp: &str) -> String {
+    // HMAC accepts a key of any length, so this cannot fail.
+    #[allow(clippy::expect_used)]
     let mut mac = HmacSha1::new_from_slice(OAUTH2_SECRET).expect("HMAC key");
     let signed = format!("{path_and_maybe_body}\n{timestamp}");
     mac.update(signed.as_bytes());

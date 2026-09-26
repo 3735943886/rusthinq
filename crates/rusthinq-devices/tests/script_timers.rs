@@ -1,4 +1,10 @@
 //! `ctx.set_timer` / `cancel_timer` / `on_timer`, and `ctx.send_clip`, through the harness.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #![cfg(feature = "scripting")]
 
 use rusthinq_devices::scripting::ScriptHarness;

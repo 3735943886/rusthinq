@@ -1,4 +1,10 @@
 //! Structural checks that the shipped main path uses one MqttSink and management.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 #[test]
 fn decode_module_has_full_re_export_logic() {

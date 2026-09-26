@@ -22,41 +22,28 @@ use tokio::net::TcpStream;
 /// unparseable just means "no name", which routes the connection to the local TLS
 /// acceptor exactly as if this didn't exist.
 pub fn parse_sni_from_client_hello(buf: &[u8]) -> Option<String> {
-    let need = |p: usize, n: usize| p + n <= buf.len();
+    let u8_at = |p: usize| buf.get(p).map(|&b| b as usize);
+    let u16_at = |p: usize| Some(u16::from_be_bytes([*buf.get(p)?, *buf.get(p + 1)?]) as usize);
 
     // TLS record: type(1) version(2) length(2), then handshake: type(1) length(3)
     // version(2), then a 32-byte random. 43 = 5 (record header) + 4 (handshake header)
     // + 2 (client version) + 32 (random).
-    if !need(0, 43) || buf[0] != 0x16 || buf[5] != 0x01 {
+    if buf.len() < 43 || u8_at(0)? != 0x16 || u8_at(5)? != 0x01 {
         return None;
     }
     let mut p = 43;
 
-    if !need(p, 1) {
-        return None;
-    }
-    p += 1 + buf[p] as usize; // session id
+    p += 1 + u8_at(p)?; // session id
+    p += 2 + u16_at(p)?; // cipher suites
+    p += 1 + u8_at(p)?; // compression methods
 
-    if !need(p, 2) {
-        return None;
-    }
-    p += 2 + u16::from_be_bytes([buf[p], buf[p + 1]]) as usize; // cipher suites
-
-    if !need(p, 1) {
-        return None;
-    }
-    p += 1 + buf[p] as usize; // compression methods
-
-    if !need(p, 2) {
-        return None;
-    }
-    let extensions_len = u16::from_be_bytes([buf[p], buf[p + 1]]) as usize;
+    let extensions_len = u16_at(p)?;
     let extensions_end = (p + 2 + extensions_len).min(buf.len());
     p += 2;
 
     while p + 4 <= extensions_end {
-        let ext_type = u16::from_be_bytes([buf[p], buf[p + 1]]);
-        let ext_len = u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize;
+        let ext_type = u16_at(p)?;
+        let ext_len = u16_at(p + 2)?;
         let body = p + 4;
         if body + ext_len > buf.len() {
             return None;
@@ -65,14 +52,12 @@ pub fn parse_sni_from_client_hello(buf: &[u8]) -> Option<String> {
         if ext_type == 0x0000 {
             // server_name extension: server_name_list length(2), then
             // name_type(1) name_length(2) name.
-            if ext_len < 5 || buf[body + 2] != 0x00 {
+            if ext_len < 5 || u8_at(body + 2)? != 0x00 {
                 return None;
             }
-            let name_len = u16::from_be_bytes([buf[body + 3], buf[body + 4]]) as usize;
-            if body + 5 + name_len > buf.len() {
-                return None;
-            }
-            return String::from_utf8(buf[body + 5..body + 5 + name_len].to_vec()).ok();
+            let name_len = u16_at(body + 3)?;
+            let name = buf.get(body + 5..body + 5 + name_len)?;
+            return String::from_utf8(name.to_vec()).ok();
         }
 
         p = body + ext_len;
@@ -91,7 +76,7 @@ pub async fn peek_sni(stream: &TcpStream) -> Option<String> {
     stream.readable().await.ok()?;
     let mut buf = [0u8; 4096];
     let n = stream.peek(&mut buf).await.ok()?;
-    parse_sni_from_client_hello(&buf[..n])
+    parse_sni_from_client_hello(buf.get(..n)?)
 }
 
 /// Open a connection to `name:443` and splice it with `stream` until either side
@@ -199,6 +184,21 @@ mod tests {
             // Must never panic (index out of bounds) on any prefix — a real socket can
             // hand back a short read for any reason.
             let _ = parse_sni_from_client_hello(&hello[..cut]);
+        }
+    }
+
+    #[test]
+    fn corrupted_length_fields_never_panic() {
+        let hello = build_client_hello("kic-common.lgthinq.com");
+        for i in 0..hello.len() {
+            for v in [0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                let mut m = hello.clone();
+                m[i] = v;
+                let _ = parse_sni_from_client_hello(&m);
+                for cut in [i, i + 1] {
+                    let _ = parse_sni_from_client_hello(&m[..cut.min(m.len())]);
+                }
+            }
         }
     }
 

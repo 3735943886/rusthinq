@@ -37,6 +37,17 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 
+# The daemon must not die on bad input: no panicking shortcuts in production code
+# (tests are exempt via clippy.toml). CLI tools and the setup wizard don't opt in.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 rusthinq-util = { path = "crates/rusthinq-util" }
 rusthinq-core = { path = "crates/rusthinq-core" }

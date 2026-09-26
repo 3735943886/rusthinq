@@ -30,29 +30,23 @@ pub fn parse(buf: &[u8]) -> Vec<Tlv> {
 pub fn parse_with_spans(buf: &[u8]) -> Vec<TlvSpan> {
     let mut out = Vec::new();
     let mut i = 0usize;
-    while i < buf.len() {
-        if i + 2 > buf.len() {
+    while let Some(&[b0, b1, ref rest @ ..]) = buf.get(i..) {
+        let t = (u16::from(b0) << 2) + u16::from(b1 >> 6);
+        let l = (b1 >> 4) & 3;
+        let Some(value_bytes) = rest.get(..l as usize) else {
             return out;
-        }
-        let start = i;
-        let t = (u16::from(buf[i]) << 2) + u16::from(buf[i + 1] >> 6);
-        let l = (buf[i + 1] >> 4) & 3;
-        let mut v = u32::from(buf[i + 1] & 15);
-
-        if i + 2 + l as usize > buf.len() {
-            return out;
-        }
-
-        if l > 0 {
-            v = 0;
-            for j in 0..l as usize {
-                v = (v << 8) | u32::from(buf[i + 2 + j]);
-            }
-        }
+        };
+        let v = if l > 0 {
+            value_bytes
+                .iter()
+                .fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
+        } else {
+            u32::from(b1 & 15)
+        };
         let end = i + 2 + l as usize;
         out.push(TlvSpan {
             tlv: Tlv { t, l: Some(l), v },
-            byte_start: start,
+            byte_start: i,
             byte_end: end,
         });
         i = end;
@@ -91,9 +85,9 @@ pub fn build(elements: &[Tlv]) -> Vec<u8> {
 /// `header` is `[b0, b1]` optionally followed by `b2, b3, b4` (defaults `2, 2, 1`) — the
 /// same shape the TLV drivers pass to `tlv_frame_build`, so `[1, 1, 2, 2, 1]` is the values/caps query.
 pub fn frame_build(header: &[u8], elements: &[Tlv]) -> Option<Vec<u8>> {
-    if header.len() < 2 {
+    let &[h0, h1, ..] = header else {
         return None;
-    }
+    };
     let tlv_array = build(elements);
     let len = u8::try_from(tlv_array.len()).ok()?;
     let mut body = vec![
@@ -109,7 +103,7 @@ pub fn frame_build(header: &[u8], elements: &[Tlv]) -> Option<Vec<u8>> {
     ];
     body.extend_from_slice(&tlv_array);
     let crc = crate::crc16::crc16(&body);
-    let mut out = vec![header[0], header[1]];
+    let mut out = vec![h0, h1];
     out.extend_from_slice(&body);
     out.push((crc >> 8) as u8);
     out.push((crc & 0xff) as u8);
@@ -123,12 +117,30 @@ pub fn frame_parse(buf: &[u8]) -> Option<Vec<Tlv>> {
     if buf.len() < 13 {
         return None;
     }
-    let standard = buf[2..6] == [0x04, 0x00, 0x00, 0x00]
-        && (buf[6] == 0x87 || buf[6] == 0xa7)
-        && buf[7] == 0x02
-        && (buf[8] == 0x01 || buf[8] == 0x04)
-        && buf[10] as usize == buf.len() - 13;
-    standard.then(|| parse(&buf[11..buf.len() - 2]))
+    let &[
+        _,
+        _,
+        0x04,
+        0x00,
+        0x00,
+        0x00,
+        kind,
+        0x02,
+        b6,
+        _,
+        len,
+        ref rest @ ..,
+    ] = buf
+    else {
+        return None;
+    };
+    let standard = (kind == 0x87 || kind == 0xa7)
+        && (b6 == 0x01 || b6 == 0x04)
+        && len as usize == buf.len() - 13;
+    if !standard {
+        return None;
+    }
+    Some(parse(rest.get(..len as usize)?))
 }
 
 #[cfg(test)]

@@ -366,9 +366,10 @@ impl MqttSink {
                 continue;
             };
             let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 3 && parts[parts.len() - 1] == "set" {
-                let id = parts[0];
-                let prop = parts[1..parts.len() - 1].join("/");
+            if let [id, prop_parts @ .., "set"] = parts.as_slice()
+                && !prop_parts.is_empty()
+            {
+                let prop = prop_parts.join("/");
                 // This runs on the single shared MQTT event loop task — every
                 // device's set_property calls funnel through here. Guard each handler
                 // so one device's bad `msg` can't take the whole MQTT connection down

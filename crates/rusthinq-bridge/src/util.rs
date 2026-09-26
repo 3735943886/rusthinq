@@ -88,8 +88,12 @@ pub async fn subprocess(
         drop(stdin_pipe);
     }
 
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill().await;
+        return Err(SubprocessError(format!(
+            "Subprocess {command} has no stdout/stderr pipe"
+        )));
+    };
 
     let out_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -103,7 +107,7 @@ pub async fn subprocess(
                             "Subprocess exceeded {max_output_bytes} bytes of stdout"
                         ));
                     }
-                    buf.extend_from_slice(&chunk[..n]);
+                    buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
                 }
                 Err(e) => break Err(format!("stdout read error: {e}")),
             }
@@ -122,7 +126,7 @@ pub async fn subprocess(
                         continue;
                     }
                     let take = n.min(remaining);
-                    buf.extend_from_slice(&chunk[..take]);
+                    buf.extend_from_slice(chunk.get(..take).unwrap_or_default());
                 }
                 Err(_) => break buf,
             }

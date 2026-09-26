@@ -1,6 +1,12 @@
 //! Runs the IL specification's command vectors (`../ildevice/vectors/commands.json`) through
 //! the host's validator. The specification lives in a sibling repository, so the test is
 //! skipped when that checkout is not next to this one.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 #![cfg(feature = "scripting")]
 
 use rusthinq_devices::scripting::il::validate;

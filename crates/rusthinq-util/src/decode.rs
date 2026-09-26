@@ -65,8 +65,8 @@ pub fn decode_hex_payload(hex_in: &str, direction: Option<&str>) -> Result<Value
             // Full UART frame: TLV body starts at byte 11 (after 2 reliability + 9 header).
             let tlv_base = 11usize;
             let len = t.frame.len as usize;
-            if bytes.len() >= tlv_base + len {
-                let spans = tlv::parse_with_spans(&bytes[tlv_base..tlv_base + len]);
+            if let Some(tlv_bytes) = bytes.get(tlv_base..tlv_base + len) {
+                let spans = tlv::parse_with_spans(tlv_bytes);
                 tlv_spans = spans
                     .into_iter()
                     .map(|s| {
@@ -118,16 +118,15 @@ pub fn decode_hex_payload(hex_in: &str, direction: Option<&str>) -> Result<Value
             // Non-TLV UART envelope: analyze body with heuristics (do NOT invent TLV tags).
             if u.reason.starts_with("uart_binary") {
                 protocol = "UartBinary".into();
-                if bytes.len() >= 13 {
-                    let kind = bytes[6];
-                    let b5 = bytes[7];
-                    let b6 = bytes[8];
-                    let b7 = bytes[9];
-                    let len = bytes[10] as usize;
+                if bytes.len() >= 13
+                    && let &[_, _, _, _, _, _, kind, b5, b6, b7, len_byte, ..] = bytes.as_slice()
+                {
+                    let len = len_byte as usize;
                     let start = 11usize;
                     let end = (start + len).min(bytes.len().saturating_sub(2));
-                    if end > start {
-                        let body = &bytes[start..end];
+                    if end > start
+                        && let Some(body) = bytes.get(start..end)
+                    {
                         aabb_body = Some(crate::hex::encode(body));
                         let crc = if u.reason.contains("crc_ok=true") {
                             Some(true)
@@ -148,10 +147,11 @@ pub fn decode_hex_payload(hex_in: &str, direction: Option<&str>) -> Result<Value
                 }
             } else {
                 // Raw TLV body (no UART envelope) — try whole buffer, then after 2-byte prefix
-                let candidates: &[(usize, &[u8])] = if bytes.len() > 2 {
-                    &[(0, &bytes[..]), (2, &bytes[2..])]
-                } else {
-                    &[(0, &bytes[..])]
+                let candidates: &[(usize, &[u8])] = match bytes.get(2..) {
+                    Some(after_prefix) if !after_prefix.is_empty() => {
+                        &[(0, bytes.as_slice()), (2, after_prefix)]
+                    }
+                    _ => &[(0, bytes.as_slice())],
                 };
                 let mut parsed = false;
                 for &(base, slice) in candidates {

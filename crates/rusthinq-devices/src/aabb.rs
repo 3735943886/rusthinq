@@ -6,21 +6,17 @@ pub fn wrap_aabb(inner: &[u8]) -> Vec<u8> {
     packet.push(0xaa);
     packet.push((inner.len() + 4) as u8);
     packet.extend_from_slice(inner);
-    packet.push(0x00);
-    packet.push(0x00);
     let sum: u32 = packet.iter().map(|&b| u32::from(b)).sum();
-    let last = packet.len() - 2;
-    packet[last] = ((sum & 0xff) as u8) ^ 0x55;
-    packet[last + 1] = 0xbb;
+    packet.push(((sum & 0xff) as u8) ^ 0x55);
+    packet.push(0xbb);
     packet
 }
 
 /// Strip `AA … BB` framing. Checksum is not validated (devices send it; tests often omit it).
 pub fn unwrap_aabb(buf: &[u8]) -> Option<Vec<u8>> {
-    if buf.len() >= 4 && buf[0] == 0xaa && buf[buf.len() - 1] == 0xbb {
-        Some(buf[2..buf.len() - 2].to_vec())
-    } else {
-        None
+    match buf {
+        [0xaa, _, inner @ .., _, 0xbb] => Some(inner.to_vec()),
+        _ => None,
     }
 }
 

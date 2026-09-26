@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Optional LG ThinQ cloud bridge mode"
 
+[lints]
+workspace = true
+
 [dependencies]
 rusthinq-util = { workspace = true }
 rusthinq-core = { workspace = true }

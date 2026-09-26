@@ -6,6 +6,11 @@
 //! Rhai, which is how a device script kept in its own separate repo is tested) drives it from
 //! a normal (non-test) build, the same way `rusthinq-core`'s `Mock*` types are reachable.
 
+#![allow(
+    clippy::panic,
+    reason = "test harness: a panic is how a failed feed/expectation is reported to the test runner"
+)]
+
 use crate::device_trait::DeviceHandler;
 use crate::scripting::scripted_device::{ScriptedDevice, build_t1_scripted, build_t2_scripted};
 use rusthinq_core::{

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Optional web dashboard for rusthinq-cloud, talking to it only over MQTT"
 
+[lints]
+workspace = true
+
 [dependencies]
 rusthinq-core = { workspace = true }
 rusthinq-util = { workspace = true }
