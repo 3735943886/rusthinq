@@ -7,11 +7,10 @@
 //! Usage:
 //!   rusthinq-capture <mqtt-host[:port]> <device-uuid> [out.jsonl]
 //!
-//! Env: RUSTHINQ_PREFIX (default "rusthinq") -- despite the name, this is
-//!      rusthinq-cloud's `[mqtt] raw_prefix`, NOT `rusthinq_prefix`: the raw
-//!      bus this tool reads always lives under raw_prefix (see raw_bus.rs),
-//!      and the two commonly differ. Get this wrong and the tool subscribes
-//!      to a topic nothing publishes and silently captures nothing.
+//! Env: RUSTHINQ_RAW_PREFIX (default "rusthinq-raw"): rusthinq-cloud's
+//!      `[mqtt] raw_prefix`, where the raw bus this tool reads lives (see
+//!      raw_bus.rs). Get this wrong and the tool subscribes to a topic nothing
+//!      publishes and silently captures nothing.
 //!
 //! Stdin lines become `{"k":"note","t":…,"text":…}` annotations.
 
@@ -79,7 +78,7 @@ fn main() -> Result<()> {
         .get(2)
         .cloned()
         .unwrap_or_else(|| format!("{device_id}.jsonl"));
-    let prefix = env::var("RUSTHINQ_PREFIX").unwrap_or_else(|_| "rusthinq".into());
+    let prefix = env::var("RUSTHINQ_RAW_PREFIX").unwrap_or_else(|_| "rusthinq-raw".into());
 
     let mut out = OpenOptions::new()
         .create(true)

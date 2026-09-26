@@ -6,14 +6,11 @@
 //!        read_capture, inject (gated).
 //!
 //! Run: rusthinq-mcp
-//! Env: RUSTHINQ_MQTT=host[:port] (default 127.0.0.1:1883), RUSTHINQ_PREFIX
-//!      (default "rusthinq", must match rusthinq-cloud's mqtt.rusthinq_prefix)
-//!      -- correct for list_devices/health, but NOT for `inject`: the raw bus
-//!      `inject` publishes to always lives under `[mqtt] raw_prefix` (see
-//!      raw_bus.rs), which commonly differs from rusthinq_prefix. There is no
-//!      separate override for it yet (see the `inject` match arm below), so on
-//!      a config where the two prefixes differ, `inject` currently publishes
-//!      to the wrong topic and nothing receives it.
+//! Env: RUSTHINQ_MQTT=host[:port] (default 127.0.0.1:1883),
+//!      RUSTHINQ_PREFIX (default "rusthinq", rusthinq-cloud's `[mqtt] rusthinq_prefix`;
+//!      used by list_devices/health),
+//!      RUSTHINQ_RAW_PREFIX (default "rusthinq-raw", its `[mqtt] raw_prefix`; the raw
+//!      bus `inject` publishes to lives there, see raw_bus.rs).
 
 use anyhow::{Context, Result, anyhow};
 use rusthinq_tools::mqtt;
@@ -32,6 +29,7 @@ use std::time::Duration;
 
 static MQTT_HOST: Mutex<String> = Mutex::new(String::new());
 static PREFIX: Mutex<String> = Mutex::new(String::new());
+static RAW_PREFIX: Mutex<String> = Mutex::new(String::new());
 
 fn mqtt_host() -> String {
     MQTT_HOST
@@ -45,6 +43,13 @@ fn prefix() -> String {
         .lock()
         .clone()
         .if_empty(|| env::var("RUSTHINQ_PREFIX").unwrap_or_else(|_| "rusthinq".into()))
+}
+
+fn raw_prefix() -> String {
+    RAW_PREFIX
+        .lock()
+        .clone()
+        .if_empty(|| env::var("RUSTHINQ_RAW_PREFIX").unwrap_or_else(|_| "rusthinq-raw".into()))
 }
 
 trait IfEmpty {
@@ -62,12 +67,13 @@ fn tool_list() -> Value {
     json!([
         {
             "name": "set_mqtt_host",
-            "description": "Set the rusthinq-cloud MQTT broker host[:port] (and optionally the rusthinq_prefix) for subsequent tools",
+            "description": "Set the rusthinq-cloud MQTT broker host[:port] (and optionally its rusthinq_prefix and raw_prefix) for subsequent tools",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "host": { "type": "string" },
-                    "prefix": { "type": "string" }
+                    "prefix": { "type": "string" },
+                    "raw_prefix": { "type": "string" }
                 },
                 "required": ["host"]
             }
@@ -175,7 +181,10 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
             if let Some(p) = args.get("prefix").and_then(|p| p.as_str()) {
                 *PREFIX.lock() = p.to_string();
             }
-            Ok(json!({"ok": true, "host": host, "prefix": prefix()}))
+            if let Some(p) = args.get("raw_prefix").and_then(|p| p.as_str()) {
+                *RAW_PREFIX.lock() = p.to_string();
+            }
+            Ok(json!({"ok": true, "host": host, "prefix": prefix(), "raw_prefix": raw_prefix()}))
         }
         "list_devices" => match fetch_devices()? {
             Some(v) => Ok(v),
@@ -301,8 +310,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let leaf = if from_device { "emit" } else { "inject" };
-            // BUG: this should be raw_prefix, not rusthinq_prefix -- see the module doc comment.
-            let topic = format!("{}/{device_id}/raw/{leaf}/set", prefix());
+            let topic = format!("{}/{device_id}/raw/{leaf}/set", raw_prefix());
             mqtt::publish("rusthinq-mcp-inject", &mqtt_host(), &topic, hex.as_bytes())?;
             Ok(
                 json!({"ok": true, "device_id": device_id, "from_device": from_device, "topic": topic}),
@@ -333,9 +341,10 @@ fn respond_err(id: Value, message: String) {
 fn main() {
     // Diagnostics to stderr only
     eprintln!(
-        "[rusthinq-mcp] ready mqtt={} prefix={}",
+        "[rusthinq-mcp] ready mqtt={} prefix={} raw_prefix={}",
         mqtt_host(),
-        prefix()
+        prefix(),
+        raw_prefix()
     );
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
