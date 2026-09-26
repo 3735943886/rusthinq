@@ -115,7 +115,7 @@ async fn connect_thinq1_impl(
     let did_alive = device_id.to_string();
     let stopped_a = stopped.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(ALIVE_INTERVAL);
         loop {
             interval.tick().await;
             if stopped_a.load(Ordering::SeqCst) {
@@ -210,6 +210,8 @@ async fn connect_thinq1_impl(
 /// Bounds every network step of a connect attempt so `stopped` (checked once
 /// per reconnect-loop iteration) is never blocked behind a half-open socket or
 /// a handshake the real LG server never finishes.
+/// How often the "alive" message is sent to the LG cloud for a bridged ThinQ1 device.
+const ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const RTI_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn connect_once(

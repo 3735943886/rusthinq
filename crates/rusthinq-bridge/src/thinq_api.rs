@@ -7,6 +7,18 @@ use rusthinq_util::sync::Mutex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+/// Sends per API call: a transient network blip or truncated body is retried, an
+/// application-level error (`resultCode` other than "0000") is not.
+const API_ATTEMPTS: usize = 4;
+const API_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
 const GATEWAY_URL: &str = "https://route.lgthinq.com:46030/v1/service/application/gateway-uri";
 
 static GATEWAY_CACHE: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
@@ -119,16 +131,16 @@ impl Client {
     async fn api_fetch(
         &self,
         url: &str,
-        method: &str,
+        method: Method,
         body: Option<Value>,
     ) -> anyhow::Result<Value> {
         let client = crate::resolver::http_client();
         let mut last_err: Option<reqwest::Error> = None;
-        for _ in 0..4 {
+        for _ in 0..API_ATTEMPTS {
             let mut req = match method {
-                "POST" => client.post(url),
-                "DELETE" => client.delete(url),
-                _ => client.get(url),
+                Method::Post => client.post(url),
+                Method::Delete => client.delete(url),
+                Method::Get => client.get(url),
             };
             for (k, v) in &self.headers {
                 req = req.header(k, v);
@@ -164,13 +176,13 @@ impl Client {
                             &[&format!("Error parsing response body from {url}: {e}")],
                         );
                         last_err = Some(e);
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(API_RETRY_DELAY).await;
                     }
                 },
                 Err(e) => {
                     rusthinq_core::logging::log("bridge", &[&format!("Error fetching {url}: {e}")]);
                     last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(API_RETRY_DELAY).await;
                 }
             }
         }
@@ -192,7 +204,7 @@ impl Client {
                 }
             }
             if self.gateway.is_none() {
-                let g = self.api_fetch(GATEWAY_URL, "GET", None).await?;
+                let g = self.api_fetch(GATEWAY_URL, Method::Get, None).await?;
                 let mut cache = GATEWAY_CACHE.lock();
                 let map = cache.get_or_insert_with(HashMap::new);
                 map.insert(self.env.country_code.clone(), g.clone());
@@ -261,7 +273,11 @@ impl Client {
         let saved = self.headers.clone();
         self.headers = h;
         if let Err(e) = self
-            .api_fetch(&format!("{thinq2}/service/users/client"), "POST", None)
+            .api_fetch(
+                &format!("{thinq2}/service/users/client"),
+                Method::Post,
+                None,
+            )
             .await
         {
             rusthinq_core::logging::log("bridge", &[&format!("Register client failed: {e}")]);
@@ -269,7 +285,7 @@ impl Client {
         self.headers = saved;
 
         let homes = self
-            .api_fetch(&format!("{thinq2}/service/homes"), "GET", None)
+            .api_fetch(&format!("{thinq2}/service/homes"), Method::Get, None)
             .await?;
         if let Some(items) = homes.get("item").and_then(|v| v.as_array()) {
             for home in items {
@@ -299,7 +315,7 @@ impl Client {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("home not set"))?;
         let result = self
-            .api_fetch(&format!("{thinq2}/service/homes/{home}"), "GET", None)
+            .api_fetch(&format!("{thinq2}/service/homes/{home}"), Method::Get, None)
             .await?;
         Ok(result
             .get("devices")
@@ -325,7 +341,7 @@ impl Client {
         let _ = self
             .api_fetch(
                 &format!("{thinq2}/service/homes/{home}/devices/{device_id}"),
-                "DELETE",
+                Method::Delete,
                 None,
             )
             .await;
@@ -344,7 +360,7 @@ impl Client {
         let otp = self
             .api_fetch(
                 &format!("{thinq2}/service/devices/otp/certificate"),
-                "POST",
+                Method::Post,
                 Some(json!({})),
             )
             .await?;
@@ -397,7 +413,7 @@ impl Client {
         match self
             .api_fetch(
                 &format!("{thinq2}/service/homes/{home}/devices"),
-                "POST",
+                Method::Post,
                 Some(body),
             )
             .await
@@ -538,7 +554,7 @@ mod tests {
         let client = Client::new(env);
         let url = format!("http://127.0.0.1:{port}/test");
 
-        let result = client.api_fetch(&url, "GET", None).await;
+        let result = client.api_fetch(&url, Method::Get, None).await;
         assert_eq!(
             result.unwrap(),
             json!({"ok": true}),

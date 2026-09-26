@@ -15,14 +15,31 @@ pub mod thinq2_conn;
 pub mod thinq_api;
 pub mod util;
 
+/// How often the ThinQ account is read for device names and for devices removed from it.
+/// Neither changes often and each read costs several LG API calls, so this is slow; a
+/// fresh login reads it at once, and a failed read is retried sooner (with backoff).
+const ACCOUNT_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// When to look again after an account read that listed no devices at all while some are
+/// known (see `Bridge::defer_suspicious_empty_list`).
+const EMPTY_LIST_RECHECK: Duration = Duration::from_secs(60);
+
+/// What one read of the ThinQ account did.
+enum AccountSync {
+    Done,
+    EmptyListDeferred,
+}
+
 pub use state::{BridgeState, Credentials, Environment, JsonStorage};
 pub use util::{SubprocessError, SubprocessOptions, subprocess};
 
 use pair::{Thinq1DeviceState, Thinq2DeviceState};
+use rusthinq_util::backoff::ExponentialBackoff;
 use rusthinq_util::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thinq1_conn::{Thinq1Handle, connect_thinq1};
 use thinq2_conn::{Thinq2Handle, connect_thinq2};
 
@@ -120,23 +137,26 @@ pub struct Bridge {
     /// What the owner calls each appliance, from the ThinQ account (`alias` in LG's
     /// device list) — the same names the app shows. rusthinq only ever knows a
     /// device by its id and model, useless for telling identical appliances apart;
-    /// the account already has the answer. See `name`/`start_name_refresh_loop`.
+    /// the account already has the answer. See `name`/`start_account_sync_loop`.
     device_names: Mutex<HashMap<String, String>>,
-    /// Wakes `run_name_refresh_loop` early — `complete_login` fires this so a fresh
-    /// login doesn't wait out the rest of `NAME_REFRESH_INTERVAL` before names show
+    /// Wakes `run_account_sync_loop` early — `complete_login` fires this so a fresh
+    /// login doesn't wait out the rest of `ACCOUNT_SYNC_INTERVAL` before names show
     /// up.
-    name_refresh_notify: tokio::sync::Notify,
+    account_sync_notify: tokio::sync::Notify,
     /// Called every time `device_names` actually changes — rusthinq-cloud wires
     /// this to republish its retained `<prefix>/devices` snapshot, same reason
     /// `on_session_change` exists: without it, a name that just arrived from the
     /// account wouldn't reach a subscriber until some unrelated event (a device
     /// connecting, a bridge enable/disable) happened to republish next.
     on_names_changed: Mutex<Option<SessionChangeHook>>,
-    /// The account's device ids as of the previous successful `refresh_names`
+    /// The account's device ids as of the previous successful `sync_with_account`
     /// poll. `None` before the first one (since process start), which is what
     /// tells `reconcile_storage_with_account` to do its one-time full sweep of
     /// everything already in `storage` instead of a cheap diff against nothing.
     last_account_ids: Mutex<Option<HashSet<String>>>,
+    /// The previous account read listed no devices while some were known, and was
+    /// not acted on. See `defer_suspicious_empty_list`.
+    empty_list_seen: Mutex<bool>,
     /// Fired once per id `reconcile_storage_with_account` finds orphaned (in
     /// `storage`/a live session but no longer in the account) — `id` only, no
     /// metadata (this crate doesn't have any beyond the raw AWS IoT state blob).
@@ -186,9 +206,10 @@ impl Bridge {
             traffic: Mutex::new(None),
             on_session_change: Mutex::new(None),
             device_names: Mutex::new(HashMap::new()),
-            name_refresh_notify: tokio::sync::Notify::new(),
+            account_sync_notify: tokio::sync::Notify::new(),
             on_names_changed: Mutex::new(None),
             last_account_ids: Mutex::new(None),
+            empty_list_seen: Mutex::new(false),
             on_storage_orphaned: Mutex::new(None),
             starting: Mutex::new(HashSet::new()),
         })
@@ -209,7 +230,7 @@ impl Bridge {
         })
     }
 
-    /// Install a hook run every time `refresh_names` actually changes the cached
+    /// Install a hook run every time `sync_with_account` actually changes the cached
     /// names — see `on_names_changed` above.
     pub fn set_on_names_changed_hook(&self, hook: SessionChangeHook) {
         *self.on_names_changed.lock() = Some(hook);
@@ -286,7 +307,7 @@ impl Bridge {
     }
 
     /// The owner's name for `id`, if the account has one cached (see
-    /// `start_name_refresh_loop`). `None` before the first successful refresh, or if
+    /// `start_account_sync_loop`). `None` before the first successful refresh, or if
     /// the account never gave this device an alias.
     pub fn name(&self, id: &str) -> Option<String> {
         self.device_names.lock().get(id).cloned()
@@ -297,33 +318,50 @@ impl Bridge {
     /// `rusthinq-cloud`'s `main.rs`). Deliberately not started by `new()` itself:
     /// that's a plain sync constructor callable outside a Tokio runtime (tests do
     /// this), and starting a background task there would panic in exactly that case.
-    pub fn start_name_refresh_loop(self: &Arc<Self>) {
+    pub fn start_account_sync_loop(self: &Arc<Self>) {
         let bridge = self.clone();
-        tokio::spawn(async move { bridge.run_name_refresh_loop().await });
+        tokio::spawn(async move { bridge.run_account_sync_loop().await });
     }
 
-    async fn run_name_refresh_loop(self: Arc<Self>) {
-        const NAME_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    async fn run_account_sync_loop(self: Arc<Self>) {
+        let mut backoff = ExponentialBackoff::for_external_upstream();
         loop {
-            if self.is_logged_in()
-                && let Err(e) = self.refresh_names().await
-            {
-                tracing::warn!("could not refresh device names from the ThinQ account: {e:#}");
-            }
+            let delay = if self.is_logged_in() {
+                match self.sync_with_account().await {
+                    Ok(AccountSync::Done) => {
+                        backoff.reset();
+                        ACCOUNT_SYNC_INTERVAL
+                    }
+                    Ok(AccountSync::EmptyListDeferred) => {
+                        backoff.reset();
+                        EMPTY_LIST_RECHECK
+                    }
+                    Err(e) => {
+                        let delay = backoff.next_delay();
+                        tracing::warn!(
+                            "could not read the ThinQ account (retrying in {delay:?}): {e:#}"
+                        );
+                        delay
+                    }
+                }
+            } else {
+                ACCOUNT_SYNC_INTERVAL
+            };
             tokio::select! {
-                _ = tokio::time::sleep(NAME_REFRESH_INTERVAL) => {}
-                _ = self.name_refresh_notify.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
+                _ = self.account_sync_notify.notified() => {}
             }
         }
     }
 
-    /// Best-effort, mirrors rethink's `Bridge.refreshNames`: not logged in just
-    /// clears the cache; any other failure (network, auth) is left for the caller
-    /// to log, same policy as every other real-cloud call in this file.
-    async fn refresh_names(&self) -> anyhow::Result<()> {
+    /// Reads the account's device list once and applies it: the owner's names for the
+    /// devices, then `reconcile_storage_with_account`. The two share one LG round trip
+    /// but are independent; a failure is left for the caller to retry. Not logged in
+    /// just clears the cached names. Best-effort, mirrors rethink's `Bridge.refreshNames`.
+    async fn sync_with_account(&self) -> anyhow::Result<AccountSync> {
         let Some(creds) = self.storage.get_credentials() else {
             self.set_device_names(HashMap::new());
-            return Ok(());
+            return Ok(AccountSync::Done);
         };
         let mut client = thinq_api::Client::new(creds.env.clone());
         client.auth(&creds.refresh_token).await?;
@@ -333,6 +371,13 @@ impl Bridge {
             .filter_map(|d| d.get("deviceId").and_then(|v| v.as_str()))
             .map(str::to_string)
             .collect();
+        if self.defer_suspicious_empty_list(&account_ids) {
+            tracing::warn!(
+                "the ThinQ account listed no devices although some are known; \
+                 ignoring it unless the next read agrees"
+            );
+            return Ok(AccountSync::EmptyListDeferred);
+        }
         let names: HashMap<String, String> = devices
             .iter()
             .filter_map(|d| {
@@ -343,12 +388,36 @@ impl Bridge {
             .collect();
         self.set_device_names(names);
         self.reconcile_storage_with_account(&account_ids);
-        Ok(())
+        Ok(AccountSync::Done)
+    }
+
+    /// An account read with no devices at all, while rusthinq knows of some, is more
+    /// likely a bad or partial response than the owner having removed every device at
+    /// once -- and acting on it would detach every live bridge session and clear their
+    /// `want_enabled`, which only a manual re-enable undoes. So the first such read is
+    /// ignored and the next one decides: two in a row are believed.
+    fn defer_suspicious_empty_list(&self, account_ids: &HashSet<String>) -> bool {
+        let mut seen = self.empty_list_seen.lock();
+        if !account_ids.is_empty() {
+            *seen = false;
+            return false;
+        }
+        let known_devices = self
+            .last_account_ids
+            .lock()
+            .as_ref()
+            .is_some_and(|previous| !previous.is_empty())
+            || !self.storage.list_device_ids().is_empty();
+        if !known_devices || *seen {
+            return false;
+        }
+        *seen = true;
+        true
     }
 
     /// A device removed from the LG account (deleted via the official app) leaves
     /// state behind on two levels this reconciles against the account's current
-    /// device list, called from every `refresh_names` poll (so: once immediately
+    /// device list, called from every `sync_with_account` poll (so: once immediately
     /// at process start, then every 15 minutes):
     ///
     /// - a **live** bridge session: nothing local ever closes it on its own, so
@@ -409,8 +478,8 @@ impl Bridge {
     }
 
     /// Replaces the cached names and fires `on_names_changed`, but only if they
-    /// actually changed -- `run_name_refresh_loop` calls this every
-    /// `NAME_REFRESH_INTERVAL`, and most of those ticks change nothing.
+    /// actually changed -- `run_account_sync_loop` calls this every
+    /// `ACCOUNT_SYNC_INTERVAL`, and most of those ticks change nothing.
     fn set_device_names(&self, names: HashMap<String, String>) {
         let mut current = self.device_names.lock();
         if *current == names {
@@ -490,10 +559,10 @@ impl Bridge {
             },
         }));
         *self.logged_in.lock() = true;
-        // Wakes `run_name_refresh_loop` (if `start_name_refresh_loop` was ever
+        // Wakes `run_account_sync_loop` (if `start_account_sync_loop` was ever
         // called) so names show up right away instead of after the rest of
-        // NAME_REFRESH_INTERVAL. A no-op permit if nothing's listening yet.
-        self.name_refresh_notify.notify_one();
+        // ACCOUNT_SYNC_INTERVAL. A no-op permit if nothing's listening yet.
+        self.account_sync_notify.notify_one();
         Ok(true)
     }
 
@@ -1510,6 +1579,47 @@ mod lifecycle_tests {
             bridge.storage.get_device_state_json(gone).is_some(),
             "saved state must survive -- only an explicit forget/disable erases it"
         );
+    }
+
+    /// A read that lists no devices while some are known is probably a bad response:
+    /// acting on it would detach every bridge session. The first one is ignored, the
+    /// next one decides, and any non-empty read clears the suspicion.
+    #[tokio::test]
+    async fn an_empty_account_list_is_believed_only_when_the_next_read_agrees() {
+        let bridge = test_bridge();
+        *bridge.last_account_ids.lock() = Some(HashSet::from(["dev-1".to_string()]));
+        let none = HashSet::new();
+        let one = HashSet::from(["dev-1".to_string()]);
+
+        assert!(
+            bridge.defer_suspicious_empty_list(&none),
+            "first empty read"
+        );
+        assert!(
+            !bridge.defer_suspicious_empty_list(&none),
+            "second empty read"
+        );
+
+        assert!(!bridge.defer_suspicious_empty_list(&one), "a real list");
+        assert!(
+            bridge.defer_suspicious_empty_list(&none),
+            "a real list must reset the suspicion"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_account_list_is_accepted_at_once_when_nothing_is_known() {
+        let bridge = test_bridge();
+        assert!(!bridge.defer_suspicious_empty_list(&HashSet::new()));
+    }
+
+    #[tokio::test]
+    async fn saved_devices_alone_make_an_empty_account_list_suspicious() {
+        let bridge = test_bridge();
+        bridge
+            .storage
+            .set_device_state_json("dev-saved", Some(mock_saved_state()));
+        assert!(bridge.defer_suspicious_empty_list(&HashSet::new()));
     }
 
     /// The other half of issue #9: a device with saved state but *no* live session

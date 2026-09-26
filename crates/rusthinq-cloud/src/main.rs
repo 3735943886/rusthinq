@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
     }
 
     // Owner-given device names from the ThinQ account (see rusthinq_bridge::Bridge's
-    // `name`/`start_name_refresh_loop`) — same "republish when it changes" reasoning
+    // `name`/`start_account_sync_loop`) — same "republish when it changes" reasoning
     // as the session-change hook above, so a freshly fetched name reaches a
     // subscriber without waiting for some unrelated event to next call publish().
     #[cfg(feature = "bridge")]
@@ -306,7 +306,7 @@ async fn main() -> Result<()> {
             // needs the descriptors published again.
             device_bridge.republish_all();
         }));
-        br.start_name_refresh_loop();
+        br.start_account_sync_loop();
     }
 
     // A `[bridge].storage_path` id the account's device list no longer has, found

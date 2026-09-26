@@ -230,11 +230,17 @@ Login is once per LG account; credentials are stored under `storage_path`. Progr
 results appear on `rusthinq/bridge/status` and `rusthinq/<id>/bridge/status`. The
 [MQTT cheat sheet](mqtt-control.md) has the rest, including turning bridging off.
 
+The LG account is read every 15 minutes for the devices' names and for devices removed
+from the account, so renaming a device in the official app shows up on the next read. A
+fresh LG login or a rusthinq restart reads it immediately (enabling a device does not), and
+a failed read is retried sooner with backoff. A read that lists no devices at all while some
+are known is ignored unless the next one, a minute later, agrees.
+
 ## 8. Next steps
 
 - **Using the data:** what an appliance's properties mean depends on how it's driven.
-  See [the four ways to drive a device](../README.md#what-makes-this-different-from-upstream)
-  (`.rhai` script, raw-frame consumer, rusthinq-adapter).
+  See [the two ways to drive a device](../README.md#driving-a-device)
+  (a Rhai driver, or a raw-frame consumer such as rusthinq-adapter).
 - **Home Assistant or anything else:** it reads the same MQTT topics; rusthinq itself
   is consumer-neutral.
 - **Everything you can do over MQTT:** [mqtt-control.md](mqtt-control.md).

@@ -528,7 +528,7 @@ async fn sign_csr_openssl(ca: &Ca, csr_pem: &str) -> Result<String> {
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(csr_pem.as_bytes()).await?;
     }
-    let out = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+    let out = tokio::time::timeout(OPENSSL_SIGN_TIMEOUT, child.wait_with_output())
         .await
         .context("openssl x509 timed out")??;
     if !out.status.success() {
@@ -541,6 +541,9 @@ async fn sign_csr_openssl(ca: &Ca, csr_pem: &str) -> Result<String> {
         .replace('\r', "")
         .to_string())
 }
+
+/// How long one `openssl x509` signing may run before it is abandoned.
+const OPENSSL_SIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on `openssl` child processes [`sign_csr_gated`] lets run at once. `/device/{id}
 /// /certificate` (this gate's only caller) is reachable by anyone who completes the
