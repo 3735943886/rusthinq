@@ -3,6 +3,7 @@
 use crate::metadata::Metadata;
 use rusthinq_util::sync::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type DataHandler = Box<dyn Fn(&[u8]) + Send + Sync>;
 type ResponseHandler = Box<dyn Fn(&serde_json::Value) + Send + Sync>;
@@ -24,6 +25,19 @@ pub trait Thinq2Device: Send + Sync {
     fn on_data(&self, handler: DataHandler);
     /// Inject a data packet as if received from the appliance (tests + broker).
     fn emit_data(&self, buf: &[u8]);
+    /// Send a delivery ack. It travels under its own CLIP command, `ack`, not `packet`.
+    fn send_ack(&self, buf: &[u8]) {
+        self.send(
+            "ack",
+            1,
+            serde_json::Value::String(rusthinq_util::hex::encode_upper(buf)),
+        );
+    }
+    /// Whether this device's driver acks the appliance's frames itself, as the ThinQ cloud
+    /// would (see `ctx.set_auto_ack`). While set, the LG bridge does not also relay the
+    /// cloud's own acks to the appliance, which would ack every frame twice.
+    fn set_auto_ack(&self, on: bool);
+    fn auto_ack(&self) -> bool;
 }
 
 /// Trait for ThinQ1 devices (JSON control body; binary status reports).
@@ -49,6 +63,7 @@ pub struct MockThinq2Device {
     outbox: Mutex<Vec<Vec<u8>>>,
     sent: Mutex<Vec<SentMessage>>,
     handlers: Mutex<Vec<DataHandler>>,
+    auto_ack: AtomicBool,
 }
 
 impl MockThinq2Device {
@@ -59,6 +74,7 @@ impl MockThinq2Device {
             outbox: Mutex::new(Vec::new()),
             sent: Mutex::new(Vec::new()),
             handlers: Mutex::new(Vec::new()),
+            auto_ack: AtomicBool::new(false),
         })
     }
 
@@ -107,6 +123,14 @@ impl Thinq2Device for MockThinq2Device {
         for h in guard.iter() {
             h(buf);
         }
+    }
+
+    fn set_auto_ack(&self, on: bool) {
+        self.auto_ack.store(on, Ordering::Relaxed);
+    }
+
+    fn auto_ack(&self) -> bool {
+        self.auto_ack.load(Ordering::Relaxed)
     }
 }
 

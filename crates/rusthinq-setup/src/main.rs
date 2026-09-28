@@ -1,5 +1,7 @@
 //! rusthinq-setup: SoftAP Wi-Fi provisioning without the LG app.
 
+mod whisen;
+
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use rusthinq_util::json_splitter;
@@ -28,7 +30,8 @@ fn usage() {
         "Usage:
 \trusthinq-setup hostname wifi_ssid wifi_password
 
-\thostname is usually 192.168.120.254
+\thostname is usually 192.168.120.254, or 192.168.1.1 for appliances whose SoftAP
+\thands out 192.168.1.x addresses
 \tAlways quote the password (special chars like ! $ etc.):
 \t  rusthinq-setup 192.168.120.254 'MySSID' 'MyPassword!'
 
@@ -465,18 +468,121 @@ async fn main() -> Result<()> {
     let ssid = &args[2];
     let pass = &args[3];
 
+    // Whisen appliances only listen on port 9000 and ThinQ1/ThinQ2 ones only on 5500, so
+    // both are tried at once; the first to succeed wins.
+    let whisen = whisen_setup(host, ssid, pass);
+    let thinq = thinq_setup(host, ssid, pass);
+    tokio::pin!(whisen, thinq);
+    let (mut whisen_err, mut thinq_err) = (None, None);
+    while whisen_err.is_none() || thinq_err.is_none() {
+        tokio::select! {
+            r = &mut whisen, if whisen_err.is_none() => match r {
+                Ok(()) => break,
+                Err(e) => {
+                    println!("Whisen setup failed {e:#}");
+                    whisen_err = Some(e);
+                }
+            },
+            r = &mut thinq, if thinq_err.is_none() => match r {
+                Ok(()) => break,
+                Err(e) => {
+                    println!("ThinQ setup failed {e:#}");
+                    thinq_err = Some(e);
+                }
+            },
+        }
+    }
+    if let (Some(_), Some(e)) = (whisen_err, thinq_err) {
+        return Err(e.context("Setup failed"));
+    }
+    print_footer();
+    Ok(())
+}
+
+async fn thinq_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
     if env::var("SETUP_TRY_THINQ1").as_deref() == Ok("1") {
         match thinq1_setup(host, ssid, pass).await {
-            Ok(()) => {
-                print_footer();
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(e) => println!("ThinQ 1 setup failed {e}"),
         }
     }
     println!("Trying ThinQ 2 setup");
-    thinq2_setup(host, ssid, pass).await?;
-    print_footer();
+    thinq2_setup(host, ssid, pass).await
+}
+
+/// One Whisen request: its own TLS connection, the reply read until the appliance closes it.
+async fn whisen_request(
+    host: &str,
+    path: &str,
+    body: &str,
+    headers: Option<&[&str]>,
+) -> Result<String> {
+    let mut stream = connect_tls(host, whisen::WHISEN_PORT).await?;
+    println!("Request: POST {path}");
+    stream
+        .write_all(whisen::request(path, body, headers).as_bytes())
+        .await?;
+    let mut reply = Vec::new();
+    timeout(Duration::from_secs(15), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => reply.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                // The module may drop the connection without a TLS close_notify; what
+                // arrived before that is the reply.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    })
+    .await
+    .context("timeout")??;
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    println!("response: {reply:?}");
+    Ok(reply)
+}
+
+async fn whisen_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
+    println!("Connecting to {host}:{}", whisen::WHISEN_PORT);
+    whisen_request(host, "/SetDeviceInit", "", None).await?;
+
+    // Answers 500 on some firmware.
+    if let Some(info) =
+        whisen::parse_members(&whisen_request(host, "/GetDeviceInfo", "", None).await?)
+    {
+        println!("device info: {}", serde_json::Value::Object(info));
+    }
+
+    // Nation is the country code, sent as subCountryCode by the other setups. Some firmware
+    // ignores regionalCode and picks its server from Nation: DE makes it connect to
+    // eic.lgthinq.com. Must precede SetDeviceConfig: ReleaseDevAp at the end takes the
+    // SoftAP down.
+    let info_reply = whisen_request(
+        host,
+        "/SetDeviceInfo",
+        &whisen::device_info_body("DE", "rusthinq"),
+        None,
+    )
+    .await?;
+    if whisen::status_code(&info_reply) != Some(200) {
+        bail!("SetDeviceInfo rejected");
+    }
+
+    let tz = whisen::timezone(chrono::Local::now().offset().local_minus_utc() / 60);
+    let cfg_reply = whisen_request(
+        host,
+        "/SetDeviceConfig",
+        &whisen::device_config_body(ssid, pass, &tz, None),
+        Some(whisen::DEVICE_CONFIG_HEADERS),
+    )
+    .await?;
+    if whisen::status_code(&cfg_reply) != Some(200) {
+        bail!("SetDeviceConfig rejected, appliance left in AP mode");
+    }
+
+    whisen_request(host, "/ReleaseDevAp", "", None).await?;
+    println!("Whisen setup successful, see rusthinq-cloud logs for a follow-up");
     Ok(())
 }
 

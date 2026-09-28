@@ -60,6 +60,25 @@ fn decode_summary(payload: &str) -> Option<Value> {
     })
 }
 
+/// What kind of wire event `payload` is, and the payload to record: `packet` for a frame
+/// on `raw/rx`/`raw/tx`; `ack` for a delivery ack sent to the device (a `raw/clip/tx` CLIP
+/// message with `cmd: "ack"` — the cloud's, relayed while bridged, or one the driver
+/// generated), recorded as its hex frame so it decodes like a packet; `clip` for any other
+/// CLIP message, recorded as its JSON.
+fn wire_type(payload: String) -> (&'static str, String) {
+    let Ok(v) = serde_json::from_str::<Value>(&payload) else {
+        return ("packet", payload);
+    };
+    match (
+        v.get("cmd").and_then(Value::as_str),
+        v.get("data").and_then(Value::as_str),
+    ) {
+        (Some("ack"), Some(hex)) => ("ack", hex.to_string()),
+        _ if v.is_object() => ("clip", payload),
+        _ => ("packet", payload),
+    }
+}
+
 enum Ev {
     Note(String),
     Wire { dir: &'static str, payload: String },
@@ -148,12 +167,13 @@ fn main() -> Result<()> {
             }
             Ev::Wire { dir, payload } => {
                 let t = now_ms();
-                let mut ev = json!({"k": dir, "t": t, "hex": payload});
+                let (kind, payload) = wire_type(payload);
+                let mut ev = json!({"k": dir, "t": t, "type": kind, "hex": payload});
                 if let Some(decode) = decode_summary(&payload) {
                     ev["decode"] = decode;
                 }
                 write_ev(&mut out, ev)?;
-                eprintln!("[{dir}] {}", &payload[..payload.len().min(32)]);
+                eprintln!("[{dir} {kind}] {}", &payload[..payload.len().min(32)]);
             }
             Ev::Closed => {
                 eprintln!("[rusthinq-capture] MQTT connection closed");
@@ -163,4 +183,25 @@ fn main() -> Result<()> {
     }
     let _ = mqtt_client.disconnect();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_type_tells_packets_acks_and_other_clip_apart() {
+        assert_eq!(
+            wire_type("aa08f0004d04a6bb".into()),
+            ("packet", "aa08f0004d04a6bb".into())
+        );
+        assert_eq!(
+            wire_type(
+                r#"{"did":"d","mid":1,"cmd":"ack","type":1,"data":"AA08F0004D04A6BB"}"#.into()
+            ),
+            ("ack", "AA08F0004D04A6BB".into())
+        );
+        let clip = r#"{"cmd":"setMaskingInfo","type":1,"data":{}}"#.to_string();
+        assert_eq!(wire_type(clip.clone()), ("clip", clip));
+    }
 }

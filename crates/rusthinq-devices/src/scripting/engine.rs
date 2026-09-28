@@ -198,6 +198,7 @@ fn build_engine() -> Engine {
         .register_fn("send_raw", DeviceCtx::send_raw)
         .register_fn("send_json", DeviceCtx::send_json)
         .register_fn("send_clip", DeviceCtx::send_clip)
+        .register_fn("set_auto_ack", DeviceCtx::set_auto_ack)
         .register_fn("set_timer", DeviceCtx::set_timer)
         .register_fn("cancel_timer", DeviceCtx::cancel_timer)
         .register_fn("publish_il", DeviceCtx::publish_il);
