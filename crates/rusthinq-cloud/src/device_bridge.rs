@@ -8,6 +8,7 @@ use rusthinq_devices::registry::{lookup_t1, lookup_t2};
 use rusthinq_util::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// How long a drop waits before it actually publishes "offline", in case the same
@@ -52,6 +53,12 @@ impl Thinq2Device for T2Adapter {
             h(buf);
         }
         self.dev.notify_data(buf);
+    }
+    fn set_auto_ack(&self, on: bool) {
+        self.dev.auto_ack.store(on, Ordering::Relaxed);
+    }
+    fn auto_ack(&self) -> bool {
+        self.dev.auto_ack.load(Ordering::Relaxed)
     }
 }
 

@@ -4,6 +4,7 @@ use rusthinq_core::metadata::Metadata;
 use rusthinq_util::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -86,6 +87,10 @@ pub struct ConnectedDevice {
     /// listening (the LG bridge, so it can carry the answer up) instead of being
     /// silently dropped. Always empty for ThinQ1 devices.
     pub on_unhandled_clip: Mutex<Vec<UnhandledClipHandler>>,
+    /// Set by the device's driver when it acks the appliance's frames itself (a Rhai
+    /// driver's `ctx.set_auto_ack`). The LG bridge then stops relaying the cloud's own
+    /// acks, so each frame is acked once. Always false for ThinQ1 devices.
+    pub auto_ack: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +134,7 @@ impl ConnectedDevice {
             on_response: Mutex::new(Vec::new()),
             deploy_info: Mutex::new(None),
             on_unhandled_clip: Mutex::new(Vec::new()),
+            auto_ack: AtomicBool::new(false),
         })
     }
 

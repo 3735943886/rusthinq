@@ -127,11 +127,16 @@ fn tool_list() -> Value {
         },
         {
             "name": "read_capture",
-            "description": "Read a JSONL capture file (from rusthinq-capture)",
+            "description": "Read a JSONL capture file (from rusthinq-capture). Each rx/tx event has a type: \"packet\", \"ack\" for a delivery ack sent to the device (e.g. AABB f0 00 <type> 04 [<seq16>]), or \"clip\" for another CLIP message. Optional filter by type; paging via offset/limit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "type": {
+                        "type": "string",
+                        "enum": ["packet", "ack", "clip"],
+                        "description": "rx/tx events only; captures predating the field count as packet"
+                    },
                     "offset": { "type": "integer" },
                     "limit": { "type": "integer" }
                 },
@@ -281,11 +286,18 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
             let lines: Vec<String> = BufReader::new(file)
                 .lines()
                 .collect::<std::io::Result<_>>()?;
+            let wire_type = args.get("type").and_then(|t| t.as_str());
             let slice: Vec<Value> = lines
                 .into_iter()
+                .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+                .filter(|e| {
+                    wire_type.is_none_or(|want| {
+                        matches!(e.get("k").and_then(Value::as_str), Some("rx" | "tx"))
+                            && e.get("type").and_then(Value::as_str).unwrap_or("packet") == want
+                    })
+                })
                 .skip(offset)
                 .take(limit)
-                .filter_map(|l| serde_json::from_str(&l).ok())
                 .collect();
             Ok(json!({"offset": offset, "count": slice.len(), "events": slice}))
         }

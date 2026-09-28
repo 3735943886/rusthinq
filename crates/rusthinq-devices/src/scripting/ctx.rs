@@ -264,6 +264,24 @@ impl DeviceCtx {
         }
     }
 
+    /// Ack every AABB frame the appliance sends, as the ThinQ cloud would (see
+    /// `aabb::cloud_ack`), before `on_data` sees it. Unacked, some appliances repeat each
+    /// frame up to ten times and their content sync never completes. Off by default; a new
+    /// driver for an AABB device should turn it on in `start`. While on, the LG bridge no
+    /// longer relays the cloud's own acks. T2 only — a no-op (logged) on T1.
+    pub fn set_auto_ack(&mut self, on: bool) {
+        match &self.device {
+            DeviceHandle::T2(dev) => dev.set_auto_ack(on),
+            DeviceHandle::T1(_) => {
+                tracing::warn!(
+                    target: "rusthinq_scripting",
+                    id = %self.id,
+                    "ctx.set_auto_ack() called on a ThinQ1 device (no AABB acks on this platform) — ignored"
+                );
+            }
+        }
+    }
+
     /// Send a JSON control body to the appliance. T1 only — a no-op (logged) on T2.
     pub fn send_json(&mut self, text: String) -> Result<(), Box<EvalAltResult>> {
         match &self.device {

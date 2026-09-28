@@ -365,7 +365,14 @@ pub(crate) fn build_t2_scripted(
         DeviceHandle::T2(thinq.clone()),
         |handler| {
             let for_data = handler.clone();
+            let acker = thinq.clone();
             thinq.on_data(Box::new(move |data: &[u8]| {
+                // Acked before the script sees the frame, as the cloud would.
+                if acker.auto_ack()
+                    && let Some(ack) = crate::aabb::cloud_ack(data)
+                {
+                    acker.send_ack(&ack);
+                }
                 for_data.call("on_data", vec![Dynamic::from_blob(data.to_vec())]);
             }));
         },
@@ -452,6 +459,58 @@ mod tests {
             dev.properties.get("last_hex").map(String::as_str),
             Some("deadbeef")
         );
+    }
+
+    #[test]
+    fn set_auto_ack_acks_aabb_frames_as_the_cloud_would_and_only_once_opted_in() {
+        let _dir = with_script_dir(
+            r#"
+                fn start(ctx) {
+                    if ctx.model_id() == "T2_AUTO_ACK" { ctx.set_auto_ack(true); }
+                }
+                fn on_data(ctx, data) {
+                    ctx.publish_property("last_hex", hex_encode(data));
+                }
+            "#,
+            "T2_AUTO_ACK",
+        );
+        std::fs::copy(
+            _dir.path().join("T2_AUTO_ACK.rhai"),
+            _dir.path().join("T2_NO_ACK.rhai"),
+        )
+        .unwrap();
+        let frame = crate::aabb::wrap_aabb(&[0x30, 0x4d, 0x01]);
+        for (model, acked) in [("T2_AUTO_ACK", true), ("T2_NO_ACK", false)] {
+            let mqtt = MockMqttConnection::new();
+            let thinq = MockThinq2Device::new("dev-ack", meta(model));
+            let handler = scripted_t2_factory(
+                mqtt.clone() as Arc<dyn MqttConnection>,
+                thinq.clone() as Arc<dyn Thinq2Device>,
+                meta(model),
+            );
+            handler.start();
+            assert_eq!(thinq.auto_ack(), acked);
+
+            thinq.emit_data(&frame);
+
+            let acks: Vec<_> = thinq
+                .sent()
+                .into_iter()
+                .filter(|m| m.cmd == "ack")
+                .collect();
+            if acked {
+                assert_eq!(acks.len(), 1);
+                assert_eq!(acks[0].data, "AA08F0004D04A6BB");
+            } else {
+                assert!(acks.is_empty());
+            }
+            assert!(thinq.outbox().is_empty(), "acks do not go out as packets");
+            let dev = mqtt.device("dev-ack").expect("device published to");
+            assert!(
+                dev.properties.contains_key("last_hex"),
+                "the frame still reaches on_data"
+            );
+        }
     }
 
     #[test]

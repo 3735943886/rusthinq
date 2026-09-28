@@ -3,6 +3,7 @@
 use crate::devmgr::{ConnectedDevice, SendToDevice};
 use rusthinq_bridge::LocalDevice;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub struct ConnectedAsLocal(pub Arc<ConnectedDevice>);
 
@@ -35,6 +36,13 @@ impl LocalDevice for ConnectedAsLocal {
         (self.0.send_to_device)(SendToDevice::T1Json(body));
     }
     fn send_clip_to_local(&self, payload: serde_json::Value) {
+        // A driver that acks the appliance's frames itself has already acked what the
+        // cloud is acking here; relaying it too would ack every frame twice.
+        if payload.get("cmd").and_then(|c| c.as_str()) == Some("ack")
+            && self.0.auto_ack.load(Ordering::Relaxed)
+        {
+            return;
+        }
         (self.0.send_to_device)(SendToDevice::T2Raw(payload));
     }
     fn on_unhandled_clip(&self, handler: Box<dyn Fn(serde_json::Value) + Send + Sync>) {
@@ -91,6 +99,32 @@ mod tests {
         assert_eq!(sent.len(), 1);
         match &sent[0] {
             SendToDevice::T2Raw(v) => assert_eq!(v, &payload),
+            other => panic!("expected T2Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_clouds_acks_are_not_relayed_to_a_device_whose_driver_acks_itself() {
+        let sent: Arc<UtilMutex<Vec<SendToDevice>>> = Arc::new(UtilMutex::new(Vec::new()));
+        let sent2 = sent.clone();
+        let base = dummy_dev();
+        let dev = ConnectedDevice::new(
+            base.id.clone(),
+            base.platform,
+            base.meta.clone(),
+            base.emit_data.clone(),
+            Arc::new(move |msg| sent2.lock().push(msg)),
+        );
+        dev.auto_ack.store(true, Ordering::Relaxed);
+        let local = ConnectedAsLocal(dev);
+
+        local.send_clip_to_local(serde_json::json!({"cmd": "ack", "mid": 1, "data": "AA"}));
+        local.send_clip_to_local(serde_json::json!({"cmd": "reqUniversalCtrl", "mid": 2}));
+
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1, "only the non-ack is relayed");
+        match &sent[0] {
+            SendToDevice::T2Raw(v) => assert_eq!(v["cmd"], "reqUniversalCtrl"),
             other => panic!("expected T2Raw, got {other:?}"),
         }
     }
