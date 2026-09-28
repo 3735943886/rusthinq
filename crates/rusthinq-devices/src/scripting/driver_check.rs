@@ -199,7 +199,7 @@ fn check_prop(
         }
     }
     if let Some(class) = p.get("class")
-        && !class.as_str().is_some_and(|c| !c.is_empty())
+        && class.as_str().is_none_or(|c| c.is_empty())
     {
         bad("empty class");
     }
