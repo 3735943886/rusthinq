@@ -5,3 +5,4 @@ target/
 # never commit a CA private key.
 ca.key
 ca.cert
+Cargo.lock
