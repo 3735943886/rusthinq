@@ -25,7 +25,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Clone upstream repo
         run: git clone --quiet "$UPSTREAM_REPO" upstream-repo
