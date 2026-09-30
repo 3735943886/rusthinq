@@ -126,12 +126,12 @@ jobs:
         # Perl on PATH and break the Windows build.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --locked --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Build (cross)
         if: matrix.cross
         shell: bash
-        run: cross build --locked --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
+        run: cross build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Package
         env:
