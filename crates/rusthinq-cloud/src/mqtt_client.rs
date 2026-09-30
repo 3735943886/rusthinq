@@ -7,18 +7,18 @@
 //! own restart signal — a script that wants that can subscribe to whatever topic it
 //! needs and trigger its own resync.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rumqttc::{
     AsyncClient, Event, Incoming, LastWill, MqttOptions, PublishOptions, QoS, Transport,
 };
-use rusthinq_core::mqtt::MqttSink;
+use rusthinq_core::mqtt::parse_mqtt_url;
+use rusthinq_core::mqtt::{MqttConnection, MqttSink};
 use rusthinq_util::backoff::ExponentialBackoff;
 use rusthinq_util::sync::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
-use url::Url;
 
 /// Most publishes held while the broker is unreachable. Past this the oldest are
 /// dropped: state is retained per topic and `emit_discovery()` republishes everything on
@@ -170,13 +170,8 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
                             .subscribe(format!("{raw_prefix}/+/+/+/+/set"), QoS::AtLeastOnce)
                             .await;
                     }
-                    let _ = client
-                        .publish(
-                            format!("{prefix}/availability"),
-                            b"online".to_vec(),
-                            PublishOptions::at_least_once().retained(),
-                        )
-                        .await;
+                    // Never await space in the publish channel from its own consumer.
+                    sink2.publish_retained("availability", "online");
                     sink2.emit_discovery();
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
@@ -205,14 +200,6 @@ pub async fn start_mqtt_client(sink: Arc<MqttSink>) -> Result<()> {
     });
 
     Ok(())
-}
-
-fn parse_mqtt_url(url: &str) -> Result<(String, u16, bool)> {
-    let u = Url::parse(url).with_context(|| format!("parse mqtt_url {url}"))?;
-    let host = u.host_str().unwrap_or("127.0.0.1").to_string();
-    let use_tls = u.scheme() == "mqtts" || u.scheme() == "ssl";
-    let port = u.port().unwrap_or(if use_tls { 8883 } else { 1883 });
-    Ok((host, port, use_tls))
 }
 
 #[cfg(test)]
@@ -267,5 +254,57 @@ mod tests {
         tokio::task::yield_now().await;
         q.push(item(7));
         assert_eq!(waiter.await.unwrap().0, "t/7");
+    }
+}
+
+#[cfg(test)]
+mod regression_queue_regression {
+    #[tokio::test]
+    async fn regression_connack_with_full_publish_queue_makes_progress() {
+        use rusthinq_core::{
+            config::MqttConfig,
+            mqtt::{MqttConnection, MqttSink},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sink = MqttSink::new(MqttConfig {
+            mqtt_url: format!("mqtt://127.0.0.1:{port}"),
+            rusthinq_prefix: "r".into(),
+            raw_prefix: None,
+            raw: Default::default(),
+            mqtt_user: String::new(),
+            mqtt_pass: String::new(),
+            state_file: None,
+        });
+        crate::mqtt_client::start_mqtt_client(sink.clone())
+            .await
+            .unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 4096];
+        assert_eq!(stream.read_u8().await.unwrap(), 0x10); // CONNECT
+        let mut length = 0usize;
+        let mut multiplier = 1usize;
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            length += usize::from(byte & 127) * multiplier;
+            if byte & 128 == 0 {
+                break;
+            }
+            multiplier *= 128;
+        }
+        let mut connect = vec![0; length];
+        stream.read_exact(&mut connect).await.unwrap();
+        for n in 0..200 {
+            sink.publish_property("dev", "p", &n.to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stream.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf)).await;
+        assert!(
+            next.is_ok(),
+            "event loop stopped polling after CONNACK with a full request queue"
+        );
     }
 }

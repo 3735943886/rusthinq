@@ -45,8 +45,8 @@ pub fn get_or_compile(path: &Path) -> Result<AstSlot, String> {
     }
     let ast = compile_file(&path)?;
     let slot: AstSlot = Arc::new(RwLock::new(Arc::new(ast)));
-    CACHE.lock().insert(path, slot.clone());
-    Ok(slot)
+    // Concurrent first connections must all receive the same reloadable slot.
+    Ok(CACHE.lock().entry(path).or_insert(slot).clone())
 }
 
 /// Recompile `path` and, on success, atomically swap it into the cached slot so every

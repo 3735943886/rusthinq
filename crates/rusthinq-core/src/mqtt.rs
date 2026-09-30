@@ -19,6 +19,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// Parse the broker endpoint consistently for the daemon and dashboard.
+pub fn parse_mqtt_url(value: &str) -> anyhow::Result<(String, u16, bool)> {
+    let url = url::Url::parse(value)?;
+    let tls = match url.scheme() {
+        "mqtt" => false,
+        "mqtts" | "ssl" => true,
+        scheme => anyhow::bail!("unsupported MQTT URL scheme: {scheme}"),
+    };
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("MQTT URL requires a host"))?;
+    Ok((
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+        url.port().unwrap_or(if tls { 8883 } else { 1883 }),
+        tls,
+    ))
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -353,12 +374,15 @@ impl MqttSink {
 
     pub fn handle_message(&self, topic: &str, message: &[u8]) {
         let msg = String::from_utf8_lossy(message);
-        // Two independent topic namespaces can carry `<id>/.../set` commands: the core
-        // control plane (rusthinq_prefix, always on) and the raw/debug surface
-        // (raw_prefix, only when configured — see MqttConfig::raw_prefix). Try both;
-        // a topic only ever matches one of them in practice.
+        // Preserve namespace boundaries even when broker ACLs allow only one prefix.
+        // Equal prefixes are supported, but each command must be dispatched once.
         let prefixes = std::iter::once(self.config.rusthinq_prefix.as_str())
-            .chain(self.config.raw_prefix.as_deref())
+            .chain(
+                self.config
+                    .raw_prefix
+                    .as_deref()
+                    .filter(|p| *p != self.config.rusthinq_prefix),
+            )
             .filter(|p| !p.is_empty());
         for p in prefixes {
             let prefix = format!("{p}/");
@@ -370,6 +394,14 @@ impl MqttSink {
                 && !prop_parts.is_empty()
             {
                 let prop = prop_parts.join("/");
+                let expected_prefix = if prop.starts_with("raw/") {
+                    self.config.raw_prefix.as_deref()
+                } else {
+                    Some(self.config.rusthinq_prefix.as_str())
+                };
+                if expected_prefix != Some(p) {
+                    continue;
+                }
                 // This runs on the single shared MQTT event loop task — every
                 // device's set_property calls funnel through here. Guard each handler
                 // so one device's bad `msg` can't take the whole MQTT connection down
@@ -470,6 +502,22 @@ mod mqtt_sink_tests {
             raw: Default::default(),
             state_file: None,
         }
+    }
+
+    #[test]
+    fn control_commands_cannot_arrive_through_the_raw_namespace() {
+        let mut cfg = test_cfg();
+        cfg.raw_prefix = Some("raw".into());
+        let sink = MqttSink::new(cfg);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        sink.on_set_property(move |_, _, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        sink.handle_message("raw/dev/forget/set", b"");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        sink.handle_message("rusthinq/dev/forget/set", b"");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -704,5 +752,19 @@ mod mqtt_sink_tests {
         assert!(state.properties.contains("temperature"));
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::parse_mqtt_url;
+    #[test]
+    fn rejects_invalid_broker_endpoints_and_handles_ipv6() {
+        assert!(parse_mqtt_url("https://broker").is_err());
+        assert!(parse_mqtt_url("mqtt:///path").is_err());
+        assert_eq!(
+            parse_mqtt_url("mqtt://[::1]:1884").unwrap(),
+            ("::1".into(), 1884, false)
+        );
     }
 }

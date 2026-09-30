@@ -19,6 +19,10 @@ pub trait DeviceHandler: Send + Sync {
     fn drop_device(&self);
     fn set_property(&self, prop: &str, value: &str);
     fn publish_config(&self);
+    /// A script that failed its initial compile can be rebuilt after a file change.
+    fn needs_reload(&self) -> bool {
+        false
+    }
     /// Release timers and listeners this handler is holding, without touching the
     /// published availability state. `drop_device()` should call this on its way to publishing
     /// offline, but it also runs on its own when a device is superseded by its own

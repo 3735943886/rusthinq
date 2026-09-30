@@ -10,16 +10,18 @@
 //! see `devlist.rs`) and `<rusthinq_prefix>/bridge/#` (`bridge/status`,
 //! `bridge/login-url`, see `bridge_control.rs`). Per-device raw traffic
 //! (`<raw_prefix>/<id>/raw/rx`/`tx`/`clip/tx`, see `raw_bus.rs`) is subscribed on demand by
-//! `http.rs`'s `/device` handler for as long as a monitor page is open.
+//! `http.rs`'s `/device` handler and restored after each broker reconnect.
 
 use crate::state::Shared;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, Transport};
 use rusthinq_core::config::MqttConfig;
+use rusthinq_core::mqtt::parse_mqtt_url;
 use rusthinq_util::backoff::ExponentialBackoff;
+use rusthinq_util::sync::Mutex;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use url::Url;
 
 pub type Publish = rumqttc::Publish;
 
@@ -32,9 +34,16 @@ pub struct Handle {
     events: broadcast::Sender<Publish>,
     pub prefix: String,
     pub raw_prefix: Option<String>,
+    raw_topics: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Handle {
+    /// Remember monitor topics across clean-session reconnects.
+    pub async fn subscribe_raw(&self, topic: &str) {
+        self.raw_topics.lock().insert(topic.to_string());
+        let _ = self.client.subscribe(topic, QoS::AtMostOnce).await;
+    }
+
     /// Every incoming publish from here on. Bounded and lossy under backpressure --
     /// a slow/gone receiver (a closed browser tab) just misses old messages rather
     /// than blocking the MQTT event loop for everyone else.
@@ -71,11 +80,13 @@ pub fn start(cfg: MqttConfig, state: Arc<Shared>) -> Result<Handle> {
     let (client, eventloop) = AsyncClient::builder(opts).capacity(64).build();
     let (events_tx, _) = broadcast::channel(256);
 
+    let raw_topics = Arc::new(Mutex::new(HashSet::new()));
     let handle = Handle {
         client: client.clone(),
         events: events_tx.clone(),
         prefix: cfg.rusthinq_prefix.clone(),
         raw_prefix: cfg.raw_prefix.clone(),
+        raw_topics: raw_topics.clone(),
     };
 
     tokio::spawn(run_event_loop(
@@ -84,6 +95,7 @@ pub fn start(cfg: MqttConfig, state: Arc<Shared>) -> Result<Handle> {
         cfg.rusthinq_prefix,
         events_tx,
         state,
+        raw_topics,
     ));
 
     Ok(handle)
@@ -95,29 +107,36 @@ async fn run_event_loop(
     prefix: String,
     events_tx: broadcast::Sender<Publish>,
     state: Arc<Shared>,
+    raw_topics: Arc<Mutex<HashSet<String>>>,
 ) {
     let devices_topic = format!("{prefix}/devices");
     let mut backoff = ExponentialBackoff::for_local_control_plane();
+    let mut subscriptions: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 backoff.reset();
                 tracing::info!("rusthinq-gui MQTT connection established");
                 state.set_gui_mqtt_connected(true);
-                let _ = client.subscribe(&devices_topic, QoS::AtLeastOnce).await;
-                // Account-level topics (`<prefix>/bridge/status`, `.../login-url`)...
-                let _ = client
-                    .subscribe(format!("{prefix}/bridge/#"), QoS::AtLeastOnce)
-                    .await;
-                // ...and per-device ones (`<prefix>/<id>/bridge/status`) -- a
-                // different shape, see bridge_control.rs's doc comment.
-                let _ = client
-                    .subscribe(format!("{prefix}/+/bridge/status"), QoS::AtLeastOnce)
-                    .await;
-                // `<prefix>/<id>/forget/status` -- see device_control.rs.
-                let _ = client
-                    .subscribe(format!("{prefix}/+/forget/status"), QoS::AtLeastOnce)
-                    .await;
+                if let Some(task) = subscriptions.take() {
+                    task.abort();
+                }
+                let client = client.clone();
+                let topics = vec![
+                    devices_topic.clone(),
+                    format!("{prefix}/bridge/#"),
+                    format!("{prefix}/+/bridge/status"),
+                    format!("{prefix}/+/forget/status"),
+                ];
+                let raw: Vec<_> = raw_topics.lock().iter().cloned().collect();
+                subscriptions = Some(tokio::spawn(async move {
+                    for topic in topics {
+                        let _ = client.subscribe(topic, QoS::AtLeastOnce).await;
+                    }
+                    for topic in raw {
+                        let _ = client.subscribe(topic, QoS::AtMostOnce).await;
+                    }
+                }));
             }
             Ok(Event::Incoming(Incoming::Publish(p))) => {
                 if p.topic == devices_topic {
@@ -134,16 +153,6 @@ async fn run_event_loop(
             }
         }
     }
-}
-
-/// Mirrors `rusthinq-cloud`'s `mqtt_client.rs::parse_mqtt_url` -- same small parse,
-/// kept local since it's the only bit of that file this crate needs.
-fn parse_mqtt_url(url: &str) -> Result<(String, u16, bool)> {
-    let u = Url::parse(url).with_context(|| format!("parse mqtt_url {url}"))?;
-    let host = u.host_str().unwrap_or("127.0.0.1").to_string();
-    let use_tls = u.scheme() == "mqtts" || u.scheme() == "ssl";
-    let port = u.port().unwrap_or(if use_tls { 8883 } else { 1883 });
-    Ok((host, port, use_tls))
 }
 
 #[cfg(test)]
@@ -164,5 +173,84 @@ mod tests {
         assert_eq!(host, "broker.example");
         assert_eq!(port, 8883);
         assert!(tls);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let kind = stream.read_u8().await.unwrap();
+        let mut length = 0;
+        let mut multiplier = 1;
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            length += (byte & 127) as usize * multiplier;
+            if byte & 128 == 0 {
+                break;
+            }
+            multiplier *= 128;
+        }
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        (kind, body)
+    }
+
+    async fn accept(listener: &TcpListener) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(packet(&mut stream).await.0 >> 4, 1);
+        stream.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+        stream
+    }
+
+    async fn until_subscribed(stream: &mut TcpStream, topic: &str) {
+        loop {
+            let (kind, body) = packet(stream).await;
+            if kind >> 4 == 8 {
+                let length = u16::from_be_bytes([body[2], body[3]]) as usize;
+                stream
+                    .write_all(&[0x90, 3, body[0], body[1], 0])
+                    .await
+                    .unwrap();
+                if &body[4..4 + length] == topic.as_bytes() {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_subscription_is_restored_after_clean_session_reconnect() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let cfg = MqttConfig {
+                mqtt_url: format!("mqtt://{}", listener.local_addr().unwrap()),
+                rusthinq_prefix: "r".into(),
+                raw_prefix: Some("raw".into()),
+                mqtt_user: String::new(),
+                mqtt_pass: String::new(),
+                raw: Default::default(),
+                state_file: None,
+            };
+            let handle = start(cfg, Shared::new()).unwrap();
+            let mut first = accept(&listener).await;
+            let topic = "raw/device/raw/rx";
+            handle.subscribe_raw(topic).await;
+            until_subscribed(&mut first, topic).await;
+            // Let the client consume SUBACK, so success requires restoring an
+            // acknowledged subscription rather than replaying an in-flight one.
+            let mut events = handle.subscribe_events();
+            first.write_all(&[0x30, 4, 0, 1, b'x', b'1']).await.unwrap();
+            events.recv().await.unwrap();
+            drop(first);
+            let mut second = accept(&listener).await;
+            until_subscribed(&mut second, topic).await;
+        })
+        .await
+        .unwrap();
     }
 }

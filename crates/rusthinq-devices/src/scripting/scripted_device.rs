@@ -87,26 +87,64 @@ impl DeviceHandler for BrokenScript {
             .publish_property(&self.id, "script_error", &self.error);
     }
 
+    fn needs_reload(&self) -> bool {
+        true
+    }
     fn drop_device(&self) {}
     fn set_property(&self, _prop: &str, _value: &str) {}
     fn publish_config(&self) {}
 }
 
-/// A device's named one-shot timers. Each `set` starts a sleeping thread holding only a
-/// `Weak` to the device and a generation number: when it wakes it fires `on_timer` only if
-/// its generation is still the current one for that name (re-arming or cancelling bumps or
-/// removes it), so a replaced timer never fires. Nothing here keeps the device alive.
+/// One shared timer runtime works for both the daemon and synchronous script harness.
+/// Sleeping timers are cancellable futures, not one OS thread per timer/reset.
+fn timer_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("rhai-timers")
+            .enable_time()
+            .build()
+    }) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            tracing::error!(%error, "cannot start script timer runtime");
+            None
+        }
+    }
+}
+
+struct ArmedTimer {
+    generation: u64,
+    delay_ms: u64,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for ArmedTimer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Default)]
 struct TimerTable {
-    /// name -> (generation, delay in ms) of the armed timer.
-    armed: rusthinq_util::sync::Mutex<HashMap<String, (u64, u64)>>,
+    armed: rusthinq_util::sync::Mutex<HashMap<String, ArmedTimer>>,
     next_gen: AtomicU64,
     owner: OnceLock<Weak<ScriptedDevice>>,
 }
 
 impl TimerTable {
-    fn fire(&self, name: &str) {
-        self.armed.lock().remove(name);
+    fn fire(&self, name: &str, generation: Option<u64>) {
+        let removed = {
+            let mut armed = self.armed.lock();
+            if !armed.get(name).is_some_and(|entry| {
+                generation.is_none_or(|generation| entry.generation == generation)
+            }) {
+                return;
+            }
+            armed.remove(name)
+        };
+        drop(removed);
         if let Some(dev) = self.owner.get().and_then(Weak::upgrade) {
             dev.call("on_timer", vec![name.into()]);
         }
@@ -115,19 +153,31 @@ impl TimerTable {
 
 impl TimerHost for Arc<TimerTable> {
     fn set(&self, name: &str, after_ms: u64) {
+        let Some(runtime) = timer_runtime() else {
+            return;
+        };
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-        self.armed
-            .lock()
-            .insert(name.to_string(), (generation, after_ms));
-        let table = self.clone();
-        let name = name.to_string();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(after_ms));
-            let current = table.armed.lock().get(&name).map(|(g, _)| *g);
-            if current == Some(generation) {
-                table.fire(&name);
-            }
+        let table = Arc::downgrade(self);
+        let timer_name = name.to_string();
+        // Hold the lock until registration, including for a zero-delay timer.
+        let mut armed = self.armed.lock();
+        let task = runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(after_ms)).await;
+            // Script execution must not block the shared timer scheduler.
+            tokio::task::spawn_blocking(move || {
+                if let Some(table) = table.upgrade() {
+                    table.fire(&timer_name, Some(generation));
+                }
+            });
         });
+        armed.insert(
+            name.to_string(),
+            ArmedTimer {
+                generation,
+                delay_ms: after_ms,
+                task: task.abort_handle(),
+            },
+        );
     }
 
     fn cancel(&self, name: &str) {
@@ -164,7 +214,7 @@ impl ScriptedDevice {
             .armed
             .lock()
             .iter()
-            .map(|(n, (_, ms))| (n.clone(), *ms))
+            .map(|(n, entry)| (n.clone(), entry.delay_ms))
             .collect();
         v.sort();
         v
@@ -172,9 +222,7 @@ impl ScriptedDevice {
 
     /// Fire `name` now, if armed — a test hook so a test need not wait out real time.
     pub(crate) fn fire_timer(&self, name: &str) {
-        if self.timers.armed.lock().contains_key(name) {
-            self.timers.fire(name);
-        }
+        self.timers.fire(name, None);
     }
 
     fn call(&self, fn_name: &str, extra: Vec<Dynamic>) {
@@ -364,11 +412,15 @@ pub(crate) fn build_t2_scripted(
         path,
         DeviceHandle::T2(thinq.clone()),
         |handler| {
-            let for_data = handler.clone();
-            let acker = thinq.clone();
+            let for_data = Arc::downgrade(handler);
+            let acker = Arc::downgrade(&thinq);
             thinq.on_data(Box::new(move |data: &[u8]| {
+                let Some(for_data) = for_data.upgrade() else {
+                    return;
+                };
                 // Acked before the script sees the frame, as the cloud would.
-                if acker.auto_ack()
+                if let Some(acker) = acker.upgrade()
+                    && acker.auto_ack()
                     && let Some(ack) = crate::aabb::cloud_ack(data)
                 {
                     acker.send_ack(&ack);
@@ -405,12 +457,18 @@ pub(crate) fn build_t1_scripted(
         path,
         DeviceHandle::T1(thinq.clone()),
         |handler| {
-            let for_data = handler.clone();
+            let for_data = Arc::downgrade(handler);
             thinq.on_data(Box::new(move |data: &[u8]| {
+                let Some(for_data) = for_data.upgrade() else {
+                    return;
+                };
                 for_data.call("on_data", vec![Dynamic::from_blob(data.to_vec())]);
             }));
-            let for_response = handler.clone();
+            let for_response = Arc::downgrade(handler);
             thinq.on_response(Box::new(move |body: &serde_json::Value| {
+                let Some(for_response) = for_response.upgrade() else {
+                    return;
+                };
                 for_response.call("on_response", vec![Dynamic::from(body.to_string())]);
             }));
         },
@@ -570,5 +628,56 @@ mod tests {
         let sent = thinq.sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["cmd"], "hello");
+    }
+}
+
+#[cfg(test)]
+mod lifetime_and_timer_tests {
+    use super::*;
+    use rusthinq_core::{MockMqttConnection, MockThinq2Device};
+
+    #[test]
+    fn dropping_a_script_releases_its_device_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.rhai");
+        std::fs::write(&path, "fn on_data(ctx, data) {}").unwrap();
+        let meta = Metadata::new("M", "M", "1");
+        let device = MockThinq2Device::new("release", meta.clone());
+        let handler = build_t2_scripted(MockMqttConnection::new(), device.clone(), meta, &path)
+            .ok()
+            .unwrap();
+        let weak = Arc::downgrade(&handler);
+        drop(handler);
+        assert!(weak.upgrade().is_none());
+        device.emit_data(&[1]); // expired callbacks are harmless
+    }
+
+    #[test]
+    fn rearm_cancel_and_drop_abort_sleeping_timer_tasks() {
+        let table = Arc::new(TimerTable::default());
+        table.set("a", 60_000);
+        let first = table.armed.lock().get("a").unwrap().task.clone();
+        let generation = table.armed.lock().get("a").unwrap().generation;
+        table.set("a", 60_000);
+        table.fire("a", Some(generation));
+        assert_eq!(
+            table.armed.lock().len(),
+            1,
+            "stale expiry must not consume the replacement"
+        );
+        let second = table.armed.lock().get("a").unwrap().task.clone();
+        table.cancel("a");
+        table.set("b", 60_000);
+        let third = table.armed.lock().get("b").unwrap().task.clone();
+        let weak = Arc::downgrade(&table);
+        drop(table);
+        assert!(weak.upgrade().is_none());
+        for _ in 0..200 {
+            if first.is_finished() && second.is_finished() && third.is_finished() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(first.is_finished() && second.is_finished() && third.is_finished());
     }
 }

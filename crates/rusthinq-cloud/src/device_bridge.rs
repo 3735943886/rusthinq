@@ -188,6 +188,8 @@ impl DeviceBridge {
     /// handler installed by `install`, below).
     pub fn new_device(self: &Arc<Self>, thinqdev: Arc<ConnectedDevice>) {
         self.cancel_superseded(&thinqdev.id);
+        self.t1_adapters.lock().remove(&thinqdev.id);
+        self.t2_adapters.lock().remove(&thinqdev.id);
         self.unmapped.lock().remove(&thinqdev.id);
 
         let handler: Option<Arc<dyn DeviceHandler>> = match thinqdev.platform {
@@ -198,14 +200,16 @@ impl DeviceBridge {
                         handlers: Mutex::new(Vec::new()),
                         response_handlers: Mutex::new(Vec::new()),
                     });
-                    let ad = adapter.clone();
+                    let ad = Arc::downgrade(&adapter);
                     thinqdev.add_data_handler(move |buf| {
+                        let Some(ad) = ad.upgrade() else { return };
                         for h in ad.handlers.lock().iter() {
                             h(buf);
                         }
                     });
-                    let ad = adapter.clone();
+                    let ad = Arc::downgrade(&adapter);
                     thinqdev.add_response_handler(move |body| {
+                        let Some(ad) = ad.upgrade() else { return };
                         for h in ad.response_handlers.lock().iter() {
                             h(body);
                         }
@@ -228,8 +232,9 @@ impl DeviceBridge {
                         dev: thinqdev.clone(),
                         handlers: Mutex::new(Vec::new()),
                     });
-                    let ad = adapter.clone();
+                    let ad = Arc::downgrade(&adapter);
                     thinqdev.add_data_handler(move |buf| {
+                        let Some(ad) = ad.upgrade() else { return };
                         for h in ad.handlers.lock().iter() {
                             h(buf);
                         }
@@ -248,18 +253,19 @@ impl DeviceBridge {
             }
         };
 
-        let Some(handler) = handler else {
-            tracing::warn!(
-                "{:?} device type {} unknown",
-                thinqdev.platform,
-                thinqdev.meta.model_id
-            );
+        if handler
+            .as_ref()
+            .is_none_or(|handler| handler.needs_reload())
+        {
             self.unmapped
                 .lock()
                 .insert(thinqdev.id.clone(), thinqdev.clone());
-            let bridge = self.clone();
-            let gone = thinqdev.clone();
+            let bridge = Arc::downgrade(self);
+            let gone = Arc::downgrade(&thinqdev);
             thinqdev.add_close_handler(move || {
+                let (Some(bridge), Some(gone)) = (bridge.upgrade(), gone.upgrade()) else {
+                    return;
+                };
                 let mut unmapped = bridge.unmapped.lock();
                 if unmapped
                     .get(&gone.id)
@@ -268,6 +274,13 @@ impl DeviceBridge {
                     unmapped.remove(&gone.id);
                 }
             });
+        }
+        let Some(handler) = handler else {
+            tracing::warn!(
+                "{:?} device type {} unknown",
+                thinqdev.platform,
+                thinqdev.meta.model_id
+            );
             return;
         };
 
@@ -339,11 +352,14 @@ impl DeviceBridge {
     fn install(self: &Arc<Self>, thinqdev: Arc<ConnectedDevice>, handler: Arc<dyn DeviceHandler>) {
         let id = thinqdev.id.clone();
         self.handlers.lock().insert(id.clone(), handler.clone());
-        let bridge = self.clone();
+        let bridge = Arc::downgrade(self);
         // Only tear down the handler when *this* ConnectedDevice closes — not when a
         // superseded reconnect's stale close handler runs after re-accept.
-        let thinq_for_close = thinqdev.clone();
+        let thinq_for_close = Arc::downgrade(&thinqdev);
         thinqdev.add_close_handler(move || {
+            let Some(bridge) = bridge.upgrade() else {
+                return;
+            };
             // Deferred rather than checked-and-dropped here: at the moment *this*
             // event fires there may be no replacement yet, but one can still arrive
             // within the grace period (see new_device's doc comment above). So this
@@ -354,7 +370,9 @@ impl DeviceBridge {
             // left once the sleep is done).
             let bridge_task = bridge.clone();
             let id_task = id.clone();
-            let thinq_for_close_task = thinq_for_close.clone();
+            let Some(thinq_for_close_task) = thinq_for_close.upgrade() else {
+                return;
+            };
             let grace = bridge_task.grace;
             let task = tokio::spawn(async move {
                 tokio::time::sleep(grace).await;
@@ -577,7 +595,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         rusthinq_devices::scripting::init(dir.clone(), false);
 
-        let bridge = DeviceBridge::new(MockMqttConnection::new());
+        let mqtt = MockMqttConnection::new();
+        let bridge = DeviceBridge::new(mqtt.clone());
         let dev = ConnectedDevice::new(
             "remap-dev".into(),
             Platform::Thinq2,
@@ -596,11 +615,31 @@ mod tests {
         bridge.remap();
         assert!(!bridge.has_device("remap-dev"), "still no script");
 
-        std::fs::write(dir.join(format!("{MODEL}.rhai")), "fn start(ctx) {}").unwrap();
+        std::fs::write(dir.join(format!("{MODEL}.rhai")), "fn start( {{{").unwrap();
+        bridge.remap();
+        assert!(bridge.has_device("remap-dev"));
+        assert!(
+            bridge.unmapped.lock().contains_key("remap-dev"),
+            "broken handler is retryable"
+        );
+        std::fs::write(
+            dir.join(format!("{MODEL}.rhai")),
+            r#"fn start(ctx) { ctx.publish_property("recovered", "yes"); }"#,
+        )
+        .unwrap();
         bridge.remap();
         assert!(
             bridge.has_device("remap-dev"),
             "the new script was attached"
+        );
+        assert!(!bridge.unmapped.lock().contains_key("remap-dev"));
+        assert_eq!(
+            mqtt.device("remap-dev")
+                .unwrap()
+                .properties
+                .get("recovered")
+                .map(String::as_str),
+            Some("yes")
         );
         std::fs::remove_dir_all(&dir).ok();
     }

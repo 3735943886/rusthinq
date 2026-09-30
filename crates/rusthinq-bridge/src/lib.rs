@@ -854,15 +854,18 @@ impl Bridge {
         // the live session's device identity (not just its id) before detaching is
         // what device_bridge.rs's own close handler and devmgr.rs's accept() both
         // already do for exactly this reason.
-        let bridge = self.clone();
+        let bridge = Arc::downgrade(self);
         let id_close = id.clone();
-        let device_for_close = device.clone();
+        let device_for_close = Arc::downgrade(&device);
         device.on_close(Box::new(move || {
+            let Some(bridge) = bridge.upgrade() else {
+                return;
+            };
             let still_ours = bridge
                 .sessions
                 .lock()
                 .get(&id_close)
-                .map(|s| Arc::ptr_eq(&s.device, &device_for_close))
+                .map(|s| std::ptr::eq(Arc::as_ptr(&s.device), device_for_close.as_ptr()))
                 .unwrap_or(false);
             if still_ours {
                 bridge.detach_session(&id_close);

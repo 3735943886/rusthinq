@@ -99,12 +99,11 @@ impl Shared {
     /// online/offline status without the GUI needing its own device-manager view.
     pub fn device_online(&self, id: &str) -> Option<String> {
         let current = self.current();
-        current
-            .get("devices")?
-            .get(id)?
-            .get("model")?
-            .as_str()
-            .map(str::to_string)
+        let device = current.get("devices")?.get(id)?;
+        if device.get("online").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        device.get("model")?.as_str().map(str::to_string)
     }
 }
 
@@ -218,12 +217,22 @@ mod tests {
         let shared = Shared::new();
         assert_eq!(shared.device_online("d1"), None);
         shared.set_snapshot(
-            br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{"d1":{"model":"RAC_056905_WW"}}}"#,
+            br#"{"mqtt":true,"bridgeLoggedIn":null,"devices":{"d1":{"model":"RAC_056905_WW","online":true}}}"#,
         );
         assert_eq!(
             shared.device_online("d1"),
             Some("RAC_056905_WW".to_string())
         );
         assert_eq!(shared.device_online("missing"), None);
+    }
+}
+
+#[cfg(test)]
+mod regression_regression {
+    #[test]
+    fn regression_offline_device_is_not_online() {
+        let state = super::Shared::new();
+        state.set_snapshot(br#"{"mqtt":true,"devices":{"d":{"model":"M","online":false}}}"#);
+        assert_eq!(state.device_online("d"), None);
     }
 }

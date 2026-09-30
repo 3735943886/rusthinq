@@ -195,7 +195,8 @@ impl ConnectedDevice {
     }
 
     pub fn notify_close(&self) {
-        for h in self.on_close.lock().iter() {
+        let handlers = std::mem::take(&mut *self.on_close.lock());
+        for h in handlers {
             rusthinq_core::panic_guard::guard(&format!("on_close handler for {}", self.id), h);
         }
     }
@@ -241,19 +242,20 @@ impl DeviceManager {
             let mut map = self.devices.lock();
             map.insert(id.clone(), device.clone());
         }
-        let mgr = self.clone();
+        let mgr = Arc::downgrade(self);
         let dev_id = id.clone();
-        // Capture this Arc so close only removes *this* connection.
+        // A weak identity avoids a self-cycle and only removes this connection.
         // Matching by device id alone races: on ThinQ2 reconnect the old MQTT
         // client's disconnect can run after the new device is accepted and
         // wrongly wipe the live entry (UI empty, downstream integration shows the
         // device unavailable, packets still logged against the new MQTT session).
-        let device_for_close = device.clone();
+        let device_for_close = Arc::downgrade(&device);
         device.add_close_handler(move || {
+            let Some(mgr) = mgr.upgrade() else { return };
             let mut map = mgr.devices.lock();
             let still_ours = map
                 .get(&dev_id)
-                .map(|current| Arc::ptr_eq(current, &device_for_close))
+                .map(|current| std::ptr::eq(Arc::as_ptr(current), device_for_close.as_ptr()))
                 .unwrap_or(false);
             if still_ours {
                 map.remove(&dev_id);
@@ -407,5 +409,91 @@ mod tests {
         mgr.accept(dummy_dev("good-device"));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(mgr.get("good-device").is_some());
+    }
+}
+
+#[cfg(test)]
+mod regression_regressions {
+    use super::*;
+    #[test]
+    fn regression_closed_device_is_released() {
+        let mgr = DeviceManager::new();
+        let dev = ConnectedDevice::new(
+            "review".into(),
+            Platform::Thinq2,
+            rusthinq_core::metadata::Metadata::new("M", "M", "1"),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let weak = Arc::downgrade(&dev);
+        mgr.accept(dev.clone());
+        dev.notify_close();
+        assert!(mgr.get("review").is_none());
+        drop(dev);
+        assert!(
+            weak.upgrade().is_none(),
+            "closed device still retained by its own handler"
+        );
+    }
+    #[test]
+    fn regression_equal_prefix_dispatches_once() {
+        use rusthinq_core::{config::MqttConfig, mqtt::MqttSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sink = MqttSink::new(MqttConfig {
+            mqtt_url: "mqtt://localhost".into(),
+            rusthinq_prefix: "r".into(),
+            raw_prefix: Some("r".into()),
+            raw: Default::default(),
+            mqtt_user: String::new(),
+            mqtt_pass: String::new(),
+            state_file: None,
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        sink.on_set_property(move |_, _, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        sink.handle_message("r/dev/power/set", b"ON");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        sink.handle_message("r/dev/raw/inject/set", b"AA");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn regression_raw_injection_rejects_control_namespace() {
+        use rusthinq_core::{
+            config::{MqttConfig, RawStreams},
+            mqtt::MqttSink,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sink = MqttSink::new(MqttConfig {
+            mqtt_url: "mqtt://localhost".into(),
+            rusthinq_prefix: "r".into(),
+            raw_prefix: Some("raw".into()),
+            raw: RawStreams::all(),
+            mqtt_user: String::new(),
+            mqtt_pass: String::new(),
+            state_file: None,
+        });
+        let mgr = DeviceManager::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        mgr.accept(ConnectedDevice::new(
+            "dev".into(),
+            Platform::Thinq2,
+            rusthinq_core::metadata::Metadata::new("M", "M", "1"),
+            Arc::new(|_| {}),
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        ));
+        crate::raw_bus::register_inject(&sink, mgr, &RawStreams::all());
+        sink.handle_message("r/dev/raw/inject/set", b"AA");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "raw command accepted outside raw namespace"
+        );
+        sink.handle_message("raw/dev/raw/inject/set", b"AA");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

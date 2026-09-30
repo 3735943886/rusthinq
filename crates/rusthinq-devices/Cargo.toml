@@ -10,12 +10,13 @@ default = ["scripting"]
 # Rhai device-scripting support for external `.rhai` converters (see
 # src/scripting/mod.rs). Off (--no-default-features) drops rhai/notify entirely,
 # leaving no way to drive a device.
-scripting = ["dep:rhai", "dep:notify", "dep:notify-debouncer-mini"]
+scripting = ["dep:rhai", "dep:notify", "dep:notify-debouncer-mini", "dep:tokio"]
 
 [lints]
 workspace = true
 
 [dependencies]
+tokio = { workspace = true, optional = true }
 notify = { version = "8.2.0", optional = true }
 notify-debouncer-mini = { version = "0.7.0", optional = true }
 rhai = { version = "1.26.0", features = ["sync"], optional = true }

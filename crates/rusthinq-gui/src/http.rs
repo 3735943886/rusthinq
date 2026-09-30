@@ -257,23 +257,11 @@ async fn run_device_socket(mut socket: WebSocket, state: AppState, id: String) {
     // reference-counted and torn down per socket -- harmless for the handful of
     // devices a real install has, and much simpler than tracking "is any other
     // monitor tab still watching this id".
-    let _ = state
-        .mqtt
-        .client
-        .subscribe(&rx_topic, QoS::AtMostOnce)
-        .await;
-    let _ = state
-        .mqtt
-        .client
-        .subscribe(&tx_topic, QoS::AtMostOnce)
-        .await;
-    let _ = state
-        .mqtt
-        .client
-        .subscribe(&clip_tx_topic, QoS::AtMostOnce)
-        .await;
-
     let mut events_rx = state.mqtt.subscribe_events();
+    state.mqtt.subscribe_raw(&rx_topic).await;
+    state.mqtt.subscribe_raw(&tx_topic).await;
+    state.mqtt.subscribe_raw(&clip_tx_topic).await;
+
     let mut snapshot_rx = state.shared.subscribe();
 
     if send_device_status(&mut socket, &state, &id).await.is_err() {

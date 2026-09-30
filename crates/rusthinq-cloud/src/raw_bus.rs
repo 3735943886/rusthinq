@@ -148,8 +148,7 @@ pub fn lg_tap(
 /// Register the inject/emit handlers once, globally, on `sink` — routes
 /// `<raw_prefix>/<id>/raw/inject/set`, `raw/inject/clip/set` and `raw/emit/set` to the
 /// matching connected device via `manager`. `MqttSink::handle_message` already tries
-/// both `rusthinq_prefix` and `raw_prefix`, so nothing here needs to know which one
-/// matched. Silently ignored for an unknown id or bad hex: this is a debugging tap,
+/// the configured prefixes and restricts `raw/` commands to `raw_prefix`. Silently ignored for an unknown id or bad hex: this is a debugging tap,
 /// not a control plane that reports errors back to the publisher. Only call this when
 /// `config.mqtt.raw_prefix` is set.
 ///

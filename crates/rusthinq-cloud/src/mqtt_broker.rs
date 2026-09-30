@@ -379,6 +379,7 @@ impl Broker {
                                     );
                                 }
                                 if !self.dispatch(client_id, packet, &tx).await {
+                                    close_client = true;
                                     break;
                                 }
                             }
@@ -1240,5 +1241,31 @@ mod tests {
         // whose TCP session died without a clean close, rather than holding it
         // forever, by falling back to the flat default in that case.
         assert_eq!(idle_timeout_for(0), CLIENT_IDLE_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod regression_broker_regression {
+    #[tokio::test]
+    async fn regression_disconnect_ends_session_without_waiting_for_tcp_eof() {
+        use tokio::io::AsyncWriteExt;
+        let broker = std::sync::Arc::new(crate::mqtt_broker::Broker::new());
+        let (server, mut peer) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            broker.handle_connection(server).await;
+        });
+        // MQTT CONNECT: protocol MQTT/4, clean session, keep alive 60, client id x.
+        peer.write_all(&[
+            0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'x',
+        ])
+        .await
+        .unwrap();
+        peer.write_all(&[0xe0, 0]).await.unwrap();
+        let mut task = task;
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+            .await
+            .is_ok();
+        task.abort();
+        assert!(finished, "DISCONNECT left the session running");
     }
 }

@@ -128,10 +128,11 @@ impl DeviceAcceptor {
                         }
                     });
 
-                    let device_slot_emit: DeferredSlot<Arc<ConnectedDevice>> = DeferredSlot::new();
+                    let device_slot_emit: DeferredSlot<std::sync::Weak<ConnectedDevice>> =
+                        DeferredSlot::new();
                     let slot = device_slot_emit.clone();
                     let emit = Arc::new(move |buf: Vec<u8>| {
-                        if let Some(dev) = slot.get() {
+                        if let Some(dev) = slot.get().and_then(|dev| dev.upgrade()) {
                             dev.notify_data(&buf);
                         }
                     });
@@ -143,7 +144,7 @@ impl DeviceAcceptor {
                         emit,
                         send_to,
                     );
-                    device_slot_emit.set(dev.clone());
+                    device_slot_emit.set(Arc::downgrade(&dev));
                     devices.insert(device_id.clone(), (sockets.clone(), dev.clone()));
                     (sockets, dev, true)
                 };

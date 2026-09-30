@@ -262,10 +262,10 @@ impl DeviceAcceptor {
             sw_version,
         };
 
-        let device_slot: DeferredSlot<Arc<ConnectedDevice>> = DeferredSlot::new();
+        let device_slot: DeferredSlot<std::sync::Weak<ConnectedDevice>> = DeferredSlot::new();
         let slot_emit = device_slot.clone();
         let emit = Arc::new(move |buf: Vec<u8>| {
-            if let Some(dev) = slot_emit.get() {
+            if let Some(dev) = slot_emit.get().and_then(|dev| dev.upgrade()) {
                 dev.notify_data(&buf);
             }
         });
@@ -274,7 +274,7 @@ impl DeviceAcceptor {
         let did = device_id.to_string();
         let slot_send = device_slot.clone();
         let send_to = Arc::new(move |msg: SendToDevice| {
-            if let Some(d) = slot_send.get() {
+            if let Some(d) = slot_send.get().and_then(|dev| dev.upgrade()) {
                 d.notify_send(msg.clone());
             }
             let mid = now_millis();
@@ -338,7 +338,7 @@ impl DeviceAcceptor {
                 self.firmware_hosts.confirm_local_urls_in(data);
             }
         }
-        device_slot.set(dev.clone());
+        device_slot.set(Arc::downgrade(&dev));
 
         let mut cm = self.broker.client_meta(client_id);
         cm.has_device = true;
