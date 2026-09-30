@@ -110,6 +110,15 @@ pub fn init(rhai_dir: PathBuf, watch: bool) {
     }
 }
 
+/// Serializes tests that point the process-global script directory at their own
+/// tempdir: `cargo test` runs them in parallel, and another test's `init` landing
+/// between one test's `init` and its script lookup makes that lookup miss.
+#[cfg(test)]
+pub(crate) fn test_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +145,7 @@ mod tests {
 
     #[test]
     fn init_sets_the_configured_directory() {
+        let _lock = test_dir_lock();
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().to_path_buf(), false);
         assert_eq!(rhai_dir().as_deref(), Some(dir.path()));

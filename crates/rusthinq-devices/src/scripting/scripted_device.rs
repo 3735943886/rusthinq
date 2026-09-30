@@ -484,16 +484,20 @@ mod tests {
         Metadata::new(model_id, model_id, "1.0")
     }
 
-    fn with_script_dir(body: &str, model_id: &str) -> tempfile::TempDir {
+    fn with_script_dir(
+        body: &str,
+        model_id: &str,
+    ) -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let lock = crate::scripting::test_dir_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(format!("{model_id}.rhai")), body).unwrap();
         crate::scripting::init(dir.path().to_path_buf(), false);
-        dir
+        (lock, dir)
     }
 
     #[test]
     fn t2_on_data_reaches_the_script_and_publishes_via_ctx() {
-        let _dir = with_script_dir(
+        let (_lock, _dir) = with_script_dir(
             r#"
                 fn on_data(ctx, data) {
                     ctx.publish_property("last_hex", hex_encode(data));
@@ -521,7 +525,7 @@ mod tests {
 
     #[test]
     fn set_auto_ack_acks_aabb_frames_as_the_cloud_would_and_only_once_opted_in() {
-        let _dir = with_script_dir(
+        let (_lock, _dir) = with_script_dir(
             r#"
                 fn start(ctx) {
                     if ctx.model_id() == "T2_AUTO_ACK" { ctx.set_auto_ack(true); }
@@ -573,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_compile_error_yields_a_broken_script_stub_not_a_panic() {
-        let _dir = with_script_dir("fn on_data( {{{ not valid rhai", "T2_BROKEN");
+        let (_lock, _dir) = with_script_dir("fn on_data( {{{ not valid rhai", "T2_BROKEN");
         let mqtt = MockMqttConnection::new();
         let thinq = MockThinq2Device::new("dev-2", meta("T2_BROKEN"));
         let handler = scripted_t2_factory(
@@ -589,6 +593,7 @@ mod tests {
 
     #[test]
     fn missing_script_file_also_yields_a_broken_script_stub() {
+        let _lock = crate::scripting::test_dir_lock();
         let dir = tempfile::tempdir().unwrap();
         crate::scripting::init(dir.path().to_path_buf(), false);
 
@@ -608,7 +613,7 @@ mod tests {
 
     #[test]
     fn t1_send_json_reaches_the_mock_device() {
-        let _dir = with_script_dir(
+        let (_lock, _dir) = with_script_dir(
             r#"
                 fn start(ctx) {
                     ctx.send_json("{\"cmd\":\"hello\"}");
