@@ -151,7 +151,9 @@ class DeviceEntry {
 
         td = document.createElement('td')
         td.className = 'dev-model'
-        let model = this.remoteState.model
+        // The model string is whatever the appliance reported about itself (thinq2 deploy
+        // `kind`, thinq1 `modelName`), so it goes in as text, never as markup.
+        td.textContent = this.remoteState.model
         if (!this.remoteState.mapped && deviceMappingCapable) {
             // "mapped" just means registry.rs found a .rhai handler for this
             // modelId -- it says nothing about whether some other tool is driving the
@@ -160,9 +162,11 @@ class DeviceEntry {
             // Only shown when this build could possibly have mapped it (scripting
             // compiled in) -- with it off, *every* device is unmapped
             // regardless of the device itself, so the warning would say nothing.
-            model += ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`
+            td.insertAdjacentHTML(
+                'beforeend',
+                ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`,
+            )
         }
-        td.innerHTML = model
         children.push(td)
 
         td = document.createElement('td')
@@ -259,8 +263,10 @@ class DeviceEntry {
         td.className = 'dev-actions'
         td.innerHTML = `
             <span class="tooltipped" style="display: inline-block" data-position="bottom" data-tooltip="Monitor">
-                <a class="btn waves-effect waves-light" href="monitor?id=${this.id}"><i class="material-icons">troubleshoot</i></a>
+                <a class="btn waves-effect waves-light"><i class="material-icons">troubleshoot</i></a>
             </span>`
+        // Set as a property, not interpolated into the markup: the id also comes from the device.
+        td.querySelector('a').href = `monitor?id=${encodeURIComponent(this.id)}`
         children.push(td)
 
         this.row.replaceChildren(...children)
