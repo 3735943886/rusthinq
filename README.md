@@ -60,7 +60,7 @@ Two ways, freely mixed per model:
    wire bytes in-process and publish through the same MQTT primitives as the host (API:
    `scripting::ctx`). The drivers for specific models are in
    [rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts); to write one, see
-   [docs/il-rusthinq.md](docs/il-rusthinq.md) and that repository's
+   that repository's
    [writing guide](https://github.com/3735943886/rusthinq-scripts/blob/master/docs/writing-a-driver.md).
 2. **A raw-bus consumer in any language.** With `[mqtt] raw_prefix` set, connected
    devices' frames appear on `<raw_prefix>/<id>/raw/rx|tx` (plus `raw/clip/rx|tx`), and
