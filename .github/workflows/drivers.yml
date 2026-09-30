@@ -14,10 +14,10 @@ jobs:
     name: drivers (rusthinq-scripts@master)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check out the drivers
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: 3735943886/rusthinq-scripts
           path: rusthinq-scripts
