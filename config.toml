@@ -1,4 +1,4 @@
-hostname = "rusthinq.local" # this can't be an IP address
+hostname = "rusthinq.lan" # this can't be an IP address
 
 # /route echoes back the hostname the appliance asked for instead of pointing it to
 # `hostname`. Only needed when the appliance was never set up against rusthinq and
@@ -62,7 +62,7 @@ thinq1_port = 47878
 #   HTTPS    - HTTP route hits (e.g. /route, TotalDeviceInfoSvc)
 #   bridge   - LG-cloud bridge/relay activity: connect/disconnect, relayed packets,
 #              sign-in URL, login/logout outcomes
-log = ["status", "incoming", "HTTPS", "bridge"]
+log = ["status", "HTTPS", "bridge"]
 
 [mqtt]
 mqtt_url = "mqtt://localhost:1883"

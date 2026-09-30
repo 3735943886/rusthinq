@@ -428,7 +428,7 @@ pub fn normalize(raw: RawConfig) -> Config {
         gui: raw.gui,
         log: raw
             .log
-            .unwrap_or_else(|| vec!["status".into(), "incoming".into(), "HTTPS".into()]),
+            .unwrap_or_else(|| vec!["status".into(), "HTTPS".into()]),
         advertise_requested_host: raw.advertise_requested_host.unwrap_or(false),
     }
 }

@@ -56,7 +56,7 @@ Copy `config.toml` from the repo next to the binary and edit it. Every option is
 documented inline; these are the ones you have to think about.
 
 ```toml
-hostname = "rusthinq.local"        # a name, not an IP address
+hostname = "rusthinq.lan"          # a name, not an IP address
 advertise_requested_host = true    # needed for the "already set up" flow in 5a
 
 [mqtt]
