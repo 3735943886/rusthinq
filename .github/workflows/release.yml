@@ -22,10 +22,43 @@ env:
 
 concurrency:
   group: release-${{ inputs.tag }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches workspace version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+          tag = os.environ["RELEASE_TAG"]
+          version = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) or tag != f"v{version}":
+              raise SystemExit(f"Release tag {tag!r} must match stable workspace version v{version}")
+          PYTHON
+      - name: Reject an existing tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          existing=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
+          if [ -n "$existing" ]; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
   build:
+    needs: validate
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -93,18 +126,20 @@ jobs:
         # Perl on PATH and break the Windows build.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
+        run: cargo build --locked --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Build (cross)
         if: matrix.cross
         shell: bash
-        run: cross build --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
+        run: cross build --locked --release --target ${{ matrix.target }} ${{ env.PACKAGES }} --features ${{ env.FEATURES }}
 
       - name: Package
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          out="rusthinq-${{ inputs.tag }}-${{ matrix.name }}"
+          out="rusthinq-${RELEASE_TAG}-${{ matrix.name }}"
           mkdir "$out"
           for bin in ${{ env.BINARIES }}; do
             if [ "${{ runner.os }}" = "Windows" ]; then
@@ -140,8 +175,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum rusthinq-* > SHA256SUMS
+
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: dist/*
