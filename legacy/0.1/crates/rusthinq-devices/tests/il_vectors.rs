@@ -26,7 +26,7 @@ fn wire(value: &Value) -> String {
 #[test]
 fn the_host_validator_agrees_with_the_il_command_vectors() {
     let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../ildevice/vectors/commands.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../../ildevice/vectors/commands.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!("skipped: {} not found", path.display());
         return;
