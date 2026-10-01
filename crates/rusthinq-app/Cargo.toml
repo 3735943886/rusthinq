@@ -9,4 +9,6 @@ rusthinq-server = { path = "../rusthinq-server" }
 tempfile = "3"
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
+rusthinq-bridge = { path = "../rusthinq-bridge" }
 tokio.workspace = true
+serde_json.workspace = true

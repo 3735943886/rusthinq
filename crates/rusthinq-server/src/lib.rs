@@ -30,6 +30,8 @@ pub struct Config {
     pub write_timeout: Duration,
     /// Must be at least the loaded lifecycle ledger's generation high-water mark.
     pub generation_floor: u64,
+    /// Inclusive durable reservation bound; MAX preserves unreserved transport use.
+    pub generation_ceiling: u64,
 }
 impl Config {
     fn validate(&self) -> Result<(), Reject> {
@@ -41,6 +43,7 @@ impl Config {
             || self.max_connections == 0
             || self.idle_timeout.is_zero()
             || self.write_timeout.is_zero()
+            || self.generation_floor > self.generation_ceiling
         {
             return Err(Reject::InvalidConfig);
         }
@@ -58,6 +61,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(90),
             write_timeout: Duration::from_secs(10),
             generation_floor: 0,
+            generation_ceiling: u64::MAX,
         }
     }
 }
@@ -129,12 +133,14 @@ struct Entry {
 struct State {
     entries: HashMap<String, Entry>,
     generation: u64,
+    generation_ceiling: u64,
     active: BTreeSet<u64>,
     identified: HashMap<String, u64>,
     stopped: bool,
 }
 struct Shared {
     state: Mutex<State>,
+    completions: Mutex<HashMap<u64, watch::Receiver<bool>>>,
     events: broadcast::Sender<Event>,
     config: Config,
 }
@@ -147,6 +153,50 @@ impl Shared {
 #[derive(Clone)]
 pub struct ServerHandle(Arc<Shared>);
 impl ServerHandle {
+    /// Apply only a durably committed contiguous extension from the owner.
+    pub fn extend_generations(&self, floor: u64, ceiling: u64) -> Result<(), Reject> {
+        let mut state = self.0.lock();
+        if state.stopped {
+            return Err(Reject::Stopped);
+        }
+        if floor != state.generation_ceiling || ceiling <= floor {
+            return Err(Reject::InvalidConfig);
+        }
+        state.generation_ceiling = ceiling;
+        Ok(())
+    }
+    pub fn generation_budget(&self) -> (u64, u64) {
+        let state = self.0.lock();
+        (state.generation, state.generation_ceiling)
+    }
+    /// Close the exact ThinQ1 generation and await transport-future completion.
+    /// A Down event is emitted earlier and is not this completion barrier.
+    pub async fn close_and_wait(&self, session: &SessionId) -> Result<(), Reject> {
+        let completion = self
+            .0
+            .completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.generation)
+            .cloned();
+        let Some(mut completion) = completion else {
+            // A completed ThinQ1 task may have been pruned; an active unsupported
+            // transport cannot be treated as completed.
+            return if self.0.lock().active.contains(&session.generation) {
+                Err(Reject::StaleSession)
+            } else {
+                Ok(())
+            };
+        };
+        match self.close(session) {
+            Ok(()) | Err(Reject::StaleSession) => {}
+            Err(error) => return Err(error),
+        }
+        while !*completion.borrow() {
+            completion.changed().await.map_err(|_| Reject::Stopped)?;
+        }
+        Ok(())
+    }
     /// Broadcast receivers report Lagged explicitly. Recover via snapshot; events carry generations.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.0.events.subscribe()
@@ -220,12 +270,14 @@ impl Server {
         let state = State {
             entries: HashMap::new(),
             generation: config.generation_floor,
+            generation_ceiling: config.generation_ceiling,
             active: BTreeSet::new(),
             identified: HashMap::new(),
             stopped: false,
         };
         let handle = ServerHandle(Arc::new(Shared {
             state: Mutex::new(state),
+            completions: Mutex::new(HashMap::new()),
             events,
             config,
         }));
@@ -255,6 +307,7 @@ impl Server {
             state.generation = state
                 .generation
                 .checked_add(1)
+                .filter(|next| *next <= state.generation_ceiling)
                 .ok_or(Reject::GenerationExhausted)?;
             let generation = state.generation;
             state.active.insert(generation);
@@ -262,7 +315,16 @@ impl Server {
         };
         let shared = self.handle.0.clone();
         let stop = self.stop.subscribe();
-        self.tasks.spawn(run(stream, shared, generation, stop));
+        let (completed, completion) = watch::channel(false);
+        {
+            let mut completions = shared.completions.lock().unwrap_or_else(|e| e.into_inner());
+            completions.retain(|_, receiver| !*receiver.borrow() && receiver.has_changed().is_ok());
+            completions.insert(generation, completion);
+        }
+        self.tasks.spawn(async move {
+            run(stream, shared, generation, stop).await;
+            completed.send_replace(true);
+        });
         Ok(generation)
     }
     pub async fn shutdown(mut self) {

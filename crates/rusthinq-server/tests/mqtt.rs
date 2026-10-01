@@ -14,6 +14,57 @@ use tokio::{
 struct FixedClock;
 
 #[tokio::test]
+async fn reserved_generation_ceiling_fences_redeploy_and_new_transport_admission() {
+    let broker = Broker::new(
+        Config {
+            generation_floor: 10,
+            generation_ceiling: 11,
+            ..Config::default()
+        },
+        Arc::new(FixedClock),
+    )
+    .unwrap();
+    let mut events = broker.handle().subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let session = ready(&mut peer, "d", &mut events).await;
+    assert_eq!(session.generation, 11);
+    publish(
+        &mut peer,
+        "clip/provisioning/devices/d",
+        &json!({"did":"d","cmd":"deploy","kind":"model","data":{}}),
+    )
+    .await;
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(
+            session,
+            Disconnect::ThinQ2(rusthinq_protocol::thinq2::Error::CounterExhausted)
+        )
+    );
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(broker.handle().snapshot().is_empty());
+    let (stream, _peer) = tokio::io::duplex(8192);
+    assert!(broker.run(stream).await.is_err());
+    assert_eq!(
+        broker.handle().extend_generations(10, 12),
+        Err(Reject::InvalidConfig)
+    );
+    broker.handle().extend_generations(11, 12).unwrap();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let current = ready(&mut peer, "d", &mut events).await;
+    assert_eq!(current.generation, 12);
+    broker.stop();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn qos2_release_delivers_once_with_retries_and_reusable_identifiers() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let mut events = broker.handle().subscribe();

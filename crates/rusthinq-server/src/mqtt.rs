@@ -63,6 +63,9 @@ pub struct Handle {
     shared: Arc<Shared>,
 }
 impl Handle {
+    pub fn extend_generations(&self, floor: u64, ceiling: u64) -> Result<(), Reject> {
+        ServerHandle(self.shared.clone()).extend_generations(floor, ceiling)
+    }
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.shared.events.subscribe()
     }
@@ -108,11 +111,13 @@ impl Broker {
         config.validate()?;
         let (events, _) = broadcast::channel(config.event_capacity);
         let shared = Arc::new(Shared {
+            completions: Mutex::new(HashMap::new()),
             config: config.clone(),
             events,
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 generation: config.generation_floor,
+                generation_ceiling: config.generation_ceiling,
                 active: BTreeSet::new(),
                 identified: HashMap::new(),
                 stopped: false,
@@ -144,6 +149,7 @@ impl Broker {
             state.generation = state
                 .generation
                 .checked_add(1)
+                .filter(|next| *next <= state.generation_ceiling)
                 .ok_or_else(|| io::Error::other("generation exhausted"))?;
             let generation = state.generation;
             state.active.insert(generation);
@@ -407,7 +413,11 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                             {
                                 break 'connection Disconnect::Closed;
                             }
-                            let Some(next) = state.generation.checked_add(1) else {
+                            let Some(next) = state
+                                .generation
+                                .checked_add(1)
+                                .filter(|next| *next <= state.generation_ceiling)
+                            else {
                                 break 'connection Disconnect::ThinQ2(
                                     thinq2::Error::CounterExhausted,
                                 );
