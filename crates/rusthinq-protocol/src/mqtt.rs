@@ -1,4 +1,4 @@
-//! Bounded MQTT 3.1.1 device codec. Clean, local sessions; QoS 0/1 ingress.
+//! Bounded MQTT 3.1.1 device codec. Clean, local sessions; QoS 0/1/2 ingress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Malformed,
@@ -6,10 +6,18 @@ pub enum Error {
     Unsupported,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Will {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
     Connect {
         client: String,
         keep_alive: u16,
+        will: Option<Will>,
     },
     Subscribe {
         id: u16,
@@ -24,6 +32,10 @@ pub enum Packet {
         payload: Vec<u8>,
         id: Option<u16>,
         duplicate: bool,
+        qos: u8,
+    },
+    PubRel {
+        id: u16,
     },
     Ping,
     Disconnect,
@@ -110,14 +122,30 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
             if flags & 1 != 0 || flags & 0x40 != 0 && flags & 0x80 == 0 {
                 return Err(Error::Malformed);
             }
-            if flags & 0x3c != 0 || flags & 2 == 0 {
+            if flags & 2 == 0 {
                 return Err(Error::Unsupported);
-            } // will/persistent sessions
-            let keep_alive = body.number()?;
-            let client = body.string()?;
-            if client.is_empty() {
+            } // persistent sessions require an explicit store
+            let will_qos = (flags >> 3) & 3;
+            if will_qos == 3 || flags & 4 == 0 && flags & 0x38 != 0 {
                 return Err(Error::Malformed);
             }
+            let keep_alive = body.number()?;
+            let client = body.string()?;
+            let will = if flags & 4 != 0 {
+                let topic = body.string()?;
+                if topic.is_empty() || topic.contains(['+', '#']) {
+                    return Err(Error::Malformed);
+                }
+                let size = body.number()? as usize;
+                Some(Will {
+                    topic,
+                    payload: body.take(size)?.to_vec(),
+                    qos: will_qos,
+                    retain: flags & 0x20 != 0,
+                })
+            } else {
+                None
+            };
             if flags & 0x80 != 0 {
                 body.string()?;
             }
@@ -125,11 +153,15 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
                 let n = body.number()? as usize;
                 body.take(n)?;
             }
-            Packet::Connect { client, keep_alive }
+            Packet::Connect {
+                client,
+                keep_alive,
+                will,
+            }
         }
         3 => {
             let qos = (flags >> 1) & 3;
-            if qos > 1 || flags & 1 != 0 {
+            if qos == 3 || flags & 1 != 0 {
                 return Err(Error::Unsupported);
             }
             if qos == 0 && flags & 8 != 0 {
@@ -139,7 +171,7 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
             if topic.is_empty() || topic.contains(['+', '#']) {
                 return Err(Error::Malformed);
             }
-            let id = if qos == 1 { Some(body.id()?) } else { None };
+            let id = if qos > 0 { Some(body.id()?) } else { None };
             let payload = body.0.to_vec();
             body.0 = &[];
             Packet::Publish {
@@ -147,6 +179,7 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
                 payload,
                 id,
                 duplicate: flags & 8 != 0,
+                qos,
             }
         }
         kind @ (8 | 10) if flags == 2 => {
@@ -174,6 +207,7 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
                 Packet::Unsubscribe { id, filters }
             }
         }
+        6 if flags == 2 => Packet::PubRel { id: body.id()? },
         12 if flags == 0 => Packet::Ping,
         14 if flags == 0 => Packet::Disconnect,
         _ => return Err(Error::Unsupported),

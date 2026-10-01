@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/rusthinq-protocol", "crates/rusthinq-lifecycle", "crates/rusthinq-server"]
+members = [
+    "crates/rusthinq-protocol",
+    "crates/rusthinq-lifecycle",
+    "crates/rusthinq-server",
+    "crates/rusthinq-bridge",
+    "crates/rusthinq-app",
+]
 exclude = ["legacy/0.1"]
 resolver = "2"
 

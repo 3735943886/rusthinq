@@ -12,6 +12,167 @@ use tokio::{
     time::timeout,
 };
 struct FixedClock;
+
+#[tokio::test]
+async fn qos2_release_delivers_once_with_retries_and_reusable_identifiers() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let mut events = broker.handle().subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let session = ready(&mut peer, "d", &mut events).await;
+    for sequence in [1, 2] {
+        let topic = "clip/message/devices/d";
+        let payload = json!({"did":"d","cmd":"opaque","sequence":sequence}).to_string();
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(&9u16.to_be_bytes());
+        body.extend_from_slice(payload.as_bytes());
+        for header in [0x34, 0x3c] {
+            peer.write_all(&mqtt::frame(header, &body, 8192).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(wire(&mut peer).await, [0x50, 2, 0, 9]);
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+        peer.write_all(&[0x62, 2, 0, 9]).await.unwrap();
+        assert_eq!(wire(&mut peer).await, [0x70, 2, 0, 9]);
+        assert_eq!(
+            event(&mut events).await,
+            Event::CloudBound(session.clone(), payload.into_bytes())
+        );
+        peer.write_all(&[0x62, 2, 0, 9]).await.unwrap();
+        assert_eq!(wire(&mut peer).await, [0x70, 2, 0, 9]);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+    broker.stop();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn qos2_pending_storage_is_bounded() {
+    let broker = Broker::new(
+        Config {
+            outbound_capacity: 1,
+            ..Config::default()
+        },
+        Arc::new(FixedClock),
+    )
+    .unwrap();
+    let mut events = broker.handle().subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let session = ready(&mut peer, "d", &mut events).await;
+    let topic = "clip/message/devices/d";
+    for id in [9u16, 10] {
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(br#"{"did":"d","cmd":"opaque"}"#);
+        peer.write_all(&mqtt::frame(0x34, &body, 8192).unwrap())
+            .await
+            .unwrap();
+        if id == 9 {
+            assert_eq!(wire(&mut peer).await, [0x50, 2, 0, 9]);
+        }
+    }
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(session, Disconnect::Mqtt)
+    );
+    task.await.unwrap();
+    broker.stop();
+}
+
+#[tokio::test]
+async fn will_is_observed_on_eof_but_suppressed_on_disconnect_and_shutdown() {
+    for mode in 0..3 {
+        let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+        let mut events = broker.handle().subscribe();
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        let runtime = broker.clone();
+        let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+        let body = [
+            0, 4, b'M', b'Q', b'T', b'T', 4, 0x2e, 0, 60, 0, 0, 0, 1, b't', 0, 2, 0, 255,
+        ];
+        peer.write_all(&mqtt::frame(0x10, &body, 8192).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wire(&mut peer).await, [0x20, 2, 0, 0]);
+        match mode {
+            0 => {
+                peer.shutdown().await.unwrap();
+            }
+            1 => {
+                peer.write_all(&[0xe0, 0]).await.unwrap();
+            }
+            _ => broker.stop(),
+        }
+        task.await.unwrap();
+        if mode == 0 {
+            assert!(
+                matches!(event(&mut events).await, Event::Will {generation, session:None, message} if generation > 0 && message.topic == "t" && message.payload == [0,255] && message.qos == 1 && message.retain)
+            );
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        broker.stop();
+    }
+}
+
+#[tokio::test]
+async fn empty_client_ids_provision_independent_device_sessions() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let handle = broker.handle();
+    let mut events = handle.subscribe();
+    let mut tasks = Vec::new();
+    let mut peers = Vec::new();
+    let mut ids = Vec::new();
+    for did in ["first", "second"] {
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        let runtime = broker.clone();
+        tasks.push(tokio::spawn(
+            async move { runtime.run(stream).await.unwrap() },
+        ));
+        setup_with_client(&mut peer, did, 60, "").await;
+        provisioning(&mut peer, did).await;
+        publish(
+            &mut peer,
+            &format!("clip/message/devices/{did}"),
+            &json!({"did":did,"cmd":"completeProvisioning_ack"}),
+        )
+        .await;
+        let Event::Up(id) = event(&mut events).await else {
+            panic!("up")
+        };
+        assert_eq!(id.device, did);
+        assert!(matches!(event(&mut events).await, Event::Ready(ref current, _) if current == &id));
+        ids.push(id);
+        peers.push(peer);
+    }
+    assert_eq!(handle.snapshot().len(), 2);
+    for (id, peer) in ids.iter().zip(peers.iter_mut()) {
+        let receipt = handle.send(id, b"{}").unwrap();
+        assert!(
+            matches!(mqtt::decode(&wire(peer).await, 8192).unwrap(), mqtt::Packet::Publish {topic, ..} if topic == format!("lime/devices/{}", id.device))
+        );
+        assert_eq!(receipt.wait().await, Delivery::Sent);
+    }
+    broker.stop();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(handle.snapshot().is_empty());
+}
 impl Clock for FixedClock {
     fn sample(&self) -> io::Result<Sample> {
         Ok(Sample {
@@ -19,6 +180,54 @@ impl Clock for FixedClock {
             calendar: [26, 9, 1, 5, 6, 7, 4],
         })
     }
+}
+
+#[tokio::test]
+async fn redeploy_on_one_transport_replaces_generation_without_reconnect() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let handle = broker.handle();
+    let mut events = handle.subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let old = ready(&mut peer, "d", &mut events).await;
+    provisioning(&mut peer, "d").await;
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(old.clone(), Disconnect::Closed)
+    );
+    assert!(handle.snapshot().is_empty());
+    assert_eq!(handle.close(&old), Err(Reject::StaleSession));
+    assert!(matches!(
+        handle.send(&old, b"{}"),
+        Err(Reject::StaleSession)
+    ));
+    // A second deploy before completion also stays on the same transport.
+    provisioning(&mut peer, "d").await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        &json!({"did":"d","cmd":"completeProvisioning_ack"}),
+    )
+    .await;
+    let Event::Up(current) = event(&mut events).await else {
+        panic!("up")
+    };
+    assert!(current.generation > old.generation + 1);
+    assert_eq!(current.device, old.device);
+    assert!(matches!(event(&mut events).await, Event::Ready(ref id, _) if id == &current));
+    assert_eq!(handle.snapshot(), vec![current.clone()]);
+    let receipt = handle.send(&current, b"{}").unwrap();
+    assert!(
+        matches!(mqtt::decode(&wire(&mut peer).await, 8192).unwrap(), mqtt::Packet::Publish {payload, ..} if payload == b"{}")
+    );
+    assert_eq!(receipt.wait().await, Delivery::Sent);
+    broker.stop();
+    task.await.unwrap();
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(current, Disconnect::Closed)
+    );
 }
 async fn wire<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
     timeout(Duration::from_secs(3), async {
@@ -43,9 +252,18 @@ async fn event(events: &mut broadcast::Receiver<Event>) -> Event {
         .unwrap()
 }
 async fn setup<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, did: &str, keep_alive: u16) {
+    setup_with_client(stream, did, keep_alive, "x").await;
+}
+async fn setup_with_client<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    did: &str,
+    keep_alive: u16,
+    client: &str,
+) {
     let mut connect = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2];
     connect.extend_from_slice(&keep_alive.to_be_bytes());
-    connect.extend_from_slice(&[0, 1, b'x']);
+    connect.extend_from_slice(&(client.len() as u16).to_be_bytes());
+    connect.extend_from_slice(client.as_bytes());
     stream
         .write_all(&mqtt::frame(0x10, &connect, 4096).unwrap())
         .await
@@ -388,7 +606,7 @@ async fn full_queue_and_partial_write_cannot_delay_shutdown_or_other_devices() {
     assert_eq!(queued.wait().await, Delivery::Failed);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn qos1_puback_and_declared_keepalive_are_honored() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let mut events = broker.handle().subscribe();
@@ -432,13 +650,49 @@ async fn qos1_puback_and_declared_keepalive_are_honored() {
     event(&mut events).await;
     let start = tokio::time::Instant::now();
     assert_eq!(
-        event(&mut events).await,
+        events.recv().await.unwrap(),
         Event::Down(current, Disconnect::IdleTimeout)
     );
-    assert!(start.elapsed() >= Duration::from_millis(1400));
+    assert_eq!(start.elapsed(), Duration::from_secs(300));
     task.await.unwrap();
     broker.stop();
     assert_eq!(id.device, "d");
+}
+
+#[tokio::test]
+async fn qos1_retransmission_first_duplicate_and_reused_ids_keep_session_alive() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let mut events = broker.handle().subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let session = ready(&mut peer, "d", &mut events).await;
+    let topic = "clip/message/devices/d";
+    // First-seen DUP, retransmission, then packet-ID reuse with distinct content.
+    for (header, sequence) in [(0x3a, 1), (0x3a, 1), (0x32, 2), (0x3a, 2)] {
+        let payload = json!({"did":"d", "cmd":"opaque", "sequence":sequence}).to_string();
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(&9u16.to_be_bytes());
+        body.extend_from_slice(payload.as_bytes());
+        peer.write_all(&mqtt::frame(header, &body, 4096).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wire(&mut peer).await, vec![0x40, 2, 0, 9]);
+        assert_eq!(
+            event(&mut events).await,
+            Event::CloudBound(session.clone(), payload.into_bytes())
+        );
+        peer.write_all(&[0xc0, 0]).await.unwrap();
+        assert_eq!(wire(&mut peer).await, vec![0xd0, 0]);
+    }
+    assert_eq!(broker.handle().snapshot(), vec![session.clone()]);
+    broker.stop();
+    task.await.unwrap();
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(session, Disconnect::Closed)
+    );
 }
 
 #[tokio::test]

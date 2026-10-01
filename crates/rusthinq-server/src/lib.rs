@@ -3,6 +3,8 @@
 pub mod certificates;
 pub mod mqtt;
 pub mod provisioning;
+pub mod retained;
+pub mod thinq1_http;
 pub mod tls;
 use rusthinq_protocol::thinq1::{self, Action, Input};
 use std::{
@@ -72,6 +74,12 @@ pub enum Event {
     Down(SessionId, Disconnect),
     Ready(SessionId, serde_json::Value),
     CloudBound(SessionId, Vec<u8>),
+    /// Raw MQTT Last Will observation; L6 owns publication and retained storage.
+    Will {
+        generation: u64,
+        session: Option<SessionId>,
+        message: rusthinq_protocol::mqtt::Will,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disconnect {

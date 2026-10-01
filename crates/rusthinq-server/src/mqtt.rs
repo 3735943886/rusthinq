@@ -206,9 +206,12 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     let (close, mut closing) = watch::channel(false);
     let (commands, mut outbound) = mpsc::channel::<Command>(config.outbound_capacity);
     let mut connected = false;
+    let mut will = None;
+    let mut clean_disconnect = false;
     let mut idle = config.idle_timeout;
     let mut deadline = Instant::now() + idle;
     let mut filters: Vec<String> = Vec::new();
+    let mut qos2: HashMap<u16, (u64, String, Vec<u8>)> = HashMap::new();
     // Reads persist across outbound command selection; cancellation never loses partial packets.
     let (mut reader, mut writer) = tokio::io::split(&mut stream);
     let reason = 'connection: loop {
@@ -246,13 +249,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         let mut actions = Vec::new();
         let mut replies = Vec::new();
         match packet {
-            Packet::Connect { keep_alive, .. } if !connected => {
+            Packet::Connect {
+                keep_alive,
+                will: message,
+                ..
+            } if !connected => {
+                will = message;
                 connected = true;
-                idle = if keep_alive == 0 {
-                    config.idle_timeout
-                } else {
-                    Duration::from_millis(keep_alive as u64 * 1500)
-                };
+                // Preserve the appliance-tested grace floor from the 0.1 broker.
+                idle = mqtt_idle_timeout(keep_alive, config.idle_timeout);
                 deadline = Instant::now() + idle;
                 replies.push(vec![0x20, 2, 0, 0]);
             }
@@ -284,17 +289,66 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 replies.push(vec![0xb0, 2, (id >> 8) as u8, id as u8]);
             }
             Packet::Ping => replies.push(vec![0xd0, 0]),
-            Packet::Disconnect => break Disconnect::Eof,
+            Packet::Disconnect => {
+                clean_disconnect = true;
+                break Disconnect::Eof;
+            }
+            Packet::Publish {
+                topic,
+                payload,
+                id: Some(id),
+                qos: 2,
+                ..
+            } => {
+                if payload.len() > config.max_payload {
+                    break Disconnect::Mqtt;
+                }
+                if let Some((_, previous_topic, previous_payload)) = qos2.get(&id) {
+                    if previous_topic != &topic || previous_payload != &payload {
+                        break Disconnect::Mqtt;
+                    }
+                } else {
+                    if qos2.len() >= config.outbound_capacity {
+                        break Disconnect::Mqtt;
+                    }
+                    qos2.insert(id, (guard.generation, topic, payload));
+                }
+                replies.push(vec![0x50, 2, (id >> 8) as u8, id as u8]);
+            }
+            Packet::PubRel { id } => {
+                // Unknown/repeated PUBREL still completes without replaying device input.
+                if let Some((generation, topic, payload)) = qos2.remove(&id)
+                    && generation == guard.generation
+                {
+                    let sample = match broker.clock.sample() {
+                        Ok(sample) => sample,
+                        Err(_) => break Disconnect::Io,
+                    };
+                    let outcome = model.input(
+                        Input::Device {
+                            topic: &topic,
+                            payload: &payload,
+                            outbound_mid: sample.mid,
+                        },
+                        start.elapsed(),
+                    );
+                    if let Some(error) = outcome.error {
+                        break Disconnect::ThinQ2(error);
+                    }
+                    actions = outcome.actions;
+                }
+                replies.push(vec![0x70, 2, (id >> 8) as u8, id as u8]);
+            }
             Packet::Publish {
                 topic,
                 payload,
                 id,
-                duplicate,
+                duplicate: _,
+                qos: _,
             } => {
-                // QoS1 retransmission has an ambiguous processing outcome; do not replay CLIP actions.
-                if duplicate {
-                    break Disconnect::Mqtt;
-                }
+                // QoS1 is at-least-once. DUP can also be the first delivery seen here.
+                // Packet identifiers are reusable after PUBACK, so do not infer
+                // application-level duplication from an identifier or DUP alone.
                 let sample = match broker.clock.sample() {
                     Ok(sample) => sample,
                     Err(_) => break Disconnect::Io,
@@ -338,21 +392,47 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             index += 1;
             match action {
                 Action::Provision { operation, request } => {
-                    // Reprovisioning an already identified transport needs a new logical generation.
-                    // This first runtime slice requires an explicit reconnect instead.
-                    if guard.id.is_some() {
-                        break 'connection Disconnect::ThinQ2(thinq2::Error::Busy);
-                    }
                     let device = request["did"].as_str().expect("L1 deploy ID").to_owned();
                     if device.len() > 256 {
                         break 'connection Disconnect::Mqtt;
                     }
                     {
+                        let mut state = broker.shared.lock();
+                        if let Some(previous) = guard.id.as_ref() {
+                            if state.stopped
+                                || !state
+                                    .entries
+                                    .get(&previous.device)
+                                    .is_some_and(|entry| entry.id == *previous)
+                            {
+                                break 'connection Disconnect::Closed;
+                            }
+                            let Some(next) = state.generation.checked_add(1) else {
+                                break 'connection Disconnect::ThinQ2(
+                                    thinq2::Error::CounterExhausted,
+                                );
+                            };
+                            state.generation = next;
+                            state.active.remove(&guard.generation);
+                            state.active.insert(next);
+                            guard.generation = next;
+                            if let Some(old) = state.entries.remove(&previous.device)
+                                && old.ready
+                            {
+                                let _ = broker
+                                    .shared
+                                    .events
+                                    .send(Event::Down(old.id, Disconnect::Closed));
+                            }
+                            // All queued sends belong to the previous logical incarnation.
+                            while let Ok(command) = outbound.try_recv() {
+                                let _ = command.result.send(Delivery::Failed);
+                            }
+                        }
                         let id = SessionId {
                             device,
                             generation: guard.generation,
                         };
-                        let mut state = broker.shared.lock();
                         if state.stopped
                             || state
                                 .identified
@@ -529,6 +609,26 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
+    if !clean_disconnect
+        && !matches!(reason, Disconnect::Closed)
+        && let Some(message) = will
+    {
+        let state = broker.shared.lock();
+        if !state.stopped
+            && guard.id.as_ref().is_none_or(|id| {
+                state
+                    .entries
+                    .get(&id.device)
+                    .is_some_and(|entry| entry.id == *id)
+            })
+        {
+            let _ = broker.shared.events.send(Event::Will {
+                generation: guard.generation,
+                session: guard.id.clone(),
+                message,
+            });
+        }
+    }
     guard.reason = reason;
     drop(reader);
     drop(writer);
@@ -537,5 +637,32 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     outbound.close();
     while let Some(command) = outbound.recv().await {
         let _ = command.result.send(Delivery::Failed);
+    }
+}
+
+fn mqtt_idle_timeout(keep_alive: u16, configured: Duration) -> Duration {
+    let floor = configured.max(Duration::from_secs(300));
+    floor.max(Duration::from_millis(u64::from(keep_alive) * 1500))
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    #[test]
+    fn appliance_grace_never_shortens_configured_or_declared_interval() {
+        for keep_alive in [0, 1, 30, 200] {
+            assert_eq!(
+                mqtt_idle_timeout(keep_alive, Duration::from_secs(90)),
+                Duration::from_secs(300)
+            );
+        }
+        assert_eq!(
+            mqtt_idle_timeout(600, Duration::from_secs(90)),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            mqtt_idle_timeout(0, Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
     }
 }
