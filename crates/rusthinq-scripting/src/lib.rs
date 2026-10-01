@@ -1,4 +1,5 @@
 //! L5 bounded, IL-agnostic Rhai execution. The caller owns worker scheduling and sinks.
+pub mod context;
 pub mod worker;
 use rhai::{
     AST, CallFnOptions, Dynamic, Engine, EvalAltResult, Scope,
@@ -55,13 +56,75 @@ struct Buffer {
     limits: Limits,
     consumer: bool,
 }
+impl Buffer {
+    fn emit(&mut self, value: String, publish: bool) -> Result<(), Box<EvalAltResult>> {
+        if publish && !self.consumer {
+            return Err("consumer disabled".into());
+        }
+        let bytes = self
+            .bytes
+            .checked_add(value.len())
+            .ok_or_else(|| Box::<EvalAltResult>::from("output size overflow"))?;
+        if value.len() > self.limits.string_bytes
+            || bytes > self.limits.output_bytes
+            || self.outputs.len() >= self.limits.outputs
+        {
+            return Err("output capacity exceeded".into());
+        }
+        self.bytes = bytes;
+        self.outputs.push(if publish {
+            Output::Publish(value)
+        } else {
+            Output::Send(value)
+        });
+        Ok(())
+    }
+}
 pub struct Compiled {
+    context: Option<context::Context>,
     engine: Engine,
     ast: AST,
     buffer: Arc<Mutex<Buffer>>,
     limits: Limits,
 }
 impl Compiled {
+    /// Opt into callbacks taking `(ctx, text)`. No legacy IL or raw MQTT APIs are installed.
+    pub fn with_context(
+        source: &str,
+        limits: Limits,
+        consumer_enabled: bool,
+        config: context::Config,
+    ) -> Result<Self, Error> {
+        let ctx = context::Context::new(config, limits.string_bytes)?;
+        let mut compiled = Self::new(source, limits, consumer_enabled)?;
+        context::install(&mut compiled.engine);
+        for (name, publish) in [("publish", true), ("send", false), ("send_json", false)] {
+            let buffer = compiled.buffer.clone();
+            compiled.engine.register_fn(
+                name,
+                move |_ctx: &mut context::Context,
+                      value: String|
+                      -> Result<(), Box<EvalAltResult>> {
+                    buffer
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .emit(value, publish)
+                },
+            );
+        }
+        compiled.context = Some(ctx);
+        Ok(compiled)
+    }
+    pub fn context_device(&self) -> Option<&str> {
+        self.context.as_ref().map(|ctx| ctx.device())
+    }
+    /// Configure the actual consumer before attaching this compiled generation.
+    pub fn set_consumer_enabled(&mut self, enabled: bool) {
+        self.buffer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .consumer = enabled;
+    }
     /// Compile off the transport loop, before swapping the running generation.
     /// No filesystem resolver, MQTT factory, or IL validation is installed.
     pub fn new(source: &str, limits: Limits, consumer_enabled: bool) -> Result<Self, Error> {
@@ -96,26 +159,7 @@ impl Compiled {
                 name,
                 move |value: String| -> Result<(), Box<EvalAltResult>> {
                     let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                    if publish && !buffer.consumer {
-                        return Err("consumer disabled".into());
-                    }
-                    let bytes = buffer
-                        .bytes
-                        .checked_add(value.len())
-                        .ok_or_else(|| Box::<EvalAltResult>::from("output size overflow"))?;
-                    if value.len() > buffer.limits.string_bytes
-                        || bytes > buffer.limits.output_bytes
-                        || buffer.outputs.len() >= buffer.limits.outputs
-                    {
-                        return Err("output capacity exceeded".into());
-                    }
-                    buffer.bytes = bytes;
-                    buffer.outputs.push(if publish {
-                        Output::Publish(value)
-                    } else {
-                        Output::Send(value)
-                    });
-                    Ok(())
+                    buffer.emit(value, publish)
                 },
             );
         }
@@ -123,6 +167,7 @@ impl Compiled {
             .compile(source)
             .map_err(|error| Error::Compile(error.to_string()))?;
         Ok(Self {
+            context: None,
             engine,
             ast,
             buffer,
@@ -180,13 +225,23 @@ impl Host {
                         .eval_ast_with_scope::<Dynamic>(&mut self.scope, &self.compiled.ast)?;
                     self.initialized = true;
                 }
-                let _ = self.compiled.engine.call_fn_with_options::<Dynamic>(
-                    CallFnOptions::new().eval_ast(false).rewind_scope(false),
-                    &mut self.scope,
-                    &self.compiled.ast,
-                    function,
-                    (input.to_owned(),),
-                )?;
+                if let Some(ctx) = &self.compiled.context {
+                    let _ = self.compiled.engine.call_fn_with_options::<Dynamic>(
+                        CallFnOptions::new().eval_ast(false).rewind_scope(false),
+                        &mut self.scope,
+                        &self.compiled.ast,
+                        function,
+                        (ctx.clone(), input.to_owned()),
+                    )?;
+                } else {
+                    let _ = self.compiled.engine.call_fn_with_options::<Dynamic>(
+                        CallFnOptions::new().eval_ast(false).rewind_scope(false),
+                        &mut self.scope,
+                        &self.compiled.ast,
+                        function,
+                        (input.to_owned(),),
+                    )?;
+                }
                 Ok(())
             },
         ));

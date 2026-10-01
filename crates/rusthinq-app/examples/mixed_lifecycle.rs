@@ -33,8 +33,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|error| io::Error::other(format!("server config: {error:?}")))?;
     let broker = Broker::sharing(server.handle(), Arc::new(SystemClock));
     let mut mqtt_tasks = JoinSet::new();
-    let runtime = Runtime::new(storage, server.handle(), Duration::from_secs(10), 256)?
-        .with_generation_refill(1_000_000, 10_000)?;
+    let runtime = Runtime::new_mixed(
+        storage,
+        server.handle(),
+        broker.handle(),
+        Duration::from_secs(10),
+        256,
+    )?
+    .with_generation_refill(1_000_000, 10_000)?;
     let mut events = runtime.handle().subscribe();
     let listener = TcpListener::bind(&args[0]).await?;
     let mqtt_listener = TcpListener::bind(&args[1]).await?;

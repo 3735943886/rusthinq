@@ -63,6 +63,10 @@ pub struct Handle {
     shared: Arc<Shared>,
 }
 impl Handle {
+    /// Identity check for L6 owners that route both codecs through one session registry.
+    pub fn shares_registry(&self, server: &ServerHandle) -> bool {
+        Arc::ptr_eq(&self.shared, &server.0)
+    }
     pub fn generation_budget(&self) -> (u64, u64) {
         ServerHandle(self.shared.clone()).generation_budget()
     }

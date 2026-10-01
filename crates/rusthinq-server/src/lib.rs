@@ -108,7 +108,7 @@ pub enum Reject {
     Stopped,
     GenerationExhausted,
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Sent,
     Failed,

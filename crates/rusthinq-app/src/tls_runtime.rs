@@ -35,7 +35,8 @@ impl Service {
         let server = Server::new(config)
             .map_err(|error| io::Error::other(format!("server config: {error:?}")))?;
         let broker = Broker::sharing(server.handle(), clock);
-        let mut runtime = Runtime::new(storage, server.handle(), grace, events)?;
+        let mut runtime =
+            Runtime::new_mixed(storage, server.handle(), broker.handle(), grace, events)?;
         if let Some((count, low_water)) = refill {
             runtime = runtime.with_generation_refill(count, low_water)?;
         }
@@ -48,6 +49,14 @@ impl Service {
     }
     pub fn handle(&self) -> Handle {
         self.runtime.handle()
+    }
+    pub fn with_scripts(mut self, owner: crate::scripts::Owner) -> Self {
+        self.runtime = self.runtime.with_scripts(owner);
+        self
+    }
+    pub fn with_script_sink(mut self, sink: Arc<dyn crate::scripts::PublishSink>) -> Self {
+        self.runtime = self.runtime.with_script_sink(sink);
+        self
     }
     /// Add bounded L3 HTTPS services (e.g. ThinQ1 metadata or provisioning).
     pub fn with_local_service(

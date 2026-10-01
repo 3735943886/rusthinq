@@ -1,9 +1,11 @@
 use rusthinq_app::{
     lifecycle_storage::Storage,
     runtime::{Event, Runtime},
+    scripts::{Callbacks, Context, DataEncoding, Owner, PublishSink},
 };
 use rusthinq_lifecycle::Action;
 use rusthinq_protocol::mqtt;
+use rusthinq_scripting::{Compiled, Limits, worker};
 use rusthinq_server::{
     Config, Event as TransportEvent, Protocol, Reject, Server,
     mqtt::{Broker, SystemClock},
@@ -12,9 +14,47 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
-    sync::{broadcast, watch},
+    sync::{broadcast, mpsc, watch},
     time::timeout,
 };
+
+struct ScriptSink(mpsc::Sender<(Context, String)>);
+impl PublishSink for ScriptSink {
+    fn try_publish(&self, context: &Context, payload: String) -> Result<(), String> {
+        self.0
+            .try_send((context.clone(), payload))
+            .map_err(|error| error.to_string())
+    }
+}
+async fn attach_data(handle: &rusthinq_app::runtime::Handle, id: &str, encoding: DataEncoding) {
+    let session = handle
+        .snapshot()
+        .into_iter()
+        .find(|d| d.entry.id == id)
+        .unwrap()
+        .session
+        .unwrap();
+    handle.attach_script(id.into(), session,
+        Compiled::new("let count=0; fn on_data(v){count+=1;publish(v);send(\"{ \\\"cmd\\\": \\\"script\\\" }\");}", Limits::default(), true).unwrap(),
+        worker::Config::default(), Callbacks {data: Some("on_data".into()), data_encoding: encoding, ..Callbacks::default()}).await.unwrap();
+}
+async fn script_publish(publications: &mut mpsc::Receiver<(Context, String)>) -> (Context, String) {
+    timeout(Duration::from_secs(3), publications.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+async fn script_packet(peer: &mut DuplexStream) {
+    let bytes = packet(peer).await;
+    assert_eq!(bytes[0] & 1, 0, "script downlink must not be retained");
+    match mqtt::decode(&bytes, 8192).unwrap() {
+        mqtt::Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "lime/devices/d");
+            assert_eq!(payload, br#"{ "cmd": "script" }"#);
+        }
+        other => panic!("expected script publish, got {other:?}"),
+    }
+}
 
 async fn packet(peer: &mut DuplexStream) -> Vec<u8> {
     timeout(Duration::from_secs(3), async {
@@ -367,4 +407,223 @@ async fn mqtt_eof_persists_device_and_restart_restores_offline() {
     let restored = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128).unwrap();
     assert_eq!(restored.handle().snapshot().len(), 1);
     assert!(!restored.handle().snapshot()[0].online);
+}
+
+#[tokio::test]
+async fn mqtt_binary_script_data_and_redeploy_are_fenced_with_nonretained_downlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let (sink, mut publications) = mpsc::channel(8);
+    let runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(ScriptSink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let service = broker.clone();
+    let transport = tokio::spawn(async move { service.run(stream).await.unwrap() });
+    connect(&mut peer).await;
+    deploy(&mut peer).await;
+    until(&mut events, |e| {
+        matches!(e, Event::Transport(TransportEvent::Ready(..)))
+    })
+    .await;
+    attach_data(&handle, "d", DataEncoding::Hex).await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"device_packet","data":"00ff80"}),
+    )
+    .await;
+    let (first, bytes) = script_publish(&mut publications).await;
+    assert_eq!(bytes, "00ff80");
+    script_packet(&mut peer).await;
+    until(&mut events, |e| {
+        matches!(
+            e,
+            Event::ScriptDelivery {
+                delivery: rusthinq_server::Delivery::Sent,
+                ..
+            }
+        )
+    })
+    .await;
+    deploy(&mut peer).await;
+    until(&mut events, |e| matches!(e, Event::Transport(TransportEvent::Ready(id,_)) if id.generation > first.session.generation)).await;
+    attach_data(&handle, "d", DataEncoding::Hex).await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"device_packet","data":"fe01"}),
+    )
+    .await;
+    let (second, bytes) = script_publish(&mut publications).await;
+    assert_eq!(bytes, "fe01");
+    assert!(second.session.generation > first.session.generation);
+    assert_eq!(second.session.incarnation, first.session.incarnation);
+    script_packet(&mut peer).await;
+    broker.stop();
+    transport.await.unwrap();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mixed_script_downlinks_choose_protocol_from_captured_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let broker = Broker::sharing(server.handle(), Arc::new(SystemClock));
+    let (sink, mut publications) = mpsc::channel(8);
+    let runtime = Runtime::new_mixed(
+        storage,
+        server.handle(),
+        broker.handle(),
+        Duration::ZERO,
+        128,
+    )
+    .unwrap()
+    .with_scripts(Owner::new(2).unwrap())
+    .with_script_sink(Arc::new(ScriptSink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+    let mut thin = thinq1(&mut server, "other").await;
+    until(
+        &mut events,
+        |e| matches!(e, Event::Lifecycle(Action::Online {id,..}) if id == "other"),
+    )
+    .await;
+    attach_data(&handle, "other", DataEncoding::Utf8).await;
+    let body =
+        json!({"Header":{"x-lgedm-deviceId":"other"},"Body":{"ReturnCode":"OK"}}).to_string();
+    thin.write_all(&rusthinq_protocol::thinq1::encode(body.as_bytes(), 8192).unwrap())
+        .await
+        .unwrap();
+    let (context, payload) = script_publish(&mut publications).await;
+    assert_eq!(context.device, "other");
+    assert_eq!(payload, body);
+    let size = timeout(Duration::from_secs(3), thin.read_u32())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut frame = vec![0; size as usize];
+    thin.read_exact(&mut frame).await.unwrap();
+    assert_eq!(frame, br#"{ "cmd": "script" }"#);
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let service = broker.clone();
+    let transport = tokio::spawn(async move { service.run(stream).await.unwrap() });
+    connect(&mut peer).await;
+    deploy(&mut peer).await;
+    until(&mut events, |e| {
+        matches!(e, Event::Transport(TransportEvent::Ready(..)))
+    })
+    .await;
+    attach_data(&handle, "d", DataEncoding::Hex).await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"device_packet","data":"ff00"}),
+    )
+    .await;
+    let (context, payload) = script_publish(&mut publications).await;
+    assert_eq!(context.device, "d");
+    assert_eq!(payload, "ff00");
+    script_packet(&mut peer).await;
+    assert_eq!(handle.snapshot().len(), 2);
+    server.shutdown().await;
+    transport.await.unwrap();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mixed_runtime_rejects_unrelated_registries_before_starting() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Config::default()).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    assert!(!broker.handle().shares_registry(&server.handle()));
+    let result = Runtime::new_mixed(
+        storage,
+        server.handle(),
+        broker.handle(),
+        Duration::ZERO,
+        32,
+    );
+    assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+    server.shutdown().await;
+    broker.stop();
+}
+
+#[tokio::test]
+async fn mqtt_utf8_admission_error_does_not_fault_script_or_change_its_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let (sink, mut publications) = mpsc::channel(4);
+    let runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(ScriptSink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let service = broker.clone();
+    let transport = tokio::spawn(async move { service.run(stream).await.unwrap() });
+    connect(&mut peer).await;
+    deploy(&mut peer).await;
+    until(&mut events, |e| {
+        matches!(e, Event::Transport(TransportEvent::Ready(..)))
+    })
+    .await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            Compiled::new(
+                "let count=0; fn on_data(v){count+=1;publish(v+count.to_string());}",
+                Limits::default(),
+                true,
+            )
+            .unwrap(),
+            worker::Config::default(),
+            Callbacks {
+                data: Some("on_data".into()),
+                ..Callbacks::default()
+            },
+        )
+        .await
+        .unwrap();
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"device_packet","data":"ff"}),
+    )
+    .await;
+    until(
+        &mut events,
+        |e| matches!(e,Event::Rejected {reason,..} if reason.contains("invalid utf-8")),
+    )
+    .await;
+    assert!(publications.try_recv().is_err());
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"device_packet","data":"6869"}),
+    )
+    .await;
+    assert_eq!(script_publish(&mut publications).await.1, "hi1");
+    broker.stop();
+    transport.await.unwrap();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
 }

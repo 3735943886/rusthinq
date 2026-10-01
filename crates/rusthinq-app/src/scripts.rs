@@ -27,6 +27,56 @@ pub struct Completion {
     generation: u64,
     outcome: Outcome,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    pub device: String,
+    pub session: SessionKey,
+    pub generation: u64,
+}
+impl Completion {
+    pub fn context(&self) -> Context {
+        Context {
+            device: self.device.clone(),
+            session: self.session,
+            generation: self.generation,
+        }
+    }
+}
+/// Called synchronously after fencing. Implementations must be bounded/nonblocking;
+/// retained MQTT adapters must durably inventory ownership before publication.
+pub trait PublishSink: Send + Sync {
+    fn try_publish(&self, context: &Context, payload: String) -> Result<(), String>;
+}
+#[derive(Clone, Debug, Default)]
+pub struct Callbacks {
+    pub response: Option<String>,
+    pub data: Option<String>,
+    pub ready: Option<String>,
+    pub data_encoding: DataEncoding,
+}
+#[derive(Clone, Debug, Default)]
+pub enum DataEncoding {
+    #[default]
+    Utf8,
+    /// Lowercase hex preserves every byte without interpreting IL or model framing.
+    Hex,
+}
+impl DataEncoding {
+    pub(crate) fn encode(&self, data: &[u8]) -> Result<String, String> {
+        match self {
+            Self::Utf8 => String::from_utf8(data.to_vec()).map_err(|error| error.to_string()),
+            Self::Hex => {
+                let mut result = String::with_capacity(data.len().saturating_mul(2));
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for byte in data {
+                    result.push(HEX[usize::from(byte >> 4)] as char);
+                    result.push(HEX[usize::from(byte & 15)] as char);
+                }
+                Ok(result)
+            }
+        }
+    }
+}
 impl Call {
     pub async fn wait(self) -> Result<Completion, Error> {
         Ok(Completion {
@@ -49,6 +99,17 @@ pub struct Owner {
     stopped: bool,
 }
 impl Owner {
+    pub fn generation(&self, id: &str) -> Option<u64> {
+        self.workers
+            .get(id)
+            .and_then(|owned| match *owned.worker.handle().status().borrow() {
+                rusthinq_scripting::worker::Status::Running { generation }
+                | rusthinq_scripting::worker::Status::Faulted { generation, .. } => {
+                    Some(generation)
+                }
+                rusthinq_scripting::worker::Status::Stopped { .. } => None,
+            })
+    }
     pub fn new(capacity: usize) -> Result<Self, Error> {
         if capacity == 0 {
             return Err(Error::InvalidConfig);
@@ -85,6 +146,9 @@ impl Owner {
         self.reconcile(devices);
         if !Self::current(devices, &id, session) {
             return Err(Error::Stale);
+        }
+        if compiled.context_device().is_some_and(|device| device != id) {
+            return Err(Error::InvalidConfig);
         }
         if self.workers.contains_key(&id)
             || self.workers.len() + self.retiring.len() >= self.capacity
@@ -153,6 +217,9 @@ impl Owner {
     ) -> Result<rusthinq_scripting::worker::Reload, Error> {
         if self.stopped {
             return Err(Error::Stopped);
+        }
+        if compiled.context_device().is_some_and(|device| device != id) {
+            return Err(Error::InvalidConfig);
         }
         self.reconcile(devices);
         self.workers
