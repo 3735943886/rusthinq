@@ -10,5 +10,10 @@ tempfile = "3"
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
 rusthinq-bridge = { path = "../rusthinq-bridge" }
+rusthinq-scripting = { path = "../rusthinq-scripting" }
 tokio.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+openssl = "0.10"
+tokio-openssl = "0.6"

@@ -1,4 +1,4 @@
-//! Owned L6 ThinQ1 session/lifecycle loop and serialized off-thread persistence.
+//! Owned L6 session/lifecycle loop and serialized off-thread persistence.
 use crate::lifecycle_storage::Storage;
 use rusthinq_bridge::devices::{BridgeHandle, Deregistration, Registration};
 use rusthinq_lifecycle::{Action, Device, Input, Model, SessionKey, Step};
@@ -17,6 +17,7 @@ use tokio::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    Metadata(rusthinq_server::thinq1_http::Metadata),
     GenerationExtended { ceiling: u64 },
     GenerationRefillFailed { reason: String },
     CleanupFailed { reason: String },
@@ -38,6 +39,7 @@ struct AttachCleanup {
     result: oneshot::Sender<io::Result<()>>,
 }
 struct Shared {
+    metadata: Mutex<BTreeMap<String, rusthinq_server::thinq1_http::Metadata>>,
     devices: Mutex<Vec<Device>>,
     events: broadcast::Sender<Event>,
     commands: mpsc::Sender<String>,
@@ -47,6 +49,15 @@ struct Shared {
 #[derive(Clone)]
 pub struct Handle(Arc<Shared>);
 impl Handle {
+    pub fn metadata_snapshot(&self) -> Vec<rusthinq_server::thinq1_http::Metadata> {
+        self.0
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
     /// Supply a fresh session and reopened inventory after cleanup failure.
     /// A running worker is never replaced or aborted by this operation.
     pub async fn attach_retained_cleanup<S>(
@@ -95,11 +106,55 @@ enum WriteResult {
     Reservation(Result<crate::lifecycle_storage::GenerationBlock, String>),
 }
 type WriteTask = JoinHandle<(Storage, WriteResult)>;
+#[derive(Clone)]
+enum TransportHandle {
+    ThinQ1(ServerHandle),
+    ThinQ2(rusthinq_server::mqtt::Handle),
+}
+impl TransportHandle {
+    fn subscribe(&self) -> broadcast::Receiver<TransportEvent> {
+        match self {
+            Self::ThinQ1(handle) => handle.subscribe(),
+            Self::ThinQ2(handle) => handle.subscribe(),
+        }
+    }
+    fn snapshot(&self) -> Vec<SessionId> {
+        match self {
+            Self::ThinQ1(handle) => handle.snapshot(),
+            Self::ThinQ2(handle) => handle.snapshot(),
+        }
+    }
+    fn close(&self, session: &SessionId) -> Result<(), rusthinq_server::Reject> {
+        match self {
+            Self::ThinQ1(handle) => handle.close(session),
+            Self::ThinQ2(handle) => handle.close(session),
+        }
+    }
+    async fn close_and_wait(&self, session: &SessionId) -> Result<(), rusthinq_server::Reject> {
+        match self {
+            Self::ThinQ1(handle) => handle.close_and_wait(session).await,
+            Self::ThinQ2(handle) => handle.close_and_wait(session).await,
+        }
+    }
+    fn generation_budget(&self) -> (u64, u64) {
+        match self {
+            Self::ThinQ1(handle) => handle.generation_budget(),
+            Self::ThinQ2(handle) => handle.generation_budget(),
+        }
+    }
+    fn extend_generations(&self, floor: u64, ceiling: u64) -> Result<(), rusthinq_server::Reject> {
+        match self {
+            Self::ThinQ1(handle) => handle.extend_generations(floor, ceiling),
+            Self::ThinQ2(handle) => handle.extend_generations(floor, ceiling),
+        }
+    }
+}
 pub struct Runtime {
+    scripts: Option<crate::scripts::Owner>,
     model: Model,
     storage: Option<Storage>,
     write: Option<WriteTask>,
-    server: ServerHandle,
+    server: TransportHandle,
     transport: broadcast::Receiver<TransportEvent>,
     shared: Arc<Shared>,
     capacity: usize,
@@ -114,6 +169,7 @@ pub struct Runtime {
     removal_registrations: BTreeMap<String, Registration>,
     refill: Option<(u64, u64)>,
     deferred_storage: Option<Action>,
+    metadata: Option<mpsc::Receiver<rusthinq_server::thinq1_http::Metadata>>,
 }
 struct Bridge {
     handle: BridgeHandle,
@@ -126,6 +182,33 @@ impl Runtime {
     pub fn new(
         storage: Storage,
         server: ServerHandle,
+        grace: Duration,
+        event_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::from_transport(
+            storage,
+            TransportHandle::ThinQ1(server),
+            grace,
+            event_capacity,
+        )
+    }
+    /// Local MQTT transport tasks remain owned and joined by the caller/front door.
+    pub fn new_mqtt(
+        storage: Storage,
+        broker: rusthinq_server::mqtt::Handle,
+        grace: Duration,
+        event_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::from_transport(
+            storage,
+            TransportHandle::ThinQ2(broker),
+            grace,
+            event_capacity,
+        )
+    }
+    fn from_transport(
+        storage: Storage,
+        server: TransportHandle,
         grace: Duration,
         event_capacity: usize,
     ) -> io::Result<Self> {
@@ -145,6 +228,7 @@ impl Runtime {
         let (attach, attachments) = mpsc::channel(1);
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
         let shared = Arc::new(Shared {
+            metadata: Mutex::new(BTreeMap::new()),
             devices: Mutex::new(model.devices()),
             events,
             commands,
@@ -152,6 +236,7 @@ impl Runtime {
             cleanup_status,
         });
         Ok(Self {
+            scripts: None,
             model,
             storage: Some(storage),
             write: None,
@@ -170,10 +255,45 @@ impl Runtime {
             removal_registrations: BTreeMap::new(),
             refill: None,
             deferred_storage: None,
+            metadata: None,
         })
     }
     pub fn handle(&self) -> Handle {
         Handle(self.shared.clone())
+    }
+    /// Own preconfigured workers; lifecycle changes invalidate their session bindings.
+    /// Automatic driver selection and transport callback dispatch remain separate.
+    pub fn with_scripts(mut self, mut owner: crate::scripts::Owner) -> Self {
+        assert!(self.scripts.is_none(), "one script worker owner");
+        owner.reconcile(&self.model.devices());
+        self.scripts = Some(owner);
+        self
+    }
+    pub fn with_metadata(
+        mut self,
+        receiver: mpsc::Receiver<rusthinq_server::thinq1_http::Metadata>,
+    ) -> Self {
+        assert!(self.metadata.is_none(), "one metadata source");
+        self.metadata = Some(receiver);
+        self
+    }
+    fn observe_metadata(&self, metadata: rusthinq_server::thinq1_http::Metadata) {
+        let mut entries = self
+            .shared
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !entries.contains_key(&metadata.device_id) && entries.len() >= self.capacity {
+            drop(entries);
+            self.emit(Event::Rejected {
+                device: metadata.device_id,
+                reason: "metadata inventory capacity exceeded".into(),
+            });
+            return;
+        }
+        entries.insert(metadata.device_id.clone(), metadata.clone());
+        drop(entries);
+        self.emit(Event::Metadata(metadata));
     }
     /// Refill a reserved ThinQ1 generation budget on the serialized storage worker.
     pub fn with_generation_refill(mut self, count: u64, low_water: u64) -> io::Result<Self> {
@@ -295,6 +415,9 @@ impl Runtime {
     fn input(&mut self, input: Input) {
         let outcome = self.model.input(input, self.epoch.elapsed());
         self.deadline = outcome.next_deadline;
+        if let Some(scripts) = &mut self.scripts {
+            scripts.reconcile(&self.model.devices());
+        }
         *self
             .shared
             .devices
@@ -313,6 +436,11 @@ impl Runtime {
             match action {
                 Action::Removed { id, .. } => {
                     self.removal_registrations.remove(&id);
+                    self.shared
+                        .metadata
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
                 }
                 Action::ForgetStep {
                     id,
@@ -503,6 +631,19 @@ impl Runtime {
                 }
             }
             if stopping && self.write.is_none() && self.closes.is_empty() {
+                if let Some(scripts) = self.scripts.take()
+                    && let Err(error) = scripts.shutdown().await
+                {
+                    self.emit(Event::Rejected {
+                        device: String::new(),
+                        reason: format!("script worker shutdown: {error:?}"),
+                    });
+                }
+                if let Some(mut receiver) = self.metadata.take() {
+                    while let Ok(metadata) = receiver.try_recv() {
+                        self.observe_metadata(metadata);
+                    }
+                }
                 self.cleanup_state
                     .send_replace((self.model.devices(), true));
                 if self.cleanup.is_none() {
@@ -561,6 +702,9 @@ impl Runtime {
                 }
                 Some(id) = self.commands.recv(), if !stopping => {
                     self.forget(id);
+                }
+                metadata = async {self.metadata.as_mut().expect("metadata source").recv().await}, if !stopping && self.metadata.is_some() => {
+                    match metadata {Some(metadata)=>self.observe_metadata(metadata),None=>self.metadata=None}
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !stopping && self.refill.is_some() => {},
                 event = self.transport.recv(), if !stopping => match event {

@@ -1,0 +1,9 @@
+[package]
+name = "rusthinq-scripting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rhai = { version = "1.26.0", features = ["sync"] }
+tokio.workspace = true

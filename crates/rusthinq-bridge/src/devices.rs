@@ -224,6 +224,9 @@ impl BridgeHandle {
         if !server.snapshot().contains(local) {
             return Err(Error::Offline);
         }
+        if server.protocol(local) != Ok(rusthinq_server::Protocol::ThinQ1) {
+            return Err(Error::Transport(Reject::WrongTransport));
+        }
         if payload.len() > self.0.max_payload {
             return Err(Error::InvalidPayload);
         }

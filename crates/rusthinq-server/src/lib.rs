@@ -99,6 +99,7 @@ pub enum Disconnect {
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reject {
+    WrongTransport,
     InvalidConfig,
     Busy,
     StaleSession,
@@ -125,6 +126,7 @@ struct Command {
     result: oneshot::Sender<Delivery>,
 }
 struct Entry {
+    protocol: Protocol,
     id: SessionId,
     commands: mpsc::Sender<Command>,
     close: watch::Sender<bool>,
@@ -139,6 +141,7 @@ struct State {
     stopped: bool,
 }
 struct Shared {
+    stop: watch::Sender<bool>,
     state: Mutex<State>,
     completions: Mutex<HashMap<u64, watch::Receiver<bool>>>,
     events: broadcast::Sender<Event>,
@@ -152,7 +155,21 @@ impl Shared {
 }
 #[derive(Clone)]
 pub struct ServerHandle(Arc<Shared>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    ThinQ1,
+    ThinQ2,
+}
 impl ServerHandle {
+    pub fn protocol(&self, session: &SessionId) -> Result<Protocol, Reject> {
+        self.0
+            .lock()
+            .entries
+            .get(&session.device)
+            .filter(|entry| entry.id == *session && entry.ready)
+            .map(|entry| entry.protocol)
+            .ok_or(Reject::StaleSession)
+    }
     /// Apply only a durably committed contiguous extension from the owner.
     pub fn extend_generations(&self, floor: u64, ceiling: u64) -> Result<(), Reject> {
         let mut state = self.0.lock();
@@ -223,6 +240,9 @@ impl ServerHandle {
             .get(&session.device)
             .filter(|entry| entry.id == *session && entry.ready)
             .ok_or(Reject::StaleSession)?;
+        if entry.protocol != Protocol::ThinQ1 {
+            return Err(Reject::WrongTransport);
+        }
         let _: serde_json::Value =
             serde_json::from_slice(payload).map_err(|_| Reject::InvalidJson)?;
         let frame = thinq1::encode(payload, self.0.config.max_payload)
@@ -267,6 +287,7 @@ impl Server {
     pub fn new(config: Config) -> Result<Self, Reject> {
         config.validate()?;
         let (events, _) = broadcast::channel(config.event_capacity);
+        let (stop, _) = watch::channel(false);
         let state = State {
             entries: HashMap::new(),
             generation: config.generation_floor,
@@ -276,12 +297,12 @@ impl Server {
             stopped: false,
         };
         let handle = ServerHandle(Arc::new(Shared {
+            stop: stop.clone(),
             state: Mutex::new(state),
             completions: Mutex::new(HashMap::new()),
             events,
             config,
         }));
-        let (stop, _) = watch::channel(false);
         Ok(Self {
             handle,
             tasks: JoinSet::new(),
@@ -303,6 +324,9 @@ impl Server {
             let mut state = self.handle.0.lock();
             if state.stopped {
                 return Err(Reject::Stopped);
+            }
+            if state.active.len() >= self.handle.0.config.max_connections {
+                return Err(Reject::Busy);
             }
             state.generation = state
                 .generation
@@ -477,6 +501,7 @@ async fn run<S>(
                     if let Some(old) = state.entries.insert(
                         id.device.clone(),
                         Entry {
+                            protocol: Protocol::ThinQ1,
                             id: id.clone(),
                             commands: commands.clone(),
                             close: close.clone(),

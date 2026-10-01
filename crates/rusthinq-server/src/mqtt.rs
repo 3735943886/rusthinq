@@ -1,7 +1,7 @@
 //! Local ThinQ2 device MQTT service. No external broker, cloud dial, or IL semantics.
 use crate::{
-    Command, Config, Delivery, Disconnect, Entry, Event, Guard, Receipt, Reject, ServerHandle,
-    SessionId, Shared, State,
+    Command, Config, Delivery, Disconnect, Entry, Event, Guard, Protocol, Receipt, Reject,
+    ServerHandle, SessionId, Shared, State,
     tls::{LocalFuture, LocalService, Transport},
     write_frame,
 };
@@ -63,6 +63,14 @@ pub struct Handle {
     shared: Arc<Shared>,
 }
 impl Handle {
+    pub fn generation_budget(&self) -> (u64, u64) {
+        ServerHandle(self.shared.clone()).generation_budget()
+    }
+    pub async fn close_and_wait(&self, session: &SessionId) -> Result<(), Reject> {
+        ServerHandle(self.shared.clone())
+            .close_and_wait(session)
+            .await
+    }
     pub fn extend_generations(&self, floor: u64, ceiling: u64) -> Result<(), Reject> {
         ServerHandle(self.shared.clone()).extend_generations(floor, ceiling)
     }
@@ -95,6 +103,9 @@ impl Handle {
             .get(&id.device)
             .filter(|entry| entry.id == *id && entry.ready)
             .ok_or(Reject::StaleSession)?;
+        if entry.protocol != Protocol::ThinQ2 {
+            return Err(Reject::WrongTransport);
+        }
         let (result, receive) = oneshot::channel();
         entry
             .commands
@@ -110,7 +121,9 @@ impl Broker {
     pub fn new(config: Config, clock: Arc<dyn Clock>) -> Result<Self, Reject> {
         config.validate()?;
         let (events, _) = broadcast::channel(config.event_capacity);
+        let (stop, _) = watch::channel(false);
         let shared = Arc::new(Shared {
+            stop: stop.clone(),
             completions: Mutex::new(HashMap::new()),
             config: config.clone(),
             events,
@@ -123,7 +136,6 @@ impl Broker {
                 stopped: false,
             }),
         });
-        let (stop, _) = watch::channel(false);
         Ok(Self {
             shared,
             clock,
@@ -133,6 +145,15 @@ impl Broker {
     pub fn handle(&self) -> Handle {
         Handle {
             shared: self.shared.clone(),
+        }
+    }
+    /// Share the ThinQ1 owner's sessions, allocator, admission bound and stop signal.
+    /// MQTT transport tasks remain caller/front-door owned.
+    pub fn sharing(server: ServerHandle, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            stop: server.0.stop.clone(),
+            shared: server.0,
+            clock,
         }
     }
     /// Signals all connections separately from data queues. Their caller/front door owns joins.
@@ -161,7 +182,18 @@ impl Broker {
             reason: Disconnect::Panic,
             generation,
         };
+        let (completed, completion) = watch::channel(false);
+        {
+            let mut completions = self
+                .shared
+                .completions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            completions.retain(|_, receiver| !*receiver.borrow() && receiver.has_changed().is_ok());
+            completions.insert(generation, completion);
+        }
         connection(stream, self, guard).await;
+        completed.send_replace(true);
         Ok(())
     }
 }
@@ -425,7 +457,18 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                             state.generation = next;
                             state.active.remove(&guard.generation);
                             state.active.insert(next);
+                            let previous_generation = guard.generation;
                             guard.generation = next;
+                            {
+                                let mut completions = broker
+                                    .shared
+                                    .completions
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if let Some(completion) = completions.remove(&previous_generation) {
+                                    completions.insert(next, completion);
+                                }
+                            }
                             if let Some(old) = state.entries.remove(&previous.device)
                                 && old.ready
                             {
@@ -460,6 +503,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         if let Some(old) = state.entries.insert(
                             id.device.clone(),
                             Entry {
+                                protocol: Protocol::ThinQ2,
                                 id: id.clone(),
                                 commands: commands.clone(),
                                 close: close.clone(),

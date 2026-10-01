@@ -5,6 +5,7 @@ members = [
     "crates/rusthinq-server",
     "crates/rusthinq-bridge",
     "crates/rusthinq-app",
+    "crates/rusthinq-scripting",
 ]
 exclude = ["legacy/0.1"]
 resolver = "2"
