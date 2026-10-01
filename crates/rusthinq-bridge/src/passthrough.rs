@@ -91,6 +91,12 @@ impl Relay {
         f(&mut hosts, now).map_err(policy_error)
     }
 
+    /// Diagnostics advances expiry without renewing suspected leases.
+    pub fn snapshot(
+        &self,
+    ) -> io::Result<std::collections::BTreeMap<String, crate::firmware::Evidence>> {
+        self.with_hosts(|hosts, now| hosts.snapshot(now))
+    }
     pub fn learn_command(&self, payload: &Value) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.learn_command(payload, now))
     }

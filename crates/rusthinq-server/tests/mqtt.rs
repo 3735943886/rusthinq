@@ -14,6 +14,144 @@ use tokio::{
 struct FixedClock;
 
 #[tokio::test]
+async fn bridge_downlink_is_fenced_and_bridged_ingress_has_no_local_clip_ack() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let handle = broker.handle();
+    let mut events = handle.subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let session = ready(&mut peer, "d", &mut events).await;
+    // A bridge transition must preserve an in-progress device packet read.
+    peer.write_all(&[0xc0]).await.unwrap();
+    assert_eq!(
+        handle.bridge_state(&session, 2, true).unwrap().wait().await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        event(&mut events).await,
+        Event::BridgeChanged(session.clone(), 2, true)
+    );
+    peer.write_all(&[0]).await.unwrap();
+    assert_eq!(wire(&mut peer).await, [0xd0, 0]);
+    let cloud = b"{\"did\":\"d\",\"cmd\":\"opaque\"}\0";
+    let receipt = handle.cloud(&session, 2, cloud).unwrap();
+    assert!(
+        matches!(mqtt::decode(&wire(&mut peer).await, 8192).unwrap(), mqtt::Packet::Publish {payload, ..} if payload == cloud)
+    );
+    assert_eq!(receipt.wait().await, Delivery::Sent);
+    let packet = json!({"did":"d","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())});
+    publish(&mut peer, "clip/message/devices/d", &packet).await;
+    assert!(matches!(event(&mut events).await, Event::Data(ref id,_) if id == &session));
+    assert!(
+        matches!(event(&mut events).await, Event::BridgedCloudBound(ref id,2,_) if id == &session)
+    );
+    peer.write_all(&[0xc0, 0]).await.unwrap();
+    assert_eq!(wire(&mut peer).await, [0xd0, 0]);
+    assert_eq!(
+        handle
+            .bridge_state(&session, 3, false)
+            .unwrap()
+            .wait()
+            .await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        event(&mut events).await,
+        Event::BridgeChanged(session.clone(), 3, false)
+    );
+    assert_eq!(
+        handle.cloud(&session, 2, cloud).unwrap().wait().await,
+        Delivery::Failed
+    );
+    assert_eq!(
+        handle.bridge_state(&session, 2, true).unwrap().wait().await,
+        Delivery::Failed
+    );
+    assert!(matches!(
+        handle.cloud(&session, 2, br#"{"did":"other","cmd":"opaque"}"#),
+        Err(Reject::InvalidJson)
+    ));
+    peer.write_all(&[0xc0, 0]).await.unwrap();
+    assert_eq!(wire(&mut peer).await, [0xd0, 0]);
+    publish(&mut peer, "clip/message/devices/d", &packet).await;
+    let mqtt::Packet::Publish { payload, .. } = mqtt::decode(&wire(&mut peer).await, 8192).unwrap()
+    else {
+        panic!("local ack")
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&payload).unwrap()["cmd"],
+        "ack"
+    );
+    assert!(matches!(event(&mut events).await, Event::Data(ref id,_) if id == &session));
+    assert!(matches!(event(&mut events).await, Event::CloudBound(ref id,_) if id == &session));
+    broker.stop();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn redeploy_drops_inherited_cloud_ack_ownership() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let handle = broker.handle();
+    let mut events = handle.subscribe();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    let old = ready(&mut peer, "d", &mut events).await;
+    assert_eq!(
+        handle.bridge_state(&old, 2, true).unwrap().wait().await,
+        Delivery::Sent
+    );
+    event(&mut events).await;
+    provisioning(&mut peer, "d").await;
+    assert_eq!(
+        event(&mut events).await,
+        Event::Down(old.clone(), Disconnect::Closed)
+    );
+    assert!(matches!(
+        event(&mut events).await,
+        Event::BridgeChanged(_, 3, false)
+    ));
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        &json!({"did":"d","cmd":"completeProvisioning_ack"}),
+    )
+    .await;
+    let Event::Up(current) = event(&mut events).await else {
+        panic!("up")
+    };
+    event(&mut events).await;
+    assert!(current.generation > old.generation);
+    assert!(matches!(
+        handle.bridge_state(&old, 4, true),
+        Err(Reject::StaleSession)
+    ));
+    assert_eq!(
+        handle
+            .cloud(&current, 2, br#"{"did":"d","cmd":"opaque"}"#)
+            .unwrap()
+            .wait()
+            .await,
+        Delivery::Failed
+    );
+    let packet = json!({"did":"d","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())});
+    publish(&mut peer, "clip/message/devices/d", &packet).await;
+    let mqtt::Packet::Publish { payload, .. } = mqtt::decode(&wire(&mut peer).await, 8192).unwrap()
+    else {
+        panic!("ack")
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&payload).unwrap()["cmd"],
+        "ack"
+    );
+    assert!(matches!(event(&mut events).await, Event::Data(_, _)));
+    assert!(matches!(event(&mut events).await, Event::CloudBound(_, _)));
+    broker.stop();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn reserved_generation_ceiling_fences_redeploy_and_new_transport_admission() {
     let broker = Broker::new(
         Config {

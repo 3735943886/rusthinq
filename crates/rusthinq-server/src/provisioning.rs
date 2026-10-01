@@ -98,7 +98,7 @@ impl Service {
             }),
         })
     }
-    async fn request(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    pub(crate) async fn request(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
         let path = request.uri().path();
         match path {
             "/route" => {

@@ -74,6 +74,10 @@ impl Service {
         self.local.push((front, listener, service));
         Ok(self)
     }
+    pub fn with_firmware(mut self, relay: rusthinq_bridge::passthrough::Relay) -> Self {
+        self.runtime = self.runtime.with_firmware(relay);
+        self
+    }
     pub fn with_metadata(
         mut self,
         receiver: mpsc::Receiver<rusthinq_server::thinq1_http::Metadata>,

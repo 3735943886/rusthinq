@@ -1,6 +1,7 @@
 //! L3 ThinQ1 runtime. Admission accepts an already established transport (TCP or TLS).
 //! No lifecycle, persistence, scripts, or cloud ownership lives here.
 pub mod certificates;
+pub mod https;
 pub mod mqtt;
 pub mod provisioning;
 pub mod retained;
@@ -78,6 +79,8 @@ pub enum Event {
     Down(SessionId, Disconnect),
     Ready(SessionId, serde_json::Value),
     CloudBound(SessionId, Vec<u8>),
+    BridgedCloudBound(SessionId, u64, Vec<u8>),
+    BridgeChanged(SessionId, u64, bool),
     /// Raw MQTT Last Will observation; L6 owns publication and retained storage.
     Will {
         generation: u64,
@@ -129,6 +132,7 @@ struct Entry {
     protocol: Protocol,
     id: SessionId,
     commands: mpsc::Sender<Command>,
+    bridge: Option<mpsc::Sender<mqtt::BridgeCommand>>,
     close: watch::Sender<bool>,
     ready: bool,
 }
@@ -502,6 +506,7 @@ async fn run<S>(
                         id.device.clone(),
                         Entry {
                             protocol: Protocol::ThinQ1,
+                            bridge: None,
                             id: id.clone(),
                             commands: commands.clone(),
                             close: close.clone(),

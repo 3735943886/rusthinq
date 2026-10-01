@@ -318,6 +318,7 @@ pub struct Runtime {
     cleanup_state: watch::Sender<(Vec<Device>, bool)>,
     attach: mpsc::Receiver<AttachCleanup>,
     bridge: Option<Bridge>,
+    firmware: Option<rusthinq_bridge::passthrough::Relay>,
     removal_registrations: BTreeMap<String, Registration>,
     refill: Option<(u64, u64)>,
     deferred_storage: Option<Action>,
@@ -436,6 +437,7 @@ impl Runtime {
             cleanup_state,
             attach: attachments,
             bridge: None,
+            firmware: None,
             removal_registrations: BTreeMap::new(),
             refill: None,
             deferred_storage: None,
@@ -456,6 +458,12 @@ impl Runtime {
     pub fn with_script_sink(mut self, sink: Arc<dyn crate::scripts::PublishSink>) -> Self {
         assert!(self.script_sink.is_none(), "one script publication sink");
         self.script_sink = Some(sink);
+        self
+    }
+    /// Share the exact relay used by the TLS front door. Only completed current
+    /// provisioning contributes local proof; pending device packets never do.
+    pub fn with_firmware(mut self, relay: rusthinq_bridge::passthrough::Relay) -> Self {
+        self.firmware = Some(relay);
         self
     }
     pub fn with_metadata(
@@ -1149,11 +1157,19 @@ impl Runtime {
                     Ok(event) => {
                         let session = match &event {
                             TransportEvent::Data(id,_) | TransportEvent::Response(id,_) |
-                            TransportEvent::Ready(id,_) | TransportEvent::CloudBound(id,_) => Some(id),
+                            TransportEvent::Ready(id,_) | TransportEvent::CloudBound(id,_) |
+                            TransportEvent::BridgedCloudBound(id,_,_) | TransportEvent::BridgeChanged(id,_,_) => Some(id),
                             TransportEvent::Will {session,..} => session.as_ref(),
                             _ => None,
                         };
                         if session.is_none_or(|id| self.model.devices().iter().any(|device| device.entry.id == id.device && device.session.is_some_and(|session| session.generation == id.generation))) {
+                            if let TransportEvent::Ready(id, deploy) = &event
+                                && self.server.snapshot().contains(id)
+                                && let Some(firmware) = &self.firmware
+                                && let Err(error) = firmware.protect_local_endpoints(deploy)
+                            {
+                                self.emit(Event::Rejected {device:id.device.clone(), reason:format!("local endpoint protection: {error}")});
+                            }
                             self.script_transport(&event);
                             self.emit(Event::Transport(event));
                         }

@@ -11,7 +11,10 @@ use openssl::{
     stack::Stack,
     x509::{
         X509, X509Builder, X509NameBuilder, X509Req, X509StoreContext,
-        extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+        extension::{
+            AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage,
+            SubjectAlternativeName, SubjectKeyIdentifier,
+        },
         store::X509StoreBuilder,
         verify::X509VerifyFlags,
     },
@@ -91,6 +94,10 @@ impl Authority {
             .build(&cert.x509v3_context(None, None))
             .map_err(crypto)?;
         cert.append_extension(san).map_err(crypto)?;
+        let subject_key = SubjectKeyIdentifier::new()
+            .build(&cert.x509v3_context(None, None))
+            .map_err(crypto)?;
+        cert.append_extension(subject_key).map_err(crypto)?;
         cert.sign(&key, MessageDigest::sha256()).map_err(crypto)?;
         let cert = cert.build();
         let pem = String::from_utf8(cert.to_pem().map_err(crypto)?)
@@ -141,6 +148,16 @@ impl Authority {
             .build(&cert.x509v3_context(Some(&self.cert), None))
             .map_err(crypto)?;
         cert.append_extension(san).map_err(crypto)?;
+        let subject_key = SubjectKeyIdentifier::new()
+            .build(&cert.x509v3_context(Some(&self.cert), None))
+            .map_err(crypto)?;
+        cert.append_extension(subject_key).map_err(crypto)?;
+        let authority_key = AuthorityKeyIdentifier::new()
+            .keyid(false)
+            .issuer(true)
+            .build(&cert.x509v3_context(Some(&self.cert), None))
+            .map_err(crypto)?;
+        cert.append_extension(authority_key).map_err(crypto)?;
         cert.sign(&self.key, MessageDigest::sha256())
             .map_err(crypto)?;
         let mut chain = cert.build().to_pem().map_err(crypto)?;

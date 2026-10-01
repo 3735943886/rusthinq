@@ -71,7 +71,7 @@ impl Service {
             receive,
         ))
     }
-    async fn request(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    pub(crate) async fn request(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
         let path = request.uri().path().to_owned();
         let known = matches!(
             path.as_str(),

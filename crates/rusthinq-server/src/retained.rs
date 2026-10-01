@@ -1,6 +1,9 @@
 //! Owned retained records and explicit cleanup manifests. No network publication.
 use std::collections::BTreeMap;
 
+/// Includes the device ID plus incarnation and namespace metadata.
+pub const MAX_OWNER_BYTES: usize = 512;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid,
@@ -55,7 +58,7 @@ impl Store {
         payload: &[u8],
     ) -> Result<Option<Tombstone>, Error> {
         if owner.is_empty()
-            || owner.len() > 256
+            || owner.len() > MAX_OWNER_BYTES
             || owner.chars().any(char::is_control)
             || topic.is_empty()
             || topic.len() > 1024

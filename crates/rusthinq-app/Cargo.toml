@@ -11,7 +11,7 @@ rusthinq-protocol = { path = "../rusthinq-protocol" }
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
 rusthinq-bridge = { path = "../rusthinq-bridge" }
 rusthinq-scripting = { path = "../rusthinq-scripting" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 
 [dev-dependencies]

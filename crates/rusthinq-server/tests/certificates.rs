@@ -1,4 +1,31 @@
 mod support;
+#[test]
+fn generated_server_identity_passes_strict_chain_validation() {
+    let ca = rusthinq_server::certificates::Authority::generate("strict-ca.example", 2048).unwrap();
+    let identity = ca
+        .server_identity(
+            "local.example",
+            rusthinq_protocol::lg_compat::TlsPolicy::Baseline,
+        )
+        .unwrap();
+    let certificates =
+        openssl::x509::X509::stack_from_pem(&identity.certificate_chain_pem).unwrap();
+    let mut store = openssl::x509::store::X509StoreBuilder::new().unwrap();
+    store.add_cert(certificates[1].clone()).unwrap();
+    store
+        .set_flags(openssl::x509::verify::X509VerifyFlags::X509_STRICT)
+        .unwrap();
+    let mut context = openssl::x509::X509StoreContext::new().unwrap();
+    let chain = openssl::stack::Stack::new().unwrap();
+    assert!(
+        context
+            .init(&store.build(), &certificates[0], &chain, |context| context
+                .verify_cert())
+            .unwrap(),
+        "{}",
+        context.error()
+    );
+}
 use openssl::{
     stack::Stack,
     x509::{X509, X509StoreContext, store::X509StoreBuilder},

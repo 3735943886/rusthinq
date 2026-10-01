@@ -67,7 +67,7 @@ pub enum Outcome {
 /// Incarnation is part of ownership so a late cleanup cannot delete a recreated
 /// device's retained state. The length prefix makes arbitrary valid IDs unambiguous.
 pub fn device_owner(id: &str, incarnation: u64) -> io::Result<String> {
-    if id.is_empty() || id.len() > 220 || id.chars().any(char::is_control) {
+    if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid retained device owner",

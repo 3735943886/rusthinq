@@ -62,6 +62,13 @@ pub struct Broker {
 pub struct Handle {
     shared: Arc<Shared>,
 }
+pub(crate) struct BridgeCommand {
+    target: SessionId,
+    generation: u64,
+    payload: Option<Vec<u8>>,
+    active: bool,
+    result: oneshot::Sender<Delivery>,
+}
 impl Handle {
     /// Identity check for L6 owners that route both codecs through one session registry.
     pub fn shares_registry(&self, server: &ServerHandle) -> bool {
@@ -86,6 +93,63 @@ impl Handle {
     }
     pub fn close(&self, id: &SessionId) -> Result<(), Reject> {
         ServerHandle(self.shared.clone()).close(id)
+    }
+    /// Receipt Sent means state was applied in the connection actor, not a wire send.
+    pub fn bridge_state(
+        &self,
+        id: &SessionId,
+        generation: u64,
+        active: bool,
+    ) -> Result<Receipt, Reject> {
+        self.bridge_command(id, generation, None, active)
+    }
+    pub fn cloud(
+        &self,
+        id: &SessionId,
+        generation: u64,
+        payload: &[u8],
+    ) -> Result<Receipt, Reject> {
+        if payload.len() > self.shared.config.max_payload {
+            return Err(Reject::PayloadExceeded);
+        }
+        let value: Value = serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(payload))
+            .map_err(|_| Reject::InvalidJson)?;
+        if value["did"].as_str() != Some(id.device.as_str()) {
+            return Err(Reject::InvalidJson);
+        }
+        self.bridge_command(id, generation, Some(payload.to_vec()), false)
+    }
+    fn bridge_command(
+        &self,
+        id: &SessionId,
+        generation: u64,
+        payload: Option<Vec<u8>>,
+        active: bool,
+    ) -> Result<Receipt, Reject> {
+        let state = self.shared.lock();
+        if state.stopped {
+            return Err(Reject::Stopped);
+        }
+        let entry = state
+            .entries
+            .get(&id.device)
+            .filter(|entry| entry.id == *id && entry.ready)
+            .ok_or(Reject::StaleSession)?;
+        let channel = entry.bridge.as_ref().ok_or(Reject::WrongTransport)?;
+        let (result, receive) = oneshot::channel();
+        channel
+            .try_send(BridgeCommand {
+                target: id.clone(),
+                generation,
+                payload,
+                active,
+                result,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Reject::Busy,
+                mpsc::error::TrySendError::Closed(_) => Reject::StaleSession,
+            })?;
+        Ok(Receipt(receive))
     }
     pub fn send(&self, id: &SessionId, payload: &[u8]) -> Result<Receipt, Reject> {
         if payload.len() > self.shared.config.max_payload {
@@ -247,6 +311,8 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut stop = broker.stop.subscribe();
     let (close, mut closing) = watch::channel(false);
     let (commands, mut outbound) = mpsc::channel::<Command>(config.outbound_capacity);
+    let (bridge_commands, mut bridge_inputs) =
+        mpsc::channel::<BridgeCommand>(config.outbound_capacity);
     let mut connected = false;
     let mut will = None;
     let mut clean_disconnect = false;
@@ -270,6 +336,37 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 _ = stop.changed() => break 'connection Disconnect::Closed,
                 _ = closing.changed() => break 'connection Disconnect::Closed,
                 _ = tokio::time::sleep_until(deadline) => break 'connection Disconnect::IdleTimeout,
+                Some(command) = bridge_inputs.recv(), if connected => {
+                    if guard.id.as_ref() != Some(&command.target) || !guard.current() {
+                        let _ = command.result.send(Delivery::Failed);
+                        continue;
+                    }
+                    let input = match &command.payload {
+                        Some(payload) => Input::Cloud {generation:command.generation,payload},
+                        None => Input::BridgeState {generation:command.generation, active:command.active},
+                    };
+                    let outcome = model.input(input, start.elapsed());
+                    if outcome.error.is_some() {
+                        let _ = command.result.send(Delivery::Failed);
+                        continue;
+                    }
+                    let mut delivery = Delivery::Sent;
+                    for action in outcome.actions {
+                        match action {
+                            Action::BridgeChanged {generation,active} => {guard.publish(Event::BridgeChanged(command.target.clone(),generation,active));},
+                            Action::Send {topic,payload,bridge_generation:Some(generation)} => {
+                                if !model.accepts_bridge_generation(generation) || !filters.iter().any(|filter| mqtt::matches(filter,&topic)) {delivery=Delivery::Failed;break;}
+                                let frame = match encode_publish(&topic,&payload,config) {Ok(frame)=>frame,Err(_)=>{delivery=Delivery::Failed;break;}};
+                                if let Err((reason,written)) = write_frame(&mut writer,&frame,config.write_timeout,&mut stop,&mut closing).await {
+                                    let _ = command.result.send(if written == 0 {Delivery::Failed} else {Delivery::Unknown});
+                                    break 'connection reason;
+                                }
+                            }
+                            _ => {delivery=Delivery::Failed;break;}
+                        }
+                    }
+                    let _ = command.result.send(delivery);
+                }
                 command = outbound.recv(), if connected => {
                     if let Some(command) = command {
                         if !guard.current() { let _ = command.result.send(Delivery::Failed); break 'connection Disconnect::Closed; }
@@ -434,6 +531,21 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             index += 1;
             match action {
                 Action::Provision { operation, request } => {
+                    // A new local incarnation must not inherit old cloud ACK ownership.
+                    let detached_bridge = guard.id.is_some()
+                        && model.accepts_bridge_generation(model.bridge_generation());
+                    if detached_bridge {
+                        let Some(generation) = model.bridge_generation().checked_add(1) else {
+                            break 'connection Disconnect::ThinQ2(thinq2::Error::CounterExhausted);
+                        };
+                        let _ = model.input(
+                            Input::BridgeState {
+                                generation,
+                                active: false,
+                            },
+                            start.elapsed(),
+                        );
+                    }
                     let device = request["did"].as_str().expect("L1 deploy ID").to_owned();
                     if device.len() > 256 {
                         break 'connection Disconnect::Mqtt;
@@ -508,6 +620,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                             id.device.clone(),
                             Entry {
                                 protocol: Protocol::ThinQ2,
+                                bridge: Some(bridge_commands.clone()),
                                 id: id.clone(),
                                 commands: commands.clone(),
                                 close: close.clone(),
@@ -521,6 +634,13 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                                     .events
                                     .send(Event::Down(old.id, Disconnect::Closed));
                             }
+                        }
+                        if detached_bridge {
+                            let _ = broker.shared.events.send(Event::BridgeChanged(
+                                id.clone(),
+                                model.bridge_generation(),
+                                false,
+                            ));
                         }
                         guard.id = Some(id);
                     }
@@ -663,7 +783,19 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         payload,
                     ));
                 }
-                _ => break 'connection Disconnect::Mqtt, // No bridge input/queue is exposed by this local-only service.
+                Action::CloudBound {
+                    payload,
+                    bridge_generation: Some(generation),
+                } => {
+                    if model.accepts_bridge_generation(generation) {
+                        guard.publish(Event::BridgedCloudBound(
+                            guard.id.clone().expect("ready relay"),
+                            generation,
+                            payload,
+                        ));
+                    }
+                }
+                _ => break 'connection Disconnect::Mqtt,
             }
         }
     };
@@ -692,6 +824,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     drop(writer);
     drop(stream);
     drop(guard);
+    bridge_inputs.close();
+    while let Some(command) = bridge_inputs.recv().await {
+        let _ = command.result.send(Delivery::Failed);
+    }
     outbound.close();
     while let Some(command) = outbound.recv().await {
         let _ = command.result.send(Delivery::Failed);

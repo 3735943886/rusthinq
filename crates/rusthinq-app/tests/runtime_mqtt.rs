@@ -19,6 +19,66 @@ use tokio::{
 };
 
 struct ScriptSink(mpsc::Sender<(Context, String)>);
+
+#[tokio::test]
+async fn completed_local_provisioning_protects_endpoints_from_firmware_learning() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let relay = rusthinq_bridge::passthrough::Relay::new(
+        Default::default(),
+        Arc::new(rusthinq_bridge::passthrough::HttpsConnector),
+    )
+    .unwrap();
+    relay.suspect("https://api.example/fw").unwrap();
+    let runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
+        .unwrap()
+        .with_firmware(relay.clone());
+    let mut events = runtime.handle().subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let device = tokio::spawn(async move { runtime.run(stream).await.unwrap() });
+    connect(&mut peer).await;
+    publish(&mut peer, "clip/provisioning/devices/d", json!({"did":"d","cmd":"deploy","kind":"model","data":{"api-server":"https://api.example","mqtt-server":"ssl://mqtt.example:8883"}})).await;
+    packet(&mut peer).await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"completeProvisioning_ack"}),
+    )
+    .await;
+    until(&mut events, |event| {
+        matches!(event, Event::Transport(TransportEvent::Ready(_, _)))
+    })
+    .await;
+    // A later cloud command cannot turn proven local endpoints into remote hosts.
+    relay
+        .learn_command(&json!([
+            "https://api.example/fw",
+            "https://mqtt.example/fw",
+            "https://cdn.example/fw"
+        ]))
+        .unwrap();
+    let snapshot = relay.snapshot().unwrap();
+    assert_eq!(
+        snapshot["api.example"],
+        rusthinq_bridge::firmware::Evidence::Local
+    );
+    assert_eq!(
+        snapshot["mqtt.example"],
+        rusthinq_bridge::firmware::Evidence::Local
+    );
+    assert_eq!(
+        snapshot["cdn.example"],
+        rusthinq_bridge::firmware::Evidence::Command
+    );
+    broker.stop();
+    device.await.unwrap();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
+}
 impl PublishSink for ScriptSink {
     fn try_publish(&self, context: &Context, payload: String) -> Result<(), String> {
         self.0

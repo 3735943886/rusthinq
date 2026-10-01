@@ -25,12 +25,25 @@ struct Harness {
     front: JoinHandle<std::io::Result<()>>,
     signer: JoinHandle<()>,
     handle: SigningHandle,
+    metadata: tokio::sync::mpsc::Receiver<rusthinq_server::thinq1_http::Metadata>,
 }
 impl Harness {
     async fn start(config: Config, custom: Option<&[u8]>) -> Self {
         let ca = support::authority();
         let (owner, handle) = Signer::new(ca.clone(), SignConfig::default()).unwrap();
-        let service = Service::new(config, &ca, handle.clone(), custom).unwrap();
+        let provisioning = Service::new(config, &ca, handle.clone(), custom).unwrap();
+        let (thin, metadata) = rusthinq_server::thinq1_http::Service::new(
+            Default::default(),
+            Arc::new(rusthinq_server::mqtt::SystemClock),
+        )
+        .unwrap();
+        let service = rusthinq_server::https::Service::new(
+            thin,
+            provisioning,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         let identity = ca
             .server_identity("local.example", TlsPolicy::Baseline)
             .unwrap();
@@ -46,6 +59,7 @@ impl Harness {
             front,
             signer,
             handle,
+            metadata,
         }
     }
     async fn connect(&self) -> SslStream<TcpStream> {
@@ -309,4 +323,32 @@ async fn shutdown_cancels_pending_http_and_joins_signing_worker() {
         handle.sign("device", &support::csr().0).await,
         Err(rusthinq_server::certificates::SignError::Stopped)
     );
+}
+
+#[tokio::test]
+async fn shared_https_routes_both_protocols_and_metadata() {
+    let mut harness = Harness::start(Config::new("local.example".into()), None).await;
+    let mut peer = harness.connect().await;
+    let body = b"<lgedmRoot><modelName>M</modelName></lgedmRoot>";
+    let header = format!(
+        "POST /lgehadm/api/Device/TotalDeviceInfoSvc HTTP/1.1\r\nHost: local.example\r\nx-lgedm-deviceid: d\r\nx-lgedm-devicetype: 1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    peer.write_all(header.as_bytes()).await.unwrap();
+    peer.write_all(body).await.unwrap();
+    assert_eq!(response(&mut peer).await.0, 200);
+    let observed = timeout(Duration::from_secs(2), harness.metadata.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.device_id, "d");
+    assert_eq!(observed.model_name, "M");
+    assert_eq!(
+        harness
+            .request("GET", "/route", "local.example", b"")
+            .await
+            .0,
+        200
+    );
+    harness.shutdown().await;
 }
