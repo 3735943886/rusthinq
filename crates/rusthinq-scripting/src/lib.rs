@@ -1,5 +1,6 @@
 //! L5 bounded, IL-agnostic Rhai execution. The caller owns worker scheduling and sinks.
 pub mod context;
+pub mod modules;
 pub mod worker;
 use rhai::{
     AST, CallFnOptions, Dynamic, Engine, EvalAltResult, Scope,
@@ -51,6 +52,7 @@ pub struct Outcome {
     pub error: Option<Error>,
 }
 struct Buffer {
+    preparing: bool,
     outputs: Vec<Output>,
     bytes: usize,
     limits: Limits,
@@ -58,6 +60,9 @@ struct Buffer {
 }
 impl Buffer {
     fn emit(&mut self, value: String, publish: bool) -> Result<(), Box<EvalAltResult>> {
+        if self.preparing {
+            return Err("module initialization output forbidden".into());
+        }
         if publish && !self.consumer {
             return Err("consumer disabled".into());
         }
@@ -81,6 +86,9 @@ impl Buffer {
     }
 }
 pub struct Compiled {
+    invocation_ast: Option<AST>,
+    source_bytes: usize,
+    modules_loaded: bool,
     context: Option<context::Context>,
     engine: Engine,
     ast: AST,
@@ -138,6 +146,7 @@ impl Compiled {
             return Err(Error::InvalidConfig);
         }
         let buffer = Arc::new(Mutex::new(Buffer {
+            preparing: false,
             outputs: Vec::new(),
             bytes: 0,
             limits: limits.clone(),
@@ -167,6 +176,9 @@ impl Compiled {
             .compile(source)
             .map_err(|error| Error::Compile(error.to_string()))?;
         Ok(Self {
+            invocation_ast: None,
+            source_bytes: source.len(),
+            modules_loaded: false,
             context: None,
             engine,
             ast,
@@ -227,17 +239,27 @@ impl Host {
                 }
                 if let Some(ctx) = &self.compiled.context {
                     let _ = self.compiled.engine.call_fn_with_options::<Dynamic>(
-                        CallFnOptions::new().eval_ast(false).rewind_scope(false),
+                        CallFnOptions::new()
+                            .eval_ast(self.compiled.invocation_ast.is_some())
+                            .rewind_scope(false),
                         &mut self.scope,
-                        &self.compiled.ast,
+                        self.compiled
+                            .invocation_ast
+                            .as_ref()
+                            .unwrap_or(&self.compiled.ast),
                         function,
                         (ctx.clone(), input.to_owned()),
                     )?;
                 } else {
                     let _ = self.compiled.engine.call_fn_with_options::<Dynamic>(
-                        CallFnOptions::new().eval_ast(false).rewind_scope(false),
+                        CallFnOptions::new()
+                            .eval_ast(self.compiled.invocation_ast.is_some())
+                            .rewind_scope(false),
                         &mut self.scope,
-                        &self.compiled.ast,
+                        self.compiled
+                            .invocation_ast
+                            .as_ref()
+                            .unwrap_or(&self.compiled.ast),
                         function,
                         (input.to_owned(),),
                     )?;

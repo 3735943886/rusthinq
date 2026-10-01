@@ -370,10 +370,10 @@ async fn callback_burst_preserves_device_scope_and_publication_order() {
 #[tokio::test]
 async fn context_callbacks_bind_device_state_and_reload_without_il_interpretation() {
     use rusthinq_scripting::context::Config as ContextConfig;
-    let source = r#"fn on_response(ctx,body){
+    let source = r#"import "output_helper" as h; fn on_response(ctx,body){
         let count=ctx.state_get("count");if count==(){count=0;}
         count+=1;ctx.state_set("count",count);
-        ctx.publish(ctx.id()+":"+ctx.model_id()+":"+count.to_string());
+        h::publish_count(ctx,count);
         ctx.send_json("{ \"Body\": {\"Cmd\":\"Get\"} }");
     }"#;
     let compiled = |id: &str| {
@@ -384,6 +384,10 @@ async fn context_callbacks_bind_device_state_and_reload_without_il_interpretatio
             ContextConfig::new(id.into(), "model".into()),
         )
         .unwrap()
+        .with_modules(vec![rusthinq_scripting::modules::Source {
+            name: "output_helper".into(),
+            source: r#"fn publish_count(ctx,count){ctx.publish(ctx.id()+":"+ctx.model_id()+":"+count.to_string());}"#.into(),
+        }]).unwrap()
     };
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("devices.json");
