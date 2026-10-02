@@ -173,6 +173,36 @@ class DeviceEntry {
                 ` <i class="material-icons tooltipped tiny" data-position="bottom" data-tooltip="No script handler for this device in rusthinq -- its state isn't exposed as MQTT properties">warning</i>`,
             )
         }
+        if (this.remoteState.scriptFaulted) {
+            const warning = document.createElement('span')
+            warning.textContent = ' Script faulted'
+            warning.className = 'red-text'
+            td.appendChild(warning)
+        }
+        if (this.remoteState.driverReloadable) {
+            const reload = document.createElement('button')
+            reload.className = 'btn-small waves-effect waves-light'
+            reload.textContent = this.remoteState.scriptFaulted ? 'Recover script' : 'Reload script'
+            reload.disabled = !!this.reloadBusy
+            // Capture the displayed scope; a new session/reload must reject this request.
+            const scope = {
+                incarnation: this.remoteState.incarnation,
+                generation: this.remoteState.generation,
+                script_generation: this.remoteState.scriptGeneration,
+            }
+            reload.onclick = async () => {
+                this.reloadBusy = true
+                reload.disabled = true
+                try {
+                    await fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/reload`, scope, { method: 'POST' })
+                } finally {
+                    this.reloadBusy = false
+                    this.updateDom()
+                }
+            }
+            td.appendChild(document.createElement('br'))
+            td.appendChild(reload)
+        }
         children.push(td)
 
         td = document.createElement('td')
