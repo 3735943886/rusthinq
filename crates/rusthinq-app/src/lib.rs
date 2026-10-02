@@ -42,3 +42,6 @@ pub mod drivers {
 #[cfg(not(feature = "bridge"))]
 #[path = "cloud_disabled.rs"]
 pub mod cloud_account;
+
+#[cfg(feature = "bridge")]
+pub mod cloud_devices;

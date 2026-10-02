@@ -62,11 +62,13 @@ struct Gateway {
     thinq1: Option<Url>,
     rti: Option<String>,
 }
+#[derive(Clone)]
 struct Account {
     headers: HeaderMap,
     home: String,
     expires: tokio::time::Instant,
 }
+#[derive(Clone)]
 pub struct Client {
     http: Http,
     country: String,

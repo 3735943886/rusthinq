@@ -1,5 +1,39 @@
 use super::*;
 impl Handle {
+    #[cfg(feature = "bridge")]
+    pub(crate) fn cloud_deploy(&self, id: &str, generation: u64) -> Option<serde_json::Value> {
+        self.0
+            .cloud_deploy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, v)| v.clone())
+    }
+    #[cfg(feature = "bridge")]
+    pub(crate) fn cloud_devices(&self) -> Option<crate::cloud_devices::Handle> {
+        self.0
+            .cloud_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    #[cfg(feature = "bridge")]
+    pub(crate) fn attach_cloud_devices(
+        &self,
+        handle: crate::cloud_devices::Handle,
+    ) -> io::Result<()> {
+        let mut binding = self
+            .0
+            .cloud_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if binding.is_some() {
+            return Err(io::Error::other("cloud devices already attached"));
+        }
+        *binding = Some(handle);
+        Ok(())
+    }
     /// Immutable configured capability projection; admission still checks the actor.
     pub fn driver_reload_configured(&self) -> bool {
         self.0

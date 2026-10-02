@@ -111,6 +111,10 @@ struct AttachCleanup {
 struct Shared {
     driver_reload_configured: std::sync::atomic::AtomicBool,
     cloud: Mutex<Option<crate::cloud_account::Handle>>,
+    #[cfg(feature = "bridge")]
+    cloud_devices: Mutex<Option<crate::cloud_devices::Handle>>,
+    #[cfg(feature = "bridge")]
+    cloud_deploy: Mutex<BTreeMap<String, (u64, serde_json::Value)>>,
     retired_scripts: Mutex<BTreeMap<String, crate::scripts::Context>>,
     external_mqtt: Mutex<Option<crate::external_mqtt::Handle>>,
     persisted_models: Mutex<BTreeMap<String, crate::lifecycle_storage::DeviceMetadata>>,
@@ -393,6 +397,10 @@ impl Runtime {
         let shared = Arc::new(Shared {
             driver_reload_configured: std::sync::atomic::AtomicBool::new(false),
             cloud: Mutex::new(None),
+            #[cfg(feature = "bridge")]
+            cloud_devices: Mutex::new(None),
+            #[cfg(feature = "bridge")]
+            cloud_deploy: Mutex::new(BTreeMap::new()),
             persisted_models: Mutex::new(storage.state().metadata.clone()),
             durable_devices: Mutex::new(storage.state().ledger.entries.clone()),
             message_id: std::sync::atomic::AtomicU64::new(
@@ -855,6 +863,19 @@ impl Runtime {
         Ok(self)
     }
     fn forget(&mut self, id: String) {
+        #[cfg(feature = "bridge")]
+        if self.handle().cloud_devices().is_some_and(|handle| {
+            handle
+                .snapshot()
+                .iter()
+                .any(|s| s.device == id && !s.paired)
+        }) {
+            self.emit(Event::Rejected {
+                device: id,
+                reason: "pending pairing outcome; unpair before forget".into(),
+            });
+            return;
+        }
         #[cfg(feature = "bridge")]
         if let Some(bridge) = &self.bridge
             && let Some(status) = bridge
@@ -1328,6 +1349,8 @@ impl Runtime {
                                 self.emit(Event::Rejected {device:id.device.clone(), reason:format!("local endpoint protection: {error}")});
                             }
                             self.script_transport(&event);
+                            #[cfg(feature="bridge")]
+                            if let TransportEvent::Ready(id,deploy)=&event {self.shared.cloud_deploy.lock().unwrap_or_else(|e|e.into_inner()).insert(id.device.clone(),(id.generation,deploy.clone()));}
                             if let TransportEvent::Ready(id,deploy)=&event
                                 && let Some(session)=self.model.devices().iter().find(|d|d.entry.id==id.device).and_then(|d|d.session)
                                 && let Some(model)=deploy["kind"].as_str() {

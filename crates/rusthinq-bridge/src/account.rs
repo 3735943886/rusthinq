@@ -69,6 +69,7 @@ struct Admission {
 pub struct Handle {
     admission: Arc<Mutex<Admission>>,
     status: watch::Receiver<Status>,
+    client: watch::Receiver<Option<Arc<Client>>>,
 }
 pub struct Runtime {
     store: Arc<dyn CredentialStore>,
@@ -76,6 +77,7 @@ pub struct Runtime {
     logout: mpsc::Receiver<Command>,
     epoch: watch::Receiver<u64>,
     status: watch::Sender<Status>,
+    client: watch::Sender<Option<Arc<Client>>>,
 }
 pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
     let credentials = store.credentials();
@@ -88,6 +90,7 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
         expires: None,
     };
     let (status, watched) = watch::channel(status);
+    let (client, clients) = watch::channel(None);
     let (commands, received) = mpsc::channel(8);
     let (logout, urgent) = mpsc::channel(1);
     let (epoch, cancelled) = watch::channel(0);
@@ -99,6 +102,7 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
                 epoch,
             })),
             status: watched,
+            client: clients,
         },
         Runtime {
             store,
@@ -106,10 +110,32 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
             logout: urgent,
             epoch: cancelled,
             status,
+            client,
         },
     )
 }
 impl Handle {
+    /// Composition-only authenticated client snapshots. Never expose through adapters.
+    /// Logout admission cancels existing leases before its checkpoint completes.
+    pub fn clients(&self) -> watch::Receiver<Option<Arc<Client>>> {
+        self.client.clone()
+    }
+    pub fn cancellation(&self) -> watch::Receiver<u64> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .epoch
+            .subscribe()
+    }
+    pub fn authenticated_client(&self) -> Result<Arc<Client>, Error> {
+        let client = self
+            .client
+            .borrow()
+            .clone()
+            .filter(|c| c.authenticated())
+            .ok_or(Error::Unavailable)?;
+        Ok(client)
+    }
     pub fn status(&self) -> Status {
         let mut status = self.status.borrow().clone();
         if status
@@ -262,6 +288,11 @@ impl Runtime {
     }
     fn publish(&self, active: Option<&Client>, busy: bool, error: Option<String>) {
         let credentials = self.credentials();
+        self.client.send_replace(
+            active
+                .filter(|client| client.authenticated())
+                .map(|client| Arc::new(client.clone())),
+        );
         self.status.send_replace(Status {
             logged_in: active.is_some_and(Client::authenticated),
             expires: active.and_then(Client::expires_at),
@@ -514,6 +545,7 @@ mod tests {
                 epoch,
             })),
             status: watched,
+            client: watch::channel(None).1,
         };
         assert!(handle.status().logged_in);
         tokio::time::advance(std::time::Duration::from_secs(5)).await;

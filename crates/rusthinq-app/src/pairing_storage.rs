@@ -25,6 +25,8 @@ pub struct Attempt {
 pub struct Record {
     pub attempt: Attempt,
     pub material: Option<Material>,
+    #[serde(default)]
+    pub enabled: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +147,7 @@ impl Store {
             Record {
                 attempt: attempt.clone(),
                 material: None,
+                enabled: false,
             },
         );
         self.commit(next)?;
@@ -167,6 +170,23 @@ impl Store {
             .get_mut(&attempt.owner.device)
             .ok_or_else(invalid)?
             .material = Some(material);
+        self.commit(next)
+    }
+    /// Durable enable intent is separate from remote registration ownership.
+    pub fn set_enabled(&mut self, attempt: &Attempt, enabled: bool) -> io::Result<()> {
+        self.current(attempt)?;
+        if enabled
+            && self.checkpoint.records[&attempt.owner.device]
+                .material
+                .is_none()
+        {
+            return Err(invalid());
+        }
+        let mut next = self.checkpoint.clone();
+        next.records
+            .get_mut(&attempt.owner.device)
+            .ok_or_else(invalid)?
+            .enabled = enabled;
         self.commit(next)
     }
     /// Call only after a successful cloud removal; failure preserves cleanup ownership.
