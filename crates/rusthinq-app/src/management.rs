@@ -106,6 +106,7 @@ fn build(app: App) -> Router {
         .route("/api/devices/{id}/forget", post(forget))
         .route("/api/devices/{id}/send", post(send))
         .route("/api/devices/{id}/invoke", post(invoke))
+        .route("/api/devices/{id}/reload", post(reload_driver))
         .route("/api/devices/{id}/inject", post(inject))
         .route("/api/events", get(event_socket))
         .route("/ws", get(panel))
@@ -296,7 +297,7 @@ fn snapshot(handle: &Handle) -> Value {
                 "deviceType":meta.map(|m|m.device_type.as_str()),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
                 "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
-                "mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":false,
+                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some(),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":false,
                 "removal":device.removal.map(|r|format!("{r:?}"))
             }),
         );
@@ -442,6 +443,36 @@ async fn invoke(
             StatusCode::GATEWAY_TIMEOUT,
             "admission unknown; do not automatically retry",
         ),
+    }
+}
+async fn reload_driver(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let incarnation = match number(&body, "incarnation") {
+        Ok(n) => n,
+        Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+    };
+    let generation = match number(&body, "generation") {
+        Ok(n) => n,
+        Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+    };
+    let script_generation = match number(&body, "script_generation") {
+        Ok(n) => n,
+        Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+    };
+    match timeout(Duration::from_secs(5), app.handle.adapter_reload_driver(
+        id, SessionKey {incarnation,generation},script_generation,
+    )).await {
+        Ok(Ok(generation)) => (StatusCode::OK,Json(json!({"status":"reloaded","scriptGeneration":generation.to_string(),"initialized":false}))).into_response(),
+        Ok(Err(reject)) => error(match reject {
+            Reject::StaleSession => StatusCode::CONFLICT,
+            Reject::Busy => StatusCode::TOO_MANY_REQUESTS,
+            Reject::Disabled | Reject::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::BAD_REQUEST,
+        }, &format!("driver reload: {reject:?}")),
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT,"reload outcome unknown; inspect scriptGeneration before retrying"),
     }
 }
 async fn inject(

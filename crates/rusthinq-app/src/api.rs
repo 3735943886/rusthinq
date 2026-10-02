@@ -288,6 +288,34 @@ impl AppHandle {
             .adapter_invoke(id, session, generation, function, input)
             .await
     }
+    pub fn driver_reload_configured(&self) -> bool {
+        self.0.driver_reload_configured()
+    }
+    pub async fn adapter_reload_driver(
+        &self,
+        id: String,
+        session: SessionKey,
+        generation: u64,
+    ) -> Result<u64, Reject> {
+        #[cfg(feature = "scripting")]
+        {
+            self.0
+                .reload_configured_driver(id, session, generation)
+                .await
+                .map_err(|error| match error {
+                    rusthinq_scripting::Error::Stale => Reject::StaleSession,
+                    rusthinq_scripting::Error::Busy => Reject::Busy,
+                    rusthinq_scripting::Error::Stopped => Reject::Stopped,
+                    rusthinq_scripting::Error::InvalidConfig => Reject::Disabled,
+                    _ => Reject::InvalidInput,
+                })
+        }
+        #[cfg(not(feature = "scripting"))]
+        {
+            let _ = (id, session, generation);
+            Err(Reject::Disabled)
+        }
+    }
     pub fn cloud_status(&self) -> Value {
         match self.0.cloud_account() {
             Some(account) => json!({"enabled":true,"account":account.status()}),

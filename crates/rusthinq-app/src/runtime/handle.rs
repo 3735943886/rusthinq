@@ -1,5 +1,12 @@
 use super::*;
 impl Handle {
+    /// Immutable configured capability projection; admission still checks the actor.
+    pub fn driver_reload_configured(&self) -> bool {
+        self.0
+            .driver_reload_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Composition-only binding; L4 remains the sole account state/policy owner.
     #[cfg(feature = "bridge")]
     pub fn attach_cloud_account(&self, account: crate::cloud_account::Handle) -> io::Result<()> {
@@ -168,6 +175,31 @@ impl Handle {
                 input,
                 result,
             })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => rusthinq_scripting::Error::Busy,
+                mpsc::error::TrySendError::Closed(_) => rusthinq_scripting::Error::Stopped,
+            })?;
+        received
+            .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?
+    }
+    /// Reload a configured driver from disk. The actor owns and joins preparation.
+    #[cfg(feature = "scripting")]
+    pub async fn reload_configured_driver(
+        &self,
+        device: String,
+        session: SessionKey,
+        generation: u64,
+    ) -> Result<u64, rusthinq_scripting::Error> {
+        let (result, received) = oneshot::channel();
+        self.0
+            .scripts
+            .try_send(ScriptCommand::PrepareReload(PrepareReload {
+                device,
+                session,
+                generation,
+                result,
+            }))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => rusthinq_scripting::Error::Busy,
                 mpsc::error::TrySendError::Closed(_) => rusthinq_scripting::Error::Stopped,

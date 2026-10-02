@@ -109,6 +109,7 @@ struct AttachCleanup {
     result: oneshot::Sender<io::Result<()>>,
 }
 struct Shared {
+    driver_reload_configured: std::sync::atomic::AtomicBool,
     cloud: Mutex<Option<crate::cloud_account::Handle>>,
     retired_scripts: Mutex<BTreeMap<String, crate::scripts::Context>>,
     external_mqtt: Mutex<Option<crate::external_mqtt::Handle>>,
@@ -191,9 +192,17 @@ struct ReloadScript {
     result: oneshot::Sender<Result<u64, rusthinq_scripting::Error>>,
 }
 #[cfg(feature = "scripting")]
+struct PrepareReload {
+    device: String,
+    session: SessionKey,
+    generation: u64,
+    result: oneshot::Sender<Result<u64, rusthinq_scripting::Error>>,
+}
+#[cfg(feature = "scripting")]
 enum ScriptCommand {
     Attach(Box<AttachScript>),
     Reload(Box<ReloadScript>),
+    PrepareReload(PrepareReload),
     Invoke {
         device: String,
         session: SessionKey,
@@ -211,6 +220,9 @@ impl ScriptCommand {
                 let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
             }
             Self::Reload(request) => {
+                let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+            }
+            Self::PrepareReload(request) => {
                 let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
             }
             Self::Invoke { result, .. } => {
@@ -237,6 +249,12 @@ pub struct Runtime {
     drivers: Option<crate::drivers::Config>,
     #[cfg(feature = "scripting")]
     preparation_policy: rusthinq_scripting::preparation::Preparation<SessionKey>,
+    #[cfg(feature = "scripting")]
+    driver_reload_preparation: JoinSet<(
+        PrepareReload,
+        String,
+        Result<rusthinq_scripting::Compiled, rusthinq_scripting::Error>,
+    )>,
     #[cfg(feature = "scripting")]
     driver_preparation: JoinSet<(
         String,
@@ -373,6 +391,7 @@ impl Runtime {
         let (attach, attachments) = mpsc::channel(1);
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
         let shared = Arc::new(Shared {
+            driver_reload_configured: std::sync::atomic::AtomicBool::new(false),
             cloud: Mutex::new(None),
             persisted_models: Mutex::new(storage.state().metadata.clone()),
             durable_devices: Mutex::new(storage.state().ledger.entries.clone()),
@@ -451,6 +470,8 @@ impl Runtime {
             preparation_policy: rusthinq_scripting::preparation::Preparation::new(capacity),
             #[cfg(feature = "scripting")]
             driver_preparation: JoinSet::new(),
+            #[cfg(feature = "scripting")]
+            driver_reload_preparation: JoinSet::new(),
 
             #[cfg(feature = "scripting")]
             script_attach,
@@ -540,6 +561,9 @@ impl Runtime {
             self.script_sink = Some(Arc::new(ApplicationSink(self.shared.events.clone(), None)));
         }
         self.drivers = Some(config);
+        self.shared
+            .driver_reload_configured
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(self)
     }
     /// Share the exact relay used by the TLS front door. Only completed current
@@ -687,7 +711,7 @@ impl Runtime {
             return;
         };
         if !rusthinq_scripting::preparation::Preparation::<SessionKey>::can_start(
-            self.driver_preparation.len(),
+            self.driver_preparation.len() + self.driver_reload_preparation.len(),
             self.scripts
                 .as_ref()
                 .and_then(|owner| owner.generation(id))

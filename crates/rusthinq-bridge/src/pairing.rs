@@ -37,7 +37,7 @@ impl fmt::Debug for Material {
         f.write_str("PairingMaterial(<redacted>)")
     }
 }
-fn service(value: &str) -> Result<Url, Error> {
+pub(crate) fn service(value: &str) -> Result<Url, Error> {
     if value.len() > 4096 {
         return Err(Error::InvalidResponse);
     }

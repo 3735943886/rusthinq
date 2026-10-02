@@ -374,7 +374,148 @@ impl Runtime {
             self.reap_completed_scripts();
         }
     }
+    pub(super) async fn reload_request(
+        &mut self,
+        request: ReloadScript,
+        stop: &watch::Receiver<bool>,
+    ) {
+        let mut request = request;
+        if !request.result.is_closed() {
+            if *stop.borrow() || stop.has_changed().is_err() {
+                let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+                return;
+            }
+            self.reconcile();
+            request
+                .compiled
+                .set_consumer_enabled(self.script_sink.is_some());
+            let current = self.model.devices().iter().any(|device| {
+                device.entry.id == request.device
+                    && device.session == Some(request.session)
+                    && device.removal.is_none()
+            });
+            let result = if !current {
+                Err(rusthinq_scripting::Error::Stale)
+            } else if request.initialize
+                && let Err(error) = self.script_schedule.next_sequence()
+            {
+                Err(error)
+            } else if let Some(owner) = self.scripts.as_mut() {
+                match owner.reload(
+                    &self.model.devices(),
+                    &request.device,
+                    request.generation,
+                    request.compiled,
+                ) {
+                    Ok(reload) => reload.wait().await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                Err(rusthinq_scripting::Error::InvalidConfig)
+            };
+            self.reconcile();
+            let current = self.model.devices().iter().any(|device| {
+                device.entry.id == request.device
+                    && device.session == Some(request.session)
+                    && device.removal.is_none()
+            });
+            let result = if *stop.borrow() || stop.has_changed().is_err() {
+                Err(rusthinq_scripting::Error::Stopped)
+            } else if !current {
+                Err(rusthinq_scripting::Error::Stale)
+            } else {
+                result
+            };
+            if let Ok(generation) = result {
+                self.shared
+                    .script_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request.device.clone(), (request.session, generation, false));
+                self.script_schedule
+                    .retain_timers(|id, _| id != request.device);
+            }
+            // Queue initialization before another actor turn can admit commands/data.
+            let result = match result {
+                Ok(generation) if request.initialize => self
+                    .invoke_script(
+                        request.device.clone(),
+                        generation,
+                        "__init".into(),
+                        String::new(),
+                    )
+                    .map(|_| generation),
+                other => other,
+            };
+            let _ = request.result.send(result);
+        }
+    }
+    pub(super) fn prepare_reload_request(&mut self, request: PrepareReload) {
+        if request.result.is_closed() {
+            return;
+        }
+        let outcome = (|| {
+            self.reconcile();
+            let config = self
+                .drivers
+                .as_ref()
+                .ok_or(rusthinq_scripting::Error::InvalidConfig)?
+                .clone();
+            if !self.model.devices().iter().any(|d| {
+                d.entry.id == request.device
+                    && d.session == Some(request.session)
+                    && d.online
+                    && d.removal.is_none()
+            }) || self
+                .scripts
+                .as_ref()
+                .and_then(|owner| owner.generation(&request.device))
+                != Some(request.generation)
+            {
+                return Err(rusthinq_scripting::Error::Stale);
+            }
+            let (session, model, thinq2) = self
+                .shared
+                .driver_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&request.device)
+                .cloned()
+                .ok_or(rusthinq_scripting::Error::InvalidConfig)?;
+            if session != request.session {
+                return Err(rusthinq_scripting::Error::Stale);
+            }
+            if !rusthinq_scripting::preparation::Preparation::<SessionKey>::can_prepare(
+                self.driver_preparation.len() + self.driver_reload_preparation.len(),
+            ) {
+                return Err(rusthinq_scripting::Error::Busy);
+            }
+            Ok((config, model, thinq2))
+        })();
+        match outcome {
+            Err(error) => {
+                let _ = request.result.send(Err(error));
+            }
+            Ok((config, model, thinq2)) => {
+                self.driver_reload_preparation.spawn_blocking(move || {
+                    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        config.prepare(&request.device, &model, thinq2, true)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(rusthinq_scripting::Error::Compile(
+                            "driver preparation panic".into(),
+                        ))
+                    });
+                    (request, model, prepared)
+                });
+            }
+        }
+    }
     pub(super) async fn stop_scripts(&mut self) -> io::Result<()> {
+        while let Some(result) = self.driver_reload_preparation.join_next().await {
+            let (request, _, _) = result.map_err(io::Error::other)?;
+            let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+        }
         while let Some(result) = self.driver_preparation.join_next().await {
             let _ = result.map_err(io::Error::other)?;
         }
@@ -453,6 +594,22 @@ impl Runtime {
 
 macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($branches:tt)*) => { tokio::select! { biased;
                 Some(result)=async {$runtime.scripts.as_mut().expect("script owner").reap_next().await}, if $runtime.scripts.as_ref().is_some_and(|owner|owner.has_reaping())=>{$runtime.retirement_result(result);},
+                Some(result)=$runtime.driver_reload_preparation.join_next(), if !$runtime.driver_reload_preparation.is_empty() && !$stopping => {
+                    let (request,model,prepared)=result.map_err(io::Error::other)?;
+                    let current=$runtime.shared.driver_models.lock().unwrap_or_else(|e|e.into_inner())
+                        .get(&request.device).is_some_and(|(session,current,_)|*session==request.session && *current==model);
+                    if !current {let _=request.result.send(Err(rusthinq_scripting::Error::Stale));}
+                    else {match prepared {
+                        Err(error)=>{
+                            $runtime.script_rejected(request.device.clone(),format!("driver reload preparation: {error:?}"));
+                            let _=request.result.send(Err(error));
+                        },
+                        Ok(compiled)=>{$runtime.reload_request(ReloadScript {
+                            initialize:true,device:request.device,session:request.session,generation:request.generation,
+                            compiled,result:request.result,
+                        },&$stop).await;},
+                    }}
+                },
                 Some(result)=$runtime.driver_preparation.join_next(), if !$runtime.driver_preparation.is_empty() && !$stopping && !$runtime.scripts.as_ref().is_some_and(|owner|owner.retirement_pending())=>{
                     let (id,session,model,prepared)=result.map_err(io::Error::other)?;
                     $runtime.reconcile();
@@ -502,35 +659,8 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                     }
                 },
                 ScriptCommand::Attach(request) => {$runtime.attach_request(request,*$stop.borrow() || $stop.has_changed().is_err());},
-                ScriptCommand::Reload(request) => {
-                    let mut request = *request;
-                    if !request.result.is_closed() {
-                        $runtime.reconcile();
-                        request.compiled.set_consumer_enabled($runtime.script_sink.is_some());
-                        let current = $runtime.model.devices().iter().any(|device|
-                            device.entry.id == request.device && device.session == Some(request.session) && device.removal.is_none());
-                        let result = if !current {Err(rusthinq_scripting::Error::Stale)}
-                        else if request.initialize && let Err(error)=$runtime.script_schedule.next_sequence() {Err(error)}
-                        else if let Some(owner) = $runtime.scripts.as_mut() {
-                            match owner.reload(&$runtime.model.devices(), &request.device, request.generation, request.compiled) {
-                                Ok(reload) => reload.wait().await,
-                                Err(error) => Err(error),
-                            }
-                        } else {Err(rusthinq_scripting::Error::InvalidConfig)};
-                        $runtime.reconcile();
-                        let current = $runtime.model.devices().iter().any(|device|
-                            device.entry.id == request.device && device.session == Some(request.session) && device.removal.is_none());
-                        let result = if *$stop.borrow() || $stop.has_changed().is_err() {Err(rusthinq_scripting::Error::Stopped)}
-                            else if !current {Err(rusthinq_scripting::Error::Stale)} else {result};
-                        if let Ok(generation)=result {$runtime.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(request.device.clone(),(request.session,generation,false));$runtime.script_schedule.retain_timers(|id,_|id!=request.device);}
-                        // Queue initialization before another actor turn can admit commands/data.
-                        let result=match result {
-                            Ok(generation) if request.initialize=>$runtime.invoke_script(request.device.clone(),generation,"__init".into(),String::new()).map(|_|generation),
-                            other=>other,
-                        };
-                        let _ = request.result.send(result);
-                    }
-                },
+                ScriptCommand::Reload(request) => {$runtime.reload_request(*request, &$stop).await;},
+                ScriptCommand::PrepareReload(request) => {$runtime.prepare_reload_request(request);},
                 },
  $($branches)* } }; }
 pub(super) use runtime_select;

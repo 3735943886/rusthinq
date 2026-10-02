@@ -14,7 +14,11 @@ impl<K: Clone + PartialEq> Preparation<K> {
         }
     }
     pub fn can_start(in_flight: usize, worker_exists: bool) -> bool {
-        in_flight < 2 && !worker_exists
+        Self::can_prepare(in_flight) && !worker_exists
+    }
+    /// Shared disk/compiler budget for automatic attachment and explicit reload.
+    pub fn can_prepare(in_flight: usize) -> bool {
+        in_flight < 2
     }
     pub fn begin(&mut self, id: &str, scope: K, model: &str) -> bool {
         if self.is_current(id, &scope, model)

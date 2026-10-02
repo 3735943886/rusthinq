@@ -315,3 +315,155 @@ async fn cloud_account_api_reports_status_and_durable_logout_without_broker() {
     stop.send_replace(true);
     task.await.unwrap().unwrap();
 }
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_without_broker() {
+    use rusthinq_app::drivers;
+    use rusthinq_server::thinq1_http::Metadata;
+    use tokio::sync::mpsc;
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("model.rhai");
+    let original = r#"
+        fn publish_config(ctx) { ctx.publish_raw("test/"+ctx.id()+"/boot", "ready", false); }
+        fn on_response(ctx, response) { throw "fixture fault"; }
+    "#;
+    std::fs::write(&source, original).unwrap();
+    let mut server = Server::new(Default::default()).unwrap();
+    let (metadata, receiver) = mpsc::channel(4);
+    let runtime = Runtime::new(
+        Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+        server.handle(),
+        Duration::ZERO,
+        64,
+    )
+    .unwrap()
+    .with_metadata(receiver)
+    .with_drivers(drivers::Config {
+        directory: directory.path().into(),
+        topic_prefix: "test".into(),
+        il_prefix: None,
+        bindings: Default::default(),
+        watch: false,
+    })
+    .unwrap();
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let router = management::router(handle.clone(), config(false), stopped.clone()).unwrap();
+    let task = tokio::spawn(runtime.run(stopped));
+    metadata
+        .send(Metadata {
+            device_id: "d".into(),
+            model_name: "model".into(),
+            device_type: "fixture".into(),
+        })
+        .await
+        .unwrap();
+    until(&mut events, |event| matches!(event, Event::Metadata(_))).await;
+    let mut peer = identify(&mut server).await;
+    until(&mut events,|event|matches!(event,Event::ScriptExecuted {context,error:None,..} if context.generation==1)).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    let body = json!({"incarnation":session.incarnation.to_string(),"generation":session.generation.to_string(),"script_generation":"1"});
+    peer.write_all(
+        &thinq1::encode(
+            br#"{"Header":{"x-lgedm-deviceId":"d"},"Body":{"ReturnCode":"0000"}}"#,
+            8192,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    until(&mut events, |event| {
+        matches!(event, Event::ScriptExecuted { error: Some(_), .. })
+    })
+    .await;
+    assert!(handle.script_states()["d"].2);
+    std::fs::write(&source, "fn broken(").unwrap();
+    let response = router
+        .clone()
+        .oneshot(request("/api/devices/d/reload", "POST", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    until(&mut events, |event| matches!(event,Event::Rejected {reason,..} if reason.contains("driver reload preparation"))).await;
+    assert_eq!(handle.script_states()["d"], (session, 1, true));
+    std::fs::write(&source, original).unwrap();
+    let response = router
+        .clone()
+        .oneshot(request("/api/devices/d/reload", "POST", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(result["scriptGeneration"], "2");
+    assert_eq!(result["initialized"], false);
+    until(&mut events,|event|matches!(event,Event::ScriptExecuted {context,error:None,..} if context.generation==2)).await;
+    assert_eq!(handle.script_states()["d"], (session, 2, false));
+    let response = router
+        .clone()
+        .oneshot(request("/api/devices/d/reload", "POST", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(handle.script_states()["d"].1, 2);
+    let wrong_session = json!({"incarnation":session.incarnation.to_string(),"generation":(session.generation+1).to_string(),"script_generation":"2"});
+    let response = router
+        .clone()
+        .oneshot(request("/api/devices/d/reload", "POST", wrong_session))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    std::fs::write(&source, "fn broken_again(").unwrap();
+    let current = json!({"incarnation":session.incarnation.to_string(),"generation":session.generation.to_string(),"script_generation":"2"});
+    let response = router
+        .clone()
+        .oneshot(request("/api/devices/d/reload", "POST", current))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(handle.script_states()["d"], (session, 2, false));
+    let response = router
+        .oneshot(request("/api/devices", "GET", Value::Null))
+        .await
+        .unwrap();
+    let snapshot: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(snapshot["devices"]["d"]["driverReloadable"], true);
+    assert!(handle.external_mqtt().is_none());
+    drop(peer);
+    server.shutdown().await;
+    stop.send_replace(true);
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(not(feature = "scripting"))]
+#[tokio::test]
+async fn driver_reload_reports_disabled_without_scripting() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(
+        Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+        server.handle(),
+        Duration::ZERO,
+        16,
+    )
+    .unwrap();
+    let (_stop, stopped) = watch::channel(false);
+    let router = management::router(runtime.handle(), config(false), stopped).unwrap();
+    let response = router
+        .oneshot(request(
+            "/api/devices/d/reload",
+            "POST",
+            json!({"incarnation":"1","generation":"1","script_generation":"1"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    server.shutdown().await;
+}
