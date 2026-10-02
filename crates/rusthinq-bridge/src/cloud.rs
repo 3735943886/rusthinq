@@ -471,6 +471,14 @@ impl Client {
         });
         Ok(())
     }
+    pub fn account_identity(&self) -> Option<&str> {
+        self.account
+            .as_ref()?
+            .headers
+            .get("x-user-no")?
+            .to_str()
+            .ok()
+    }
     pub fn expires_at(&self) -> Option<tokio::time::Instant> {
         self.account.as_ref().map(|account| account.expires)
     }
@@ -827,6 +835,161 @@ mod tests {
         assert!(requests[4].starts_with("GET /service/homes/h%2Fa "));
         assert!(requests[5].contains("\"initDevice\":false"));
         assert!(requests[6].starts_with("DELETE /service/homes/h%2Fa/devices/d%2Fa "));
+    }
+    #[tokio::test]
+    async fn thinq1_pairing_keeps_existing_alias_and_registration() {
+        let mut replies = auth_replies();
+        replies.push(ok(json!({"devices":[{"deviceId":"d","alias":"Kitchen"}]})));
+        replies.push(ok(Value::Null));
+        let (mut client, task) = mock(replies).await;
+        client.authenticate("refresh").await.unwrap();
+        let gateway = client.gateway.as_mut().unwrap();
+        gateway.thinq1 = Some(endpoint("https://thinq1.example/api").unwrap());
+        gateway.rti = Some("rti.example:5222".into());
+        let material = client
+            .pair_device(NewDevice {
+                id: "d",
+                alias: "Replacement",
+                model: "model",
+                device_type: "type",
+                platform: "thinq1",
+                ciphertext: None,
+            })
+            .await
+            .unwrap();
+        match material {
+            crate::pairing::Material::ThinQ1 {
+                http_server,
+                rti_server,
+            } => {
+                assert_eq!(http_server, "https://thinq1.example/");
+                assert_eq!(rti_server, "rti.example:5222");
+            }
+            _ => panic!("wrong platform"),
+        }
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].contains("\"aliasPrefix\":\"Kitchen\""));
+        assert!(!requests.iter().any(|request| request.starts_with("DELETE")));
+    }
+    #[tokio::test]
+    async fn thinq2_pairing_uses_verified_regional_https_and_revalidates_restored_keys() {
+        use openssl::{
+            asn1::Asn1Time,
+            hash::MessageDigest,
+            pkey::PKey,
+            ssl::{SslAcceptor, SslMethod},
+            x509::{X509, X509Req},
+        };
+        use rusthinq_protocol::lg_compat::TlsPolicy;
+        use rusthinq_server::certificates::Authority;
+        let ca = Authority::generate("pair-ca.example", 2048).unwrap();
+        let identity = ca
+            .server_identity("iot.example", TlsPolicy::Baseline)
+            .unwrap();
+        let ca_pem = ca.certificate_pem().to_owned();
+        let client_ca = Authority::generate("client-ca.example", 2048).unwrap();
+        let root = X509::from_pem(client_ca.certificate_pem().as_bytes()).unwrap();
+        let ca_key = PKey::private_key_from_pem(&client_ca.private_key_pem().unwrap()).unwrap();
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_pem(&identity.certificate_chain_pem).unwrap())
+            .unwrap();
+        acceptor
+            .set_private_key(&PKey::private_key_from_pem(&identity.private_key_pem).unwrap())
+            .unwrap();
+        let acceptor = acceptor.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("https://iot.example:{}/", address.port());
+        let route = Url::parse(&base).unwrap();
+        let otp = openssl::rsa::Rsa::generate(2048).unwrap();
+        let public = String::from_utf8(otp.public_key_to_pem().unwrap()).unwrap();
+        let trusted = ca_pem.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for step in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
+                let mut stream = tokio_openssl::SslStream::new(ssl, stream).unwrap();
+                std::pin::Pin::new(&mut stream).accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                    assert!(headers.len() < 32768);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                let n = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; n];
+                stream.read_exact(&mut body).await.unwrap();
+                requests.push(headers);
+                let response=match step {
+                    0=>json!({"resultCode":"0000","result":{"apiServer":base,"mqttServer":"ssl://broker.example:8883"}}),
+                    1=>json!({"certificatePem":ca_pem}),
+                    _=>{
+                        let body:Value=serde_json::from_slice(&body).unwrap();let csr=X509Req::from_pem(body["csr"].as_str().unwrap().as_bytes()).unwrap();let public=csr.public_key().unwrap();assert!(csr.verify(&public).unwrap());
+                        let mut plaintext=vec![0;256];let n=otp.private_decrypt(&base64::engine::general_purpose::STANDARD.decode(body["ciphertext"].as_str().unwrap()).unwrap(),&mut plaintext,openssl::rsa::Padding::PKCS1).unwrap();assert_eq!(n,8+3+96);assert_eq!(&plaintext[8..11],b"otp");
+                        let mut leaf=X509::builder().unwrap();leaf.set_version(2).unwrap();leaf.set_serial_number(&openssl::bn::BigNum::from_u32(2).unwrap().to_asn1_integer().unwrap()).unwrap();leaf.set_subject_name(csr.subject_name()).unwrap();leaf.set_issuer_name(root.subject_name()).unwrap();leaf.set_pubkey(&public).unwrap();leaf.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();leaf.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();leaf.sign(&ca_key,MessageDigest::sha256()).unwrap();
+                        json!({"certificatePem":String::from_utf8(leaf.build().to_pem().unwrap()).unwrap(),"publication":{"message":"clip/message/d","provisioning":"clip/provisioning/d"},"subscription":{"message":"lime/devices/d"}})
+                    }
+                }.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let mut client = Client::new("KR").unwrap();
+        client.http = Http::builder()
+            .https_only(true)
+            .no_proxy()
+            .resolve("iot.example", address)
+            .add_root_certificate(reqwest::Certificate::from_pem(trusted.as_bytes()).unwrap())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let paired = crate::pairing::pair_at(&client, route, "KR", "d/a", "otp", &public)
+            .await
+            .unwrap();
+        paired.material.validate().unwrap();
+        let restored: crate::pairing::Material =
+            serde_json::from_slice(&serde_json::to_vec(&paired.material).unwrap()).unwrap();
+        restored.validate().unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /route "));
+        assert!(requests[1].starts_with("GET /route/certificate?name=aws-iot "));
+        assert!(requests[2].starts_with("POST /device/d%2Fa/certificate "));
+        let mut mismatch = paired.material.clone();
+        if let crate::pairing::Material::ThinQ2 { private_key, .. } = &mut mismatch {
+            *private_key = String::from_utf8(
+                PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap())
+                    .unwrap()
+                    .private_key_to_pem_pkcs8()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(mismatch.validate().is_err());
+        let mut altered = restored;
+        if let crate::pairing::Material::ThinQ2 { private_key, .. } = &mut altered {
+            *private_key = "invalid".into();
+        }
+        assert!(altered.validate().is_err());
     }
     #[tokio::test]
     async fn refresh_lifetime_stops_expired_requests_before_wire_delivery() {

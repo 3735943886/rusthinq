@@ -85,13 +85,13 @@ fn certificates(value: &str) -> Result<Vec<X509>, Error> {
     }
     Ok(certificates)
 }
-fn identity(key: &str, leaf: &str, ca: &str) -> Result<(), Error> {
+fn identity(key: &str, leaf: &str, ca: &str, current: bool) -> Result<(), Error> {
     if key.len() > 8192 {
         return Err(Error::InvalidResponse);
     }
     let key = PKey::private_key_from_pem(key.as_bytes()).map_err(|_| Error::InvalidResponse)?;
     let chain = certificates(leaf)?;
-    let roots = certificates(ca)?;
+    certificates(ca)?;
     if !chain[0]
         .public_key()
         .map_err(|_| Error::InvalidResponse)?
@@ -102,25 +102,32 @@ fn identity(key: &str, leaf: &str, ca: &str) -> Result<(), Error> {
     // The regional root verifies the MQTT server. AWS IoT may register a
     // client certificate issued by a different CA; do not conflate these roots.
     let now = openssl::asn1::Asn1Time::days_from_now(0).map_err(|_| Error::Crypto)?;
-    if chain[0]
-        .not_before()
-        .compare(&now)
-        .map_err(|_| Error::InvalidResponse)?
-        == std::cmp::Ordering::Greater
-        || chain[0]
-            .not_after()
+    if current
+        && (chain[0]
+            .not_before()
             .compare(&now)
             .map_err(|_| Error::InvalidResponse)?
-            != std::cmp::Ordering::Greater
+            == std::cmp::Ordering::Greater
+            || chain[0]
+                .not_after()
+                .compare(&now)
+                .map_err(|_| Error::InvalidResponse)?
+                != std::cmp::Ordering::Greater)
     {
         return Err(Error::InvalidResponse);
     }
-    let _ = roots;
     Ok(())
 }
 impl Material {
     /// Revalidate deserialized material before any credential is installed in a transport.
     pub fn validate(&self) -> Result<(), Error> {
+        self.check(true)
+    }
+    /// Structural recovery preserves expired credentials for explicit re-pairing.
+    pub fn validate_stored(&self) -> Result<(), Error> {
+        self.check(false)
+    }
+    fn check(&self, current: bool) -> Result<(), Error> {
         match self {
             Self::ThinQ1 {
                 http_server,
@@ -148,7 +155,7 @@ impl Material {
                 topic(pub_topic, false)?;
                 topic(prov_topic, false)?;
                 topic(sub_topic, true)?;
-                identity(private_key, certificate, ca_certificate)?;
+                identity(private_key, certificate, ca_certificate, current)?;
             }
         };
         Ok(())
@@ -190,7 +197,7 @@ fn prepare(id: &str, otp: &str, key: &str) -> Result<Crypto, Error> {
         || id.len() > 256
         || id.chars().any(char::is_control)
         || otp.is_empty()
-        || otp.len() > 128
+        || otp.len() > 397
         || otp.chars().any(char::is_control)
     {
         return Err(Error::InvalidInput);
@@ -261,10 +268,10 @@ async fn iot(
             body.map(|body| body.to_string()),
         )
         .await?;
-    if let Some(code) = raw.get("resultCode") {
-        if code != "0000" {
-            return Err(Error::InvalidResponse);
-        }
+    if let Some(code) = raw.get("resultCode")
+        && code != "0000"
+    {
+        return Err(Error::InvalidResponse);
     }
     Ok(raw.get("result").cloned().unwrap_or(raw))
 }
@@ -349,4 +356,85 @@ pub(crate) async fn pair_at(
         material,
         registration_ciphertext: crypto.registration_ciphertext,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn otp_envelopes_decrypt_to_the_reference_nonce_and_hashes() {
+        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let pem = String::from_utf8(rsa.public_key_to_pem().unwrap()).unwrap();
+        let crypto = prepare("device", "otp", &pem).unwrap();
+        let mut first = vec![0; 256];
+        let n = rsa
+            .private_decrypt(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&crypto.certificate_ciphertext)
+                    .unwrap(),
+                &mut first,
+                Padding::PKCS1,
+            )
+            .unwrap();
+        first.truncate(n);
+        let mut second = vec![0; 256];
+        let n = rsa
+            .private_decrypt(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&crypto.registration_ciphertext)
+                    .unwrap(),
+                &mut second,
+                Padding::PKCS1,
+            )
+            .unwrap();
+        second.truncate(n);
+        assert_eq!(&first[..8], &second[..8]);
+        assert_eq!(&first[8..11], b"otp");
+        assert_eq!(&first[11..43], &openssl::sha::sha256(b"device"));
+        assert_eq!(&first[43..75], &openssl::sha::sha256(crypto.csr.as_bytes()));
+        assert_eq!(
+            &first[75..],
+            &openssl::sha::sha256(crypto.public.as_bytes())
+        );
+        assert_eq!(&second[8..], &openssl::sha::sha256(b"device"));
+        let csr = X509Req::from_pem(crypto.csr.as_bytes()).unwrap();
+        let public = PKey::public_key_from_pem(crypto.public.as_bytes()).unwrap();
+        assert!(csr.verify(&public).unwrap());
+        assert!(public.public_eq(&PKey::private_key_from_pem(crypto.private.as_bytes()).unwrap()));
+        let der =
+            base64::engine::general_purpose::STANDARD.encode(rsa.public_key_to_der().unwrap());
+        assert!(prepare("device", "otp", &der).is_ok());
+    }
+    #[test]
+    fn invalid_material_and_unbounded_crypto_inputs_are_rejected() {
+        assert!(prepare("", "otp", "bad").is_err());
+        assert!(prepare("d", &"o".repeat(398), "bad").is_err());
+        assert!(prepare("d", "o", &"x".repeat(8193)).is_err());
+        let material = Material::ThinQ1 {
+            http_server: "http://cloud.example".into(),
+            rti_server: "host:5222".into(),
+        };
+        assert!(material.validate().is_err());
+        let material = Material::ThinQ1 {
+            http_server: "https://cloud.example".into(),
+            rti_server: "host:5222".into(),
+        };
+        material.validate().unwrap();
+        assert_eq!(format!("{material:?}"), "PairingMaterial(<redacted>)");
+        let restored: Material =
+            serde_json::from_slice(&serde_json::to_vec(&material).unwrap()).unwrap();
+        restored.validate().unwrap();
+        for value in [
+            "ssl://user:pass@broker.example",
+            "ssl://broker.example?x=y",
+            "ssl://broker.example/path",
+            "ssl://broker.example:0",
+            "http://broker.example",
+        ] {
+            assert!(service(value).is_err());
+        }
+        assert!(topic("device/+/set", true).is_ok());
+        assert!(topic("device/#/set", true).is_err());
+        assert!(topic("device/+", false).is_err());
+    }
 }
