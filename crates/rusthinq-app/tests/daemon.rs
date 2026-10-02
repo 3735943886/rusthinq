@@ -291,7 +291,6 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
             directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/drivers"),
             topic_prefix: "test".into(),
-            il_prefix: None,
             bindings: Default::default(),
             watch: false,
         }),

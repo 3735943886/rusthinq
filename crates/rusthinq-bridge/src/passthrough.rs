@@ -106,7 +106,7 @@ impl Relay {
     pub fn protect_local_endpoints(&self, payload: &Value) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.protect_local_endpoints(payload, now))
     }
-    /// Call only for a classified failure. The front door does not infer this automatically.
+    /// Explicit suspicion from a URL. Refused unlearned SNI names are suspected by `relay`.
     pub fn suspect(&self, download_url: &str) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.suspect(download_url, now))
     }
@@ -122,7 +122,7 @@ impl Passthrough for Relay {
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "relay capacity"))?;
-            if !relay.with_hosts(|hosts, now| hosts.route(&name, now))? {
+            if !relay.with_hosts(|hosts, now| hosts.route_or_suspect(&name, now))? {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "unlearned or local host",

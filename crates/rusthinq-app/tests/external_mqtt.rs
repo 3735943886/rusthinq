@@ -124,3 +124,37 @@ async fn recovered_intent_and_all_cleanup_are_confirmed_without_scripts() {
             .is_empty()
     );
 }
+#[tokio::test]
+async fn disconnected_adapter_drops_and_counts_transient_output_instead_of_failing() {
+    use rusthinq_app::scripts::{Context, PublishSink};
+    let directory = tempfile::tempdir().unwrap();
+    let (adapter, _service) = external_mqtt::new(Config {
+        host: "127.0.0.1".into(),
+        port: 1,
+        tls: false,
+        ca: None,
+        client: "test".into(),
+        username: None,
+        password: None,
+        inventory: directory.path().join("retained.json"),
+    })
+    .unwrap();
+    let context = Context {
+        device: "d".into(),
+        session: rusthinq_lifecycle::SessionKey {
+            incarnation: 1,
+            generation: 1,
+        },
+        generation: 1,
+    };
+    // Far beyond the 128-entry transient queue: nothing fails while no broker is connected.
+    for n in 0..300 {
+        let event =
+            serde_json::json!({"topic":"rusthinq/d/event","payload":n.to_string(),"retain":false});
+        assert_eq!(adapter.try_publish(&context, event.to_string()), Ok(()));
+    }
+    assert_eq!(adapter.dropped_transient(), 300);
+    let value = serde_json::json!({"topic":"rusthinq/d/state","payload":"on","retain":true});
+    assert_eq!(adapter.try_publish(&context, value.to_string()), Ok(()));
+    assert_eq!(adapter.dropped_transient(), 300);
+}

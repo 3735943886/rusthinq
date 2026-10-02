@@ -5,7 +5,6 @@ pub struct Config {
     pub watch: bool,
     pub directory: PathBuf,
     pub topic_prefix: String,
-    pub il_prefix: Option<String>,
     pub bindings: BTreeMap<String, String>,
 }
 impl Config {

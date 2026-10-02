@@ -60,7 +60,6 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
     let driver_config = rusthinq_app::drivers::Config {
         directory: sources.clone(),
         topic_prefix: "rusthinq".into(),
-        il_prefix: Some("ildevice".into()),
         bindings: Default::default(),
         watch: watched,
     };
@@ -171,7 +170,16 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
         json!({"did":"d","cmd":"completeProvisioning_ack"}),
     )
     .await;
-    until(&mut events,|event|matches!(event,Event::ScriptOutput {payload,context:Context {generation:1,..}} if serde_json::from_str::<serde_json::Value>(payload).unwrap()["topic"]=="ildevice/d")).await;
+    until(&mut events, |event| {
+        matches!(
+            event,
+            Event::ScriptOutput {
+                context: Context { generation: 1, .. },
+                ..
+            }
+        )
+    })
+    .await;
     let session = handle.snapshot()[0].session.unwrap();
     if command {
         real_command(&handle, session, &mut peer, &mut events).await;

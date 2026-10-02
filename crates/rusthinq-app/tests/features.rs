@@ -153,7 +153,6 @@ async fn embedding_rejects_disabled_capabilities_before_loading_ca_or_writing_ch
             directory: directory.path().into(),
             watch: false,
             topic_prefix: "rusthinq".into(),
-            il_prefix: None,
             bindings: Default::default(),
         });
         let error = match Daemon::prepare(config).await {

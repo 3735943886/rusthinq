@@ -5,6 +5,8 @@
 
 // The inner body of an `AA..BB` frame whose first byte is `first`, or `()` for anything else
 // (a frame of another kind, an unframed buffer). The checksum is not validated, as elsewhere.
+import "il_common" as il;
+
 fn inner(data, first) {
     let body = aabb_unwrap(data);
     if body == () || body.len() < 2 || body[0] != first { return (); }
@@ -16,7 +18,7 @@ fn pad2(n) { if n < 10 { "0" + n } else { n.to_string() } }
 // Publish `name` unless it is `()` (a wire code the table does not know is left unpublished
 // rather than published as a made-up value).
 fn pub_name(ctx, prop, name) {
-    if name != () { ctx.publish_property(prop, name); }
+    if name != () { il::publish_property(ctx, prop, name); }
 }
 
 // A binary property from a wire number that is 1 when on.
@@ -36,5 +38,5 @@ fn to_number(text) {
 }
 
 fn reject(ctx, prop, reason) {
-    ctx.publish_event("reject", json_stringify(#{ prop: prop, reason: reason }));
+    il::publish_event(ctx, "reject", json_stringify(#{ prop: prop, reason: reason }));
 }

@@ -20,6 +20,7 @@
 
 import "aabb_common" as c;
 import "monitoring_common" as m;
+import "il_common" as il;
 
 fn dev() { 0x31 }
 fn payload_len() { 28 }
@@ -158,9 +159,9 @@ fn descriptor(ctx) {
 
 // ---- host hooks -------------------------------------------------------------------
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let a = m::ack(data, dev());
@@ -171,15 +172,15 @@ fn on_data(ctx, data) {
     let b = r.body;
     let p = r.p;
 
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
     let state = b[p];
     let off = state == 0;
     ctx.state_set("state", state);
 
     let chosen = m::follow(ctx, b[p + 5], startable());
-    if chosen != () { ctx.publish_property("course_select", m::name_of(courses(), chosen)); }
+    if chosen != () { il::publish_property(ctx, "course_select", m::name_of(courses(), chosen)); }
 
-    ctx.publish_property("power", if off { "false" } else { "true" });
+    il::publish_property(ctx, "power", if off { "false" } else { "true" });
     c::pub_name(ctx, "status", m::name_of(states(), state));
     c::pub_name(ctx, "course", m::name_of(courses(), b[p + 5]));
     c::pub_name(ctx, "smart_course", m::name_of(smart_courses(), b[p + 20]));
@@ -187,32 +188,32 @@ fn on_data(ctx, data) {
     // is published (this model has maxDownloadCourseNum 1, the rest are always empty)
     c::pub_name(ctx, "download_course", m::name_of(smart_courses(), b[p + 24]));
 
-    ctx.publish_property("remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
-    ctx.publish_property("initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
-    ctx.publish_property("reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
-    ctx.publish_property("energy", (b[p + 17] * 256 + b[p + 18]).to_string());
+    il::publish_property(ctx, "remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
+    il::publish_property(ctx, "initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
+    il::publish_property(ctx, "reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
+    il::publish_property(ctx, "energy", (b[p + 17] * 256 + b[p + 18]).to_string());
 
     let error = b[p + 6];
-    ctx.publish_property("error", if error != 0 { "true" } else { "false" });
-    ctx.publish_property("error_message", error_message(error));
+    il::publish_property(ctx, "error", if error != 0 { "true" } else { "false" });
+    il::publish_property(ctx, "error_message", error_message(error));
 
     // rec[14]: bit 0 child lock, bit 1 night dry, bit 3 remote start. Bit 5 is set on every
     // record this unit has ever sent, and no cloud field follows it: left alone rather than
     // exposed as an invented toggle. rec[7] is the previous state (the cloud's preState).
     let flags = b[p + 14];
-    ctx.publish_property("child_lock", c::bit(flags, 0x01));
-    ctx.publish_property("night_dry", c::bit(flags, 0x02));
-    ctx.publish_property("remote_start", c::bit(flags, 0x08));
+    il::publish_property(ctx, "child_lock", c::bit(flags, 0x01));
+    il::publish_property(ctx, "night_dry", c::bit(flags, 0x02));
+    il::publish_property(ctx, "remote_start", c::bit(flags, 0x08));
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     if prop == "course_select" {
         let code = m::code_of(courses(), value);
         if code == () || !m::select(ctx, code, startable()) {
             c::reject(ctx, prop, "not a course this cabinet can start");
             return;
         }
-        ctx.publish_property("course_select", value);
+        il::publish_property(ctx, "course_select", value);
     } else if prop == "start" {
         let course = m::selected(ctx);
         let payload = if ctx.state_get("state") == 3 { resume_payload(course) } else { start_payload(course) };
@@ -225,4 +226,10 @@ fn on_set_property(ctx, prop, value) {
     } else {
         c::reject(ctx, prop, "unknown or read-only property");
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

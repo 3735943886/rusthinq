@@ -1,4 +1,4 @@
-//! Bounded device state and metadata. No IL types, topics, transport, or timers.
+//! Bounded device state and metadata. No device semantics, transport, or timers.
 use crate::Error;
 use rhai::{Array, Dynamic, Engine, EvalAltResult, FLOAT, INT, ImmutableString, Map};
 use std::{
@@ -16,7 +16,6 @@ pub struct Config {
     pub model_name: String,
     pub sw_version: String,
     pub topic_prefix: String,
-    pub il_prefix: Option<String>,
     pub thinq2: bool,
     pub driver_api: bool,
     pub message_seed: i64,
@@ -31,7 +30,6 @@ impl Config {
             state_bytes: 65536,
             sw_version: String::new(),
             topic_prefix: "rusthinq".into(),
-            il_prefix: None,
             thinq2: false,
             driver_api: false,
             message_seed: 0,
@@ -59,10 +57,6 @@ impl Context {
             || config.topic_prefix.is_empty()
             || config.topic_prefix.len() > 256
             || config.topic_prefix.contains(['#', '+', '\0'])
-            || config
-                .il_prefix
-                .as_ref()
-                .is_some_and(|p| p.is_empty() || p.len() > 256 || p.contains(['#', '+', '\0']))
             || config.model_name.len() > string_bytes
             || config.sw_version.len() > string_bytes
             || config.message_seed < 0
@@ -199,14 +193,6 @@ pub(crate) fn install(engine: &mut Engine) {
     });
     engine.register_fn("device_topic", |ctx: &mut Context| {
         format!("{}/{}", ctx.config.topic_prefix, ctx.config.device)
-    });
-    engine.register_fn("il_topic", |ctx: &mut Context| {
-        ctx.config
-            .il_prefix
-            .as_ref()
-            .map_or(String::new(), |prefix| {
-                format!("{prefix}/{}", ctx.config.device)
-            })
     });
     engine.register_fn("is_thinq2", |ctx: &mut Context| ctx.config.thinq2);
     engine.register_fn("state_set", Context::set);

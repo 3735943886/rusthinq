@@ -6,7 +6,6 @@ impl Config {
             watch: self.watch,
             directory: self.directory.clone(),
             topic_prefix: self.topic_prefix.clone(),
-            il_prefix: self.il_prefix.clone(),
             bindings: self.bindings.clone(),
         }
     }

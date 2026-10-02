@@ -214,19 +214,39 @@ async fn fragmented_client_hello_and_bytes_relay_exactly_with_half_close() {
 }
 
 #[tokio::test]
-async fn unlearned_and_protected_hosts_never_dial() {
-    let connector = destination(None);
+async fn unlearned_host_is_refused_then_suspected_and_protected_hosts_never_dial() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let connector = destination(Some(upstream.local_addr().unwrap()));
     let relay = Relay::new(Config::default(), connector.clone()).unwrap();
+    relay.confirm_local("protected.example").unwrap();
     let mut harness = Harness::start(relay.clone()).await;
-    let _peer = harness.connect("cdn.example").await;
-    harness.rejected().await;
-    relay
-        .learn_command(&json!("https://cdn.example/fw"))
-        .unwrap();
-    relay.confirm_local("cdn.example").unwrap();
-    let _protected = harness.connect("cdn.example").await;
+    // First attempt: no evidence, refused without dialing, as 0.1's failed local handshake.
+    let _first = harness.connect("cdn.example").await;
     harness.rejected().await;
     assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        relay.snapshot().unwrap()["cdn.example"],
+        rusthinq_bridge::firmware::Evidence::Suspected { .. }
+    ));
+    // The appliance's retry passes through to the real host.
+    let _retry = harness.connect("cdn.example").await;
+    let (mut remote, _) = timeout(Duration::from_secs(2), upstream.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut prefix = vec![0; hello("cdn.example").len()];
+    remote.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(prefix, hello("cdn.example"));
+    // Local proof is never weakened by refusal, on any number of retries.
+    for _ in 0..2 {
+        let _protected = harness.connect("protected.example").await;
+        harness.rejected().await;
+    }
+    assert_eq!(
+        relay.snapshot().unwrap()["protected.example"],
+        rusthinq_bridge::firmware::Evidence::Local
+    );
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
     harness.shutdown().await;
 }
 

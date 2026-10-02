@@ -19,7 +19,10 @@ use std::{
     io,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -169,6 +172,8 @@ struct Shared {
     removals: mpsc::Sender<Removal>,
     status: watch::Sender<Status>,
     flushed: watch::Sender<u64>,
+    /// Non-retained publications discarded because no broker connection existed.
+    dropped: AtomicU64,
 }
 #[derive(Clone)]
 pub struct Handle(Arc<Shared>);
@@ -193,6 +198,7 @@ pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
         removals,
         status: watch::channel(Status::Connecting).0,
         flushed: watch::channel(0).0,
+        dropped: AtomicU64::new(0),
     });
     Ok((
         Handle(shared.clone()),
@@ -228,6 +234,10 @@ impl Handle {
     }
     pub fn status(&self) -> watch::Receiver<Status> {
         self.0.status.subscribe()
+    }
+    /// Non-retained publications discarded while disconnected, since the adapter started.
+    pub fn dropped_transient(&self) -> u64 {
+        self.0.dropped.load(Ordering::Relaxed)
     }
     pub async fn delete_topic(&self, owner: String, topic: String) -> io::Result<usize> {
         let (result, received) = oneshot::channel();
@@ -309,6 +319,12 @@ impl Handle {
             }
             cache.values.insert(topic, message);
             cache.bytes = bytes;
+        } else if !matches!(*self.0.status.borrow(), Status::Connected) {
+            // No subscriber can receive a non-retained message without a broker; replaying
+            // it after reconnect would deliver a stale occurrence. Count the loss instead of
+            // failing the script's remaining outputs.
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         } else {
             self.0
                 .transient
@@ -387,6 +403,9 @@ impl Runtime {
                     self.shared
                         .status
                         .send_replace(Status::Failed(error.to_string()));
+                    while self.transient.try_recv().is_ok() {
+                        self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             tokio::select! {_=stop.changed()=>break,_=tokio::time::sleep(Duration::from_secs(delay))=>{}}
@@ -481,10 +500,24 @@ impl Runtime {
                     continue;
                 }
                 if !message.retired && scopes.get(&message.owner) != Some(&message.context) {
+                    // Remove only what the current scope no longer publishes. A reconnect
+                    // (fresh `scopes`) must not clear and re-create the device's state.
+                    let live: std::collections::BTreeSet<String> = self
+                        .shared
+                        .cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values
+                        .values()
+                        .filter(|value| {
+                            value.owner == message.owner && value.context == message.context
+                        })
+                        .map(|value| value.topic.clone())
+                        .collect();
                     let old: Vec<_> = ledger
                         .pending()
                         .into_iter()
-                        .filter(|item| item.owner == message.owner)
+                        .filter(|item| item.owner == message.owner && !live.contains(&item.topic))
                         .collect();
                     ledger = Session::<Transport>::request_deletions(ledger, old.clone()).await?;
                     for item in old {

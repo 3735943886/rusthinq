@@ -9,7 +9,7 @@ fn compiled(source: &str, device: &str) -> Compiled {
     .unwrap()
 }
 #[test]
-fn context_callbacks_keep_device_state_and_opaque_outputs_without_il_helpers() {
+fn context_callbacks_keep_device_state_and_opaque_outputs_without_semantic_helpers() {
     let source = r#"fn on_response(ctx, body) {
         let state=ctx.state_get("state");
         if state == () {state=#{count:0,values:[true,1,"raw"]};}

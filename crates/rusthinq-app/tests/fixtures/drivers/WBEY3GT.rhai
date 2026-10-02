@@ -19,6 +19,7 @@
 // (locked AND its elapsed counter is running).
 
 import "aabb_common" as c;
+import "il_common" as il;
 
 fn record_len() { 48 }
 
@@ -69,9 +70,9 @@ fn state_name(v) {
 
 // ---- host hooks -------------------------------------------------------------------
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let body = c::inner(data, 0x42);
@@ -87,11 +88,11 @@ fn on_data(ctx, data) {
     } else {
         return;
     };
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
 
     let remote = (body[cur] & 0x02) != 0;
     ctx.state_set("remote", remote);
-    ctx.publish_property("remote_start", if remote { "true" } else { "false" });
+    il::publish_property(ctx, "remote_start", if remote { "true" } else { "false" });
 
     let any_cooking = false;
     let locked = false;
@@ -109,12 +110,12 @@ fn on_data(ctx, data) {
         let name = if state == 3 { if cooking { "cooking" } else { "off" } } else { state_name(state) };
         c::pub_name(ctx, b[0] + "_state", name);
         ctx.state_set(b[0] + "_level", level);
-        ctx.publish_property(b[0] + "_power_level", level.to_string());
-        ctx.publish_property(b[0] + "_cook_time", (body[g + 4] * 60 + body[g + 3]).to_string());
-        ctx.publish_property(b[0] + "_remaining_time", (body[g + 8] * 60 + body[g + 7]).to_string());
+        il::publish_property(ctx, b[0] + "_power_level", level.to_string());
+        il::publish_property(ctx, b[0] + "_cook_time", (body[g + 4] * 60 + body[g + 3]).to_string());
+        il::publish_property(ctx, b[0] + "_remaining_time", (body[g + 8] * 60 + body[g + 7]).to_string());
     }
-    ctx.publish_property("cooking", if any_cooking { "true" } else { "false" });
-    ctx.publish_property("locked", if locked { "true" } else { "false" });
+    il::publish_property(ctx, "cooking", if any_cooking { "true" } else { "false" });
+    il::publish_property(ctx, "locked", if locked { "true" } else { "false" });
 }
 
 // F0 43 20 08 <burner> <level> <timer h> <timer m> 00 00 00 00   set one burner
@@ -124,7 +125,7 @@ fn send_burner(ctx, id, level, minutes) {
     ctx.send_raw(aabb_wrap([0xf0, 0x43, 0x20, 0x08, id, level, minutes / 60, minutes % 60, 0, 0, 0, 0]));
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     // The appliance would refuse these anyway; better to say so than to send them.
     if ctx.state_get("remote") != true {
         c::reject(ctx, prop, "remote start is not granted at the panel");
@@ -154,4 +155,10 @@ fn on_set_property(ctx, prop, value) {
         }
     }
     c::reject(ctx, prop, "unknown or read-only property");
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

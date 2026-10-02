@@ -164,6 +164,25 @@ impl Hosts {
         }
     }
 
+    /// Route, or refuse and suspect a host with no evidence, so the appliance's retry
+    /// passes through (0.1 suspected `https://{sni}/` after a failed local handshake).
+    /// Local proof is never weakened.
+    pub fn route_or_suspect(&mut self, host: &str, now: u64) -> Result<bool, Error> {
+        if self.route(host, now)? {
+            return Ok(true);
+        }
+        let host = normalize(host)?;
+        if !self.entries.contains_key(&host) {
+            self.record(
+                host,
+                Evidence::Suspected {
+                    expires_at: now + INITIAL_TTL,
+                },
+            )?;
+        }
+        Ok(false)
+    }
+
     /// Diagnostics does not renew leases. Expired entries are removed.
     pub fn snapshot(&mut self, now: u64) -> Result<BTreeMap<String, Evidence>, Error> {
         self.advance(now)?;

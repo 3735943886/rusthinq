@@ -9,6 +9,8 @@
 //
 // (Rhai functions cannot see top-level constants, so the tunables are functions.)
 
+import "il_common" as il;
+
 fn retry_ms() { 15000 }
 fn refresh_ms() { 900000 }
 
@@ -42,7 +44,7 @@ fn to_number(text) {
 }
 
 fn reject(ctx, prop, reason) {
-    ctx.publish_event("reject", json_stringify(#{ prop: prop, reason: reason }));
+    il::publish_event(ctx, "reject", json_stringify(#{ prop: prop, reason: reason }));
 }
 
 // ---- protocol -----------------------------------------------------------------------

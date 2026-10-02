@@ -233,12 +233,11 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
     next.run(request).await
 }
 async fn mqtt_status(State(app): State<App>) -> Json<Value> {
-    let status = app
-        .handle
-        .external_mqtt()
-        .map(|handle| format!("{:?}", *handle.status().borrow()))
-        .unwrap_or_else(|| "Disabled".into());
-    Json(json!({"status":status}))
+    let Some(handle) = app.handle.external_mqtt() else {
+        return Json(json!({"status":"Disabled"}));
+    };
+    let status = format!("{:?}", *handle.status().borrow());
+    Json(json!({"status":status,"droppedTransient":handle.dropped_transient()}))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -844,7 +843,7 @@ mod tests {
             },
             stopped,
         ));
-        let mut paths = vec!["/api/events", "/monitor-ws?id=d"];
+        let mut paths = vec!["/api/events", "/device?id=d"];
         if cfg!(feature = "gui") {
             paths.push("/ws");
         }

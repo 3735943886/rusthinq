@@ -7,7 +7,6 @@ fn config() -> Config {
     Config {
         directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
         topic_prefix: "rusthinq".into(),
-        il_prefix: Some("ildevice".into()),
         bindings: BTreeMap::new(),
         watch: false,
     }
@@ -22,26 +21,25 @@ fn messages(outputs: Vec<Output>) -> Vec<Value> {
         .collect()
 }
 #[test]
-fn real_aabb_driver_emits_descriptor_properties_and_gated_commands() {
+fn real_aabb_driver_publishes_and_gates_its_own_commands() {
     let mut host = Host::new(config().prepare("d", "Pd0F_F", true, true).unwrap());
     let initialized = host.invoke(1, "__init", "");
     assert_eq!(initialized.error, None);
-    let initial = messages(initialized.outputs);
-    assert_eq!(initial[0]["topic"], "ildevice/d");
-    let descriptor: Value = serde_json::from_str(initial[0]["payload"].as_str().unwrap()).unwrap();
-    assert_eq!(descriptor["model"], "Pd0F_F");
-    assert_eq!(descriptor["source"], "rusthinq");
-    assert_eq!(descriptor["x-mqtt"]["state"], "rusthinq/{id}/{prop}");
+    assert!(!messages(initialized.outputs).is_empty());
+    // Without remote start the script itself refuses: a non-retained publication, no send.
     let rejected = host.invoke(
         1,
         "__command",
         &json!({"prop":"pause","value":""}).to_string(),
     );
     assert_eq!(rejected.error, None);
-    let rejected = messages(rejected.outputs);
-    assert_eq!(rejected[0]["retain"], false);
-    let rejected: Value = serde_json::from_str(rejected[0]["payload"].as_str().unwrap()).unwrap();
-    assert_eq!(rejected["code"], "requires_unmet");
+    assert!(
+        !rejected
+            .outputs
+            .iter()
+            .any(|output| matches!(output, Output::Send(_)))
+    );
+    assert_eq!(messages(rejected.outputs)[0]["retain"], false);
     let mut payload = vec![0; 25];
     payload[5] = 1;
     payload[16] = 4;
@@ -91,48 +89,36 @@ fn real_tlv_driver_prepares_query_and_owned_timer_effects() {
 }
 
 #[test]
-fn script_side_number_validation_rejects_nonfinite_range_and_step() {
+fn commands_reach_the_script_unvalidated_and_are_ignored_without_a_callback() {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("Numeric.rhai"),r#"
-        fn publish_config(ctx) {
-            ctx.publish_il(json_stringify(#{props:#{level:#{type:"number",rw:true,min:0,max:10,step:2}}}));
-        }
-        fn on_set_property(ctx,prop,value) {ctx.publish_property(prop,value);}
-    "#).unwrap();
+    std::fs::write(
+        directory.path().join("Echo.rhai"),
+        r#"fn on_set_property(ctx,prop,value) {ctx.publish_raw(prop,value,false);}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("Silent.rhai"), "fn start(ctx) {}").unwrap();
     let mut options = config();
     options.directory = directory.path().into();
-    let mut host = Host::new(options.prepare("d", "Numeric", true, true).unwrap());
-    assert_eq!(host.invoke(1, "__init", "").error, None);
-    for (value, code) in [
-        ("NaN", "invalid_value"),
-        ("inf", "invalid_value"),
-        ("12", "out_of_range"),
-        ("3", "bad_step"),
-    ] {
+    let mut host = Host::new(options.prepare("d", "Echo", true, true).unwrap());
+    for value in ["NaN", " 4 ", ""] {
         let outcome = host.invoke(
             1,
             "__command",
             &json!({"prop":"level","value":value}).to_string(),
         );
         assert_eq!(outcome.error, None, "{value}");
-        let output = messages(outcome.outputs);
-        let reject: Value = serde_json::from_str(output[0]["payload"].as_str().unwrap()).unwrap();
-        assert_eq!(reject["code"], code, "{value}");
+        assert_eq!(
+            messages(outcome.outputs),
+            vec![json!({"topic":"level","payload":value,"retain":false})]
+        );
     }
+    let mut host = Host::new(options.prepare("d", "Silent", true, true).unwrap());
     let outcome = host.invoke(
         1,
         "__command",
-        &json!({"prop":"level","value":" 4 "}).to_string(),
+        &json!({"prop":"level","value":"1"}).to_string(),
     );
-    assert_eq!(outcome.error, None);
-    assert_eq!(
-        messages(outcome.outputs)[0]["payload"]
-            .as_str()
-            .unwrap()
-            .parse::<f64>()
-            .unwrap(),
-        4.0
-    );
+    assert_eq!((outcome.error, outcome.outputs), (None, vec![]));
 }
 
 #[test]
@@ -156,11 +142,6 @@ fn every_pinned_model_initializes_in_the_new_host() {
         let mut host = Host::new(prepared);
         let outcome = host.invoke(1, "__init", "");
         assert_eq!(outcome.error, None, "{model}");
-        assert!(
-            messages(outcome.outputs)
-                .iter()
-                .any(|message| message["topic"] == "ildevice/d"),
-            "{model}"
-        );
+        assert!(!messages(outcome.outputs).is_empty(), "{model}");
     }
 }

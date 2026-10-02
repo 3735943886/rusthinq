@@ -18,7 +18,8 @@ struct State {
     thinq2: bool,
     properties: BTreeMap<String, String>,
     events: BTreeMap<String, String>,
-    descriptor: Option<Value>,
+    /// Last payload per topic, for assertions on topics the harness does not classify.
+    published: BTreeMap<String, String>,
     sent: Vec<Vec<u8>>,
     clips: Vec<Value>,
     timers: BTreeMap<String, u64>,
@@ -34,10 +35,8 @@ impl State {
                     if let Ok(value) = serde_json::from_str::<Value>(&text) {
                         let topic = value["topic"].as_str().unwrap_or_default();
                         let payload = value["payload"].as_str().unwrap_or_default();
-                        if topic == "ildevice/test-device" {
-                            self.descriptor = serde_json::from_str(payload).ok();
-                        } else if let Some(name) = topic.strip_prefix("rusthinq/test-device/event/")
-                        {
+                        self.published.insert(topic.into(), payload.into());
+                        if let Some(name) = topic.strip_prefix("rusthinq/test-device/event/") {
                             self.events.insert(name.into(), payload.into());
                         } else if let Some(name) = topic.strip_prefix("rusthinq/test-device/") {
                             if value["retain"] == false {
@@ -77,6 +76,7 @@ impl State {
         if self.sent.len() > 1024
             || self.clips.len() > 1024
             || self.properties.len() > 1024
+            || self.published.len() > 2048
             || self.events.len() > 128
             || self.timers.len() > 256
         {
@@ -99,20 +99,12 @@ fn device(config: &Config, model: &str, thinq2: bool) -> Result<Device> {
     let compiled = config
         .prepare("test-device", model, thinq2, true)
         .map_err(|e| Box::<EvalAltResult>::from(format!("{e:?}")))?;
-    let raw = if compiled.has_function("on_set_property", 3) {
-        "fn __test_command(ctx,text){let cmd=json_parse(text);on_set_property(ctx,cmd.prop,cmd.value);}"
-    } else {
-        "fn __test_command(ctx,text){}"
-    };
-    let compiled = compiled
-        .with_entry(raw)
-        .map_err(|e| Box::<EvalAltResult>::from(format!("{e:?}")))?;
     Ok(Device(Arc::new(Mutex::new(State {
         host: Host::new(compiled),
         thinq2,
         properties: Default::default(),
         events: Default::default(),
-        descriptor: None,
+        published: Default::default(),
         sent: Vec::new(),
         clips: Vec::new(),
         timers: Default::default(),
@@ -201,14 +193,8 @@ fn engine(config: Config, model: String) -> Engine {
             state(d).feed(&bytes)
         })
         .register_fn("set", |d: &mut Device, prop: &str, value: &str| {
-            let mut d = state(d);
-            let command = if d.descriptor.is_some() {
-                "__command"
-            } else {
-                "__test_command"
-            };
-            d.invoke(
-                command,
+            state(d).invoke(
+                "__command",
                 &serde_json::json!({"prop":prop,"value":value}).to_string(),
             );
         })
@@ -227,12 +213,8 @@ fn engine(config: Config, model: String) -> Engine {
         .register_fn("script_error", |d: &mut Device| {
             dynamic(state(d).error.clone())
         })
-        .register_fn("descriptor", |d: &mut Device| {
-            let d = state(d);
-            d.descriptor
-                .as_ref()
-                .map(|v| rhai::serde::to_dynamic(v).unwrap_or(Dynamic::UNIT))
-                .unwrap_or(Dynamic::UNIT)
+        .register_fn("published", |d: &mut Device, topic: &str| {
+            dynamic(state(d).published.get(topic).cloned())
         })
         .register_fn("sent", |d: &mut Device| -> Array {
             state(d)
@@ -302,12 +284,11 @@ pub struct Report {
     pub test: String,
     pub error: Option<String>,
 }
-/// Runs the repository's own assertions; IL conformance remains owned by that repository.
+/// Runs the repository's own assertions; the harness interprets no script semantics.
 pub fn run(directory: &Path) -> io::Result<Vec<Report>> {
     let config = Config {
         directory: directory.canonicalize()?,
         topic_prefix: "rusthinq".into(),
-        il_prefix: Some("ildevice".into()),
         bindings: Default::default(),
         watch: false,
     };

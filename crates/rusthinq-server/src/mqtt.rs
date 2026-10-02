@@ -1,4 +1,4 @@
-//! Local ThinQ2 device MQTT service. No external broker, cloud dial, or IL semantics.
+//! Local ThinQ2 device MQTT service. No external broker, cloud dial, or device semantics.
 use crate::{
     Command, Config, Delivery, Disconnect, Entry, Event, Guard, Protocol, Receipt, Reject,
     ServerHandle, SessionId, Shared, State,

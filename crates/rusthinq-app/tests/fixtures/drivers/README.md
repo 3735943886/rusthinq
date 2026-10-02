@@ -1,7 +1,8 @@
 # Pinned real driver fixtures
 
-Copied unchanged from `rusthinq-scripts` revision
-`54292921c6edc72ea6ec901b1137845bff14e6ae`. The GPL license is preserved in
+Copied unchanged from the `rusthinq-scripts` working tree at
+`54292921c6edc72ea6ec901b1137845bff14e6ae` plus the uncommitted `il_common` migration
+(IL moved out of the host); re-pin to that commit once it exists. The GPL license is preserved in
 [COPYING](COPYING). Runtime drivers are loaded from the configured directory;
 these fixtures are test inputs, not a production fallback.
 
@@ -14,19 +15,20 @@ ThinQ1 TLS session is claimed. They do not assert actual appliance or LG account
 
 | Source | SHA-256 |
 | --- | --- |
-| `1WPU4CIGCR__2.rhai` | `61555e117e091da549a657e0d95955b89f11cd3230ceefc0de169109433f44e9` |
-| `2RSFL2DBN3K_Z.rhai` | `44d66bab2881a1a40a6872dea1ccd9b7465df076e5c8cf39bd89ce06f6127db2` |
-| `AIR_910604_WW.rhai` | `dba2593b63c40de088eb2781733469dd3ad4078bbcbf2a8767a032f8b29a9b72` |
-| `CST_570004_WW.rhai` | `d56452bb2fdc6777cf28fc9443219c325a5f83a9d0b1b3aeefc8a0120fe6c9e2` |
-| `D140110.rhai` | `65c6a26eb6d9b8d408bc51b19ddf598176570f2976c51421e48f626e4442ce89` |
-| `DHUM_056905_WW.rhai` | `011fc5c64facaa5abe43fa813a4c5b2c5a5d85a412b8352949d959de9935bc49` |
-| `F24VDD.rhai` | `b937ce6a353539bc1788eae0117d024dc857ea6214dffe83d41e3c5f23d3ff41` |
-| `Pd0F_F.rhai` | `fca91e7d1556830bf0318916794b69f56c193c9fa6bcb04ba8e23e5dc284aa37` |
-| `RH14_N_KR.rhai` | `c7539ad12e4604db9457164142980244cfe36f1e6231b0dfb7150c8916581e25` |
-| `S3BF_POD_DN4.rhai` | `b3cdb1b793528fc81fd012e53c4d3d6322b2f0d8231f96559e60a309fdcd02d2` |
-| `WBEY3GT.rhai` | `41a0f21cdd871277278ce45204ddcfc07cd6ecd4e360ee75099969a9cfd7c868` |
-| `aabb_common.rhai` | `fa6431795f3c6ba58234a59c65dcc02740696336fd89bbd9a9b7ee077abf776c` |
+| `1WPU4CIGCR__2.rhai` | `718b828b667ed283c075eee8f9fbdb802b8383c5e30cf66321a269e77e4196be` |
+| `2RSFL2DBN3K_Z.rhai` | `e063b5ad3658f1959952911f4b676f6d8910a0293236d616876e60dc652d20e3` |
+| `AIR_910604_WW.rhai` | `94f00b3b6b8bb88629cacccdd41ce0004bd6788f411d682addb4f3b39a2a56ab` |
+| `CST_570004_WW.rhai` | `6511aa2733235a7df35cef5d0ed2ac53a5b2bf4fe79535914f39b1c87323159a` |
+| `D140110.rhai` | `2896b7e5fe35217d6a437a9b617a8c09d47e678da3aa7abae0d40c0ed8483d47` |
+| `DHUM_056905_WW.rhai` | `8a88cc3b88287f1c7702abf4f112ad1d847fa5f58c16bf97c796259edf25a3d4` |
+| `F24VDD.rhai` | `06574ebde4e0958e5a7b122b858d498494aef767a29b55c1247cef8e84a1eae4` |
+| `Pd0F_F.rhai` | `2618ea50fe954d8afe3b6b258cfcec07a96c9b8ebf8e93f7a2efab70e2d78025` |
+| `RH14_N_KR.rhai` | `e490b5d97cf444fe6fab70dbe6b49fbf169599a35b812e283b9085e63b83241b` |
+| `S3BF_POD_DN4.rhai` | `ea2a8c792797ddf3b19efbe58ce0e37364cb9474e8ed7f6c02e99a018b0a7f5b` |
+| `WBEY3GT.rhai` | `dd823ea2715ed2f187e9c6e0cafc01cd86d6df77d43aa0c7684869f6223ea41c` |
+| `aabb_common.rhai` | `ec52a965c7761de9b5696314539db98a43ef6b241d54fb1b57d4193695474a22` |
+| `il_common.rhai` | `1c29822e815b65f0fc045433ea2ab318a57d14b064cd792f15dc97066078bffb` |
 | `monitoring_common.rhai` | `41b266919c852b0aac35134af1aa45ec7f7968f0952906759f84b977e32f4a60` |
-| `tlv_common.rhai` | `8717043714545beefdf1f05af0a528f43cafd61623a0f5e2d7ce62ea77ec7433` |
-| `D140110.test.rhai` | `f4d200dbab94906eaa0670ab9353e45b43adf6c7ca252378279b4cefa496756b` |
-| `Pd0F_F.test.rhai` | `2c507e782d6780d636d556cc493b7f3a2c27c6582cd326c1af4af731bff2f7ec` |
+| `tlv_common.rhai` | `ab7fc72b517b54cdb9c69ec8327c7ed5106b73bcd25e26abc45a3f495973a12e` |
+| `D140110.test.rhai` | `774277f82a2c7bbd91948140c94e763dc9eb4b7b954f8c340ac28bcf52b50864` |
+| `Pd0F_F.test.rhai` | `d221af819e3b97f27ac7c5e44d1ad3fdfb3d9ff917d5f6f8d7ba95c138ca3932` |

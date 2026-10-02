@@ -11,6 +11,7 @@
 // 0x2a2 UVnano, 0x21e tank light, 0x21b off timer (minutes), 0x221 error.
 
 import "tlv_common" as c;
+import "il_common" as il;
 
 // ---- model ------------------------------------------------------------------------
 
@@ -104,11 +105,11 @@ fn write_fan(ctx, speed) {
 fn start(ctx) { c::start(ctx); }
 
 fn publish_config(ctx) {
-    ctx.publish_il(descriptor(ctx));
+    il::publish_il(ctx, descriptor(ctx));
 }
 
 fn on_drop(ctx) {
-    ctx.publish_property("available", "false");
+    il::publish_property(ctx, "available", "false");
 }
 
 fn on_timer(ctx, name) { c::on_timer(ctx, name); }
@@ -120,7 +121,7 @@ fn on_data(ctx, data) {
     for e in frame.tlvs { apply(ctx, e.t, e.v); }
 
     if frame.first {
-        ctx.publish_property("available", "true");
+        il::publish_property(ctx, "available", "true");
         // Ask the cloud not to relay tag 1200 (the appliance's noisy periodic report).
         ctx.send_clip("setMaskingInfo", 0, "{\"blacklist_tlv\":\"1200\"}");
     }
@@ -133,53 +134,53 @@ fn apply(ctx, tag, v) {
         0x2d7 | 0x2d8 | 0x2d9 => { return false; }
         0x1f7 => {
             c::put(ctx, tag, v);
-            ctx.publish_property("power", c::flag(v));
+            il::publish_property(ctx, "power", c::flag(v));
         }
         0x1f9 => {
             let prev = ctx.state_get("t505");
             c::put(ctx, tag, v);
             let name = mode_name(v);
-            if name != () { ctx.publish_property("mode", name); }
+            if name != () { il::publish_property(ctx, "mode", name); }
             // entering silent from another mode drops the fan to low
             if is_silent(v) && (prev == () || !is_silent(prev)) {
-                ctx.publish_property("fan", "low");
+                il::publish_property(ctx, "fan", "low");
             }
         }
         0x1fa => {
             c::put(ctx, tag, v);
-            if v == 2 { ctx.publish_property("fan", "low"); }
-            else if v == 6 { ctx.publish_property("fan", "high"); }
+            if v == 2 { il::publish_property(ctx, "fan", "low"); }
+            else if v == 6 { il::publish_property(ctx, "fan", "high"); }
         }
         0x253 => {
             c::put(ctx, tag, v);
-            if v >= 30 && v <= 70 { ctx.publish_property("target", v.to_string()); }
+            if v >= 30 && v <= 70 { il::publish_property(ctx, "target", v.to_string()); }
         }
-        0x336 => { ctx.publish_property("humidity", v.to_string()); }
+        0x336 => { il::publish_property(ctx, "humidity", v.to_string()); }
         0x1fd => {
             let t = if v % 2 == 0 { (v / 2).to_string() } else { (v / 2.0).to_string() };
-            ctx.publish_property("temperature", t);
+            il::publish_property(ctx, "temperature", t);
         }
         0x186 => {
             let name = tank_state_name(v);
             if name != () {
-                ctx.publish_property("tank_full", c::flag(v));
-                ctx.publish_property("tank_state", name);
+                il::publish_property(ctx, "tank_full", c::flag(v));
+                il::publish_property(ctx, "tank_state", name);
             }
         }
         // secondary tank signals seen when the tank is reinstalled / filled
-        0x2b1 => { if v == 256 { ctx.publish_property("tank_full", "false"); } }
-        0x2b2 => { ctx.publish_property("tank_full", c::flag(v)); }
-        0x360 => { c::put(ctx, tag, v); ctx.publish_property("sterilize", c::flag(v)); }
-        0x2a2 => { c::put(ctx, tag, v); ctx.publish_property("uvnano", c::flag(v)); }
-        0x21e => { c::put(ctx, tag, v); ctx.publish_property("bucket_light", c::flag(v)); }
-        0x21b => { c::put(ctx, tag, v); ctx.publish_property("off_timer", v.to_string()); }
-        0x221 => { ctx.publish_property("error", v.to_string()); }
+        0x2b1 => { if v == 256 { il::publish_property(ctx, "tank_full", "false"); } }
+        0x2b2 => { il::publish_property(ctx, "tank_full", c::flag(v)); }
+        0x360 => { c::put(ctx, tag, v); il::publish_property(ctx, "sterilize", c::flag(v)); }
+        0x2a2 => { c::put(ctx, tag, v); il::publish_property(ctx, "uvnano", c::flag(v)); }
+        0x21e => { c::put(ctx, tag, v); il::publish_property(ctx, "bucket_light", c::flag(v)); }
+        0x21b => { c::put(ctx, tag, v); il::publish_property(ctx, "off_timer", v.to_string()); }
+        0x221 => { il::publish_property(ctx, "error", v.to_string()); }
         _ => { return false; }
     }
     true
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     switch prop {
         "power" => {
             let on = c::to_bool(value);
@@ -192,7 +193,7 @@ fn on_set_property(ctx, prop, value) {
             c::put(ctx, 0x1f7, 1); // selecting a mode powers on
             if wire == 19 && !is_silent(prev) {
                 c::put(ctx, 0x1fa, 2); // silent runs at low fan
-                ctx.publish_property("fan", "low");
+                il::publish_property(ctx, "fan", "low");
             }
             c::write(ctx, 0x1f9, wire, [0x1f7]);
         }
@@ -220,4 +221,10 @@ fn on_set_property(ctx, prop, value) {
         }
         _ => { c::reject(ctx, prop, "unknown or read-only property"); }
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

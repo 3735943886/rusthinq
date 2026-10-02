@@ -151,14 +151,7 @@ impl Config {
                     .as_object()
                     .ok_or_else(|| invalid("drivers must be an object"))?;
                 if fields.keys().any(|key| {
-                    ![
-                        "directory",
-                        "topic_prefix",
-                        "il_prefix",
-                        "bindings",
-                        "watch",
-                    ]
-                    .contains(&key.as_str())
+                    !["directory", "topic_prefix", "bindings", "watch"].contains(&key.as_str())
                 }) {
                     return Err(invalid("unknown driver field"));
                 }
@@ -173,15 +166,6 @@ impl Config {
                         .ok_or_else(|| invalid("invalid driver topic_prefix"))?
                         .to_string(),
                 };
-                let il_prefix = match drivers.get("il_prefix") {
-                    None | Some(serde_json::Value::Null) => None,
-                    Some(value) => Some(
-                        value
-                            .as_str()
-                            .ok_or_else(|| invalid("invalid driver il_prefix"))?
-                            .to_string(),
-                    ),
-                };
                 let bindings = match drivers.get("bindings") {
                     None => Default::default(),
                     Some(value) => serde_json::from_value(value.clone())
@@ -190,7 +174,6 @@ impl Config {
                 let config = crate::drivers::Config {
                     directory: parent.join(directory),
                     topic_prefix,
-                    il_prefix,
                     bindings,
                     watch: match drivers.get("watch") {
                         None => false,

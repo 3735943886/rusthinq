@@ -11,6 +11,7 @@
 
 import "aabb_common" as c;
 import "monitoring_common" as m;
+import "il_common" as il;
 
 fn dev() { 0x30 }
 fn payload_len() { 25 }
@@ -146,9 +147,9 @@ fn descriptor(ctx) {
 
 // ---- host hooks -------------------------------------------------------------------
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let a = m::ack(data, dev());
@@ -159,52 +160,52 @@ fn on_data(ctx, data) {
     let b = r.body;
     let p = r.p;
 
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
     let state = b[p];
     let off = state == 0;
     ctx.state_set("state", state);
 
     let chosen = m::follow(ctx, b[p + 5], startable());
-    if chosen != () { ctx.publish_property("course_select", course_name(chosen)); }
+    if chosen != () { il::publish_property(ctx, "course_select", course_name(chosen)); }
 
-    ctx.publish_property("power", if off { "false" } else { "true" });
+    il::publish_property(ctx, "power", if off { "false" } else { "true" });
     c::pub_name(ctx, "status", state_name(state));
-    ctx.publish_property("process", if off { "none" } else { let n = process_name(b[p + 9]); if n == () { "none" } else { n } });
+    il::publish_property(ctx, "process", if off { "none" } else { let n = process_name(b[p + 9]); if n == () { "none" } else { n } });
     c::pub_name(ctx, "course", course_name(b[p + 5]));
 
-    ctx.publish_property("remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
-    ctx.publish_property("initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
-    ctx.publish_property("reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
+    il::publish_property(ctx, "remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
+    il::publish_property(ctx, "initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
+    il::publish_property(ctx, "reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
 
     c::pub_name(ctx, "dry_level", dry_level_name(b[p + 7]));
     c::pub_name(ctx, "eco_hybrid", eco_hybrid_name(b[p + 8]));
     // rec[17:19]: energy used by the running cycle, big-endian, in Wh. The counter climbs at
     // about 12 Wh/min during a cycle, a heat pump's ~0.7 kW.
-    ctx.publish_property("energy", (b[p + 17] * 256 + b[p + 18]).to_string());
+    il::publish_property(ctx, "energy", (b[p + 17] * 256 + b[p + 18]).to_string());
 
     let error = b[p + 6];
-    ctx.publish_property("error", if error != 0 { "true" } else { "false" });
-    ctx.publish_property("error_message", error_message(error));
+    il::publish_property(ctx, "error", if error != 0 { "true" } else { "false" });
+    il::publish_property(ctx, "error_message", error_message(error));
 
     let flags = b[p + 14];
-    ctx.publish_property("reservation", c::bit(flags, 0x01));
-    ctx.publish_property("anti_crease", c::bit(flags, 0x02));
-    ctx.publish_property("child_lock", c::bit(flags, 0x10));
-    ctx.publish_property("self_clean", c::bit(flags, 0x20));
-    ctx.publish_property("damp_dry_beep", c::bit(flags, 0x40));
-    ctx.publish_property("hand_iron", c::bit(flags, 0x80));
-    ctx.publish_property("remote_start", c::bit(b[p + 15], 0x01));
-    ctx.publish_property("steam", c::bit(b[p + 16], 0x08));
+    il::publish_property(ctx, "reservation", c::bit(flags, 0x01));
+    il::publish_property(ctx, "anti_crease", c::bit(flags, 0x02));
+    il::publish_property(ctx, "child_lock", c::bit(flags, 0x10));
+    il::publish_property(ctx, "self_clean", c::bit(flags, 0x20));
+    il::publish_property(ctx, "damp_dry_beep", c::bit(flags, 0x40));
+    il::publish_property(ctx, "hand_iron", c::bit(flags, 0x80));
+    il::publish_property(ctx, "remote_start", c::bit(b[p + 15], 0x01));
+    il::publish_property(ctx, "steam", c::bit(b[p + 16], 0x08));
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     if prop == "course_select" {
         let code = course_code(value);
         if code == () || !m::select(ctx, code, startable()) {
             c::reject(ctx, prop, "not a course this dryer can start");
             return;
         }
-        ctx.publish_property("course_select", value);
+        il::publish_property(ctx, "course_select", value);
     } else if prop == "start" {
         let resume = ctx.state_get("state") == 3;
         let payload = start_payload(m::selected(ctx), resume);
@@ -217,4 +218,10 @@ fn on_set_property(ctx, prop, value) {
     } else {
         c::reject(ctx, prop, "unknown or read-only property");
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

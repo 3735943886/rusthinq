@@ -13,7 +13,6 @@ pub struct Config {
     pub watch: bool,
     pub directory: PathBuf,
     pub topic_prefix: String,
-    pub il_prefix: Option<String>,
     pub bindings: BTreeMap<String, String>,
 }
 fn name(name: &str) -> bool {
@@ -104,9 +103,6 @@ impl Config {
             || self.topic_prefix.is_empty()
             || self.topic_prefix.len() > 256
             || self.topic_prefix.contains(['#', '+', '\0'])
-            || self.il_prefix.as_ref().is_some_and(|prefix| {
-                prefix.is_empty() || prefix.len() > 256 || prefix.contains(['#', '+', '\0'])
-            })
             || self.bindings.len() > 256
             || self.bindings.iter().any(|(id, model)| {
                 id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) || !name(model)
@@ -170,7 +166,6 @@ impl Config {
         .map_err(|e| Error::Compile(e.to_string()))?;
         let mut ctx = context::Config::new(id.into(), model.into());
         ctx.topic_prefix = self.topic_prefix.clone();
-        ctx.il_prefix = self.il_prefix.clone();
         ctx.thinq2 = thinq2;
         ctx.driver_api = true;
         ctx.message_seed = SystemTime::now()
@@ -218,18 +213,14 @@ impl Config {
         if compiled.has_function("on_drop", 1) {
             entry.push_str("on_drop(ctx);");
         }
-        entry.push_str("}\nfn __command(ctx,text) {let command=json_parse(text);let value=__validate(ctx,command.prop,command.value);if value!=() {");
+        // Commands reach the driver unvalidated; any semantic check is the script's.
+        entry.push_str("}\nfn __command(ctx,text) {");
         if compiled.has_function("on_set_property", 3) {
-            entry.push_str("on_set_property(ctx,command.prop,value);");
-        } else {
             entry.push_str(
-                "__reject(ctx,command.prop,\"unsupported\",\"driver has no command callback\");",
+                "let command=json_parse(text);on_set_property(ctx,command.prop,command.value);",
             );
         }
-        entry.push_str("}}\n");
-        compiled
-            .with_entry(&entry)?
-            .with_support(include_str!("../assets/driver_support.rhai"))?
-            .with_modules(bundle)
+        entry.push_str("}\n");
+        compiled.with_entry(&entry)?.with_modules(bundle)
     }
 }

@@ -14,6 +14,7 @@
 // encoding is unknown.
 
 import "aabb_common" as c;
+import "il_common" as il;
 
 fn record_len() { 26 }
 
@@ -89,9 +90,9 @@ fn error_name(v) {
 
 // ---- host hooks -------------------------------------------------------------------
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let body = c::inner(data, 0x32);
@@ -102,30 +103,36 @@ fn on_data(ctx, data) {
     if body[rec + 1] != 0x18 { return; }
 
     let p = rec + 2; // offset of the payload
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
 
     let state = body[p];
     c::pub_name(ctx, "status", state_name(state));
     c::pub_name(ctx, "process", process_name(body[p + 1]));
     c::pub_name(ctx, "course", course_name(body[p + 5]));
     c::pub_name(ctx, "error", error_name(body[p + 2]));
-    ctx.publish_property("running", if state == 2 { "true" } else { "false" });
+    il::publish_property(ctx, "running", if state == 2 { "true" } else { "false" });
 
     // bit 0 child lock, bit 1 door, bit 2 rinse aid refill, bit 3 salt refill, bit 4 chime
     let flags = body[p + 11];
-    ctx.publish_property("child_lock", c::bit(flags, 0x01));
-    ctx.publish_property("door", c::bit(flags, 0x02));
-    ctx.publish_property("rinse_refill", c::bit(flags, 0x04));
-    ctx.publish_property("salt_refill", c::bit(flags, 0x08));
-    ctx.publish_property("chime", c::bit(flags, 0x10));
+    il::publish_property(ctx, "child_lock", c::bit(flags, 0x01));
+    il::publish_property(ctx, "door", c::bit(flags, 0x02));
+    il::publish_property(ctx, "rinse_refill", c::bit(flags, 0x04));
+    il::publish_property(ctx, "salt_refill", c::bit(flags, 0x08));
+    il::publish_property(ctx, "chime", c::bit(flags, 0x10));
 
-    ctx.publish_property("total_time", (body[p + 3] * 60 + body[p + 4]).to_string());
-    ctx.publish_property("remaining_time", (body[p + 7] * 60 + body[p + 8]).to_string());
-    ctx.publish_property("reserve_time", (body[p + 9] * 60 + body[p + 10]).to_string());
-    ctx.publish_property("rinse_aid_level", body[p + 13].to_string());
-    ctx.publish_property("softening_level", body[p + 14].to_string());
+    il::publish_property(ctx, "total_time", (body[p + 3] * 60 + body[p + 4]).to_string());
+    il::publish_property(ctx, "remaining_time", (body[p + 7] * 60 + body[p + 8]).to_string());
+    il::publish_property(ctx, "reserve_time", (body[p + 9] * 60 + body[p + 10]).to_string());
+    il::publish_property(ctx, "rinse_aid_level", body[p + 13].to_string());
+    il::publish_property(ctx, "softening_level", body[p + 14].to_string());
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     c::reject(ctx, prop, "read-only appliance");
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

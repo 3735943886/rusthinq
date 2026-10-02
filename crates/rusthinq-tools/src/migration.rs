@@ -143,9 +143,6 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .and_then(toml::Value::as_str)
             .ok_or_else(|| invalid("script directory missing"))?;
         config["drivers"] = json!({"directory":absolute(base,directory),"topic_prefix":prefix,"watch":scripting.get("watch").and_then(toml::Value::as_bool).unwrap_or(false)});
-        if let Some(il) = scripting.get("il_prefix").and_then(toml::Value::as_str) {
-            config["drivers"]["il_prefix"] = json!(il);
-        }
     }
     // External MQTT and raw ACLs must be reviewed instead of silently reactivating
     // old injection permissions against the new incarnation-scoped command API.
@@ -251,6 +248,12 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
                 config["cloud_account"] = json!("account.json");
             }
         }
+    }
+    if legacy
+        .get("scripting")
+        .is_some_and(|s| s.get("il_prefix").is_some())
+    {
+        warnings.push("0.1 [scripting] il_prefix is not a host setting in 0.2; the scripts choose their own topics (rusthinq-scripts: il_common.rhai prefix()).");
     }
     if legacy.get("gui").is_some() {
         warnings.push("Management binds to loopback with raw injection disabled; review old GUI bind and authentication explicitly.");

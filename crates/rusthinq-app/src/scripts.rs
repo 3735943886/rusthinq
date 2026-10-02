@@ -50,7 +50,7 @@ pub struct Callbacks {
 pub enum DataEncoding {
     #[default]
     Utf8,
-    /// Lowercase hex preserves every byte without interpreting IL or model framing.
+    /// Lowercase hex preserves every byte without interpreting device semantics or model framing.
     Hex,
 }
 impl DataEncoding {

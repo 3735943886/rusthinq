@@ -87,7 +87,6 @@ mod tests {
         Config {
             directory: directory.into(),
             topic_prefix: "test".into(),
-            il_prefix: None,
             bindings: Default::default(),
             watch: true,
         }

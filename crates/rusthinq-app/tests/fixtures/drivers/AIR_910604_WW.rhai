@@ -13,6 +13,7 @@
 // left out until a capture shows the hardware has the feature.
 
 import "tlv_common" as c;
+import "il_common" as il;
 
 fn descriptor(ctx) {
     json_stringify(#{
@@ -100,16 +101,16 @@ fn filter_life(ctx, prop, remain_tag, max_tag) {
     let pct = (remain * 100.0 / budget).round().to_int();
     if pct < 0 { pct = 0; }
     if pct > 100 { pct = 100; }
-    ctx.publish_property(prop, pct.to_string());
+    il::publish_property(ctx, prop, pct.to_string());
 }
 
 // ---- host hooks -------------------------------------------------------------------
 
 fn start(ctx) { c::start(ctx); }
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_timer(ctx, name) { c::on_timer(ctx, name); }
 
@@ -117,33 +118,33 @@ fn on_data(ctx, data) {
     let frame = c::receive(ctx, data, 10, [0x1f7]);
     if frame == () || frame.caps { return; }
     for e in frame.tlvs { apply(ctx, e.t, e.v); }
-    if frame.first { ctx.publish_property("available", "true"); }
+    if frame.first { il::publish_property(ctx, "available", "true"); }
 }
 
 fn apply(ctx, tag, v) {
     switch tag {
-        0x1f7 => { c::put(ctx, tag, v); ctx.publish_property("power", c::flag(v)); }
+        0x1f7 => { c::put(ctx, tag, v); il::publish_property(ctx, "power", c::flag(v)); }
         0x1f9 => {
             c::put(ctx, tag, v);
             let name = mode_name(v);
-            if name != () { ctx.publish_property("mode", name); }
+            if name != () { il::publish_property(ctx, "mode", name); }
         }
         0x1fa => {
             c::put(ctx, tag, v);
             let name = fan_name(v);
-            if name != () { ctx.publish_property("fan", name); }
+            if name != () { il::publish_property(ctx, "fan", name); }
         }
-        0x333 => { ctx.publish_property("pm1", v.to_string()); }
-        0x334 => { ctx.publish_property("pm25", v.to_string()); }
-        0x335 => { ctx.publish_property("pm10", v.to_string()); }
-        0x240 => { ctx.publish_property("air_quality", v.to_string()); }
-        0x241 => { ctx.publish_property("odor", v.to_string()); }
+        0x333 => { il::publish_property(ctx, "pm1", v.to_string()); }
+        0x334 => { il::publish_property(ctx, "pm25", v.to_string()); }
+        0x335 => { il::publish_property(ctx, "pm10", v.to_string()); }
+        0x240 => { il::publish_property(ctx, "air_quality", v.to_string()); }
+        0x241 => { il::publish_property(ctx, "odor", v.to_string()); }
         0x355 | 0x356 => { c::put(ctx, tag, v); filter_life(ctx, "filter_life", 0x355, 0x356); }
         0x363 | 0x364 => { c::put(ctx, tag, v); filter_life(ctx, "top_filter_life", 0x363, 0x364); }
-        0x24e => { c::put(ctx, tag, v); ctx.publish_property("light", c::flag(v)); }
-        0x360 => { c::put(ctx, tag, v); ctx.publish_property("sterilize", c::flag(v)); }
-        0x21a => { c::put(ctx, tag, v); ctx.publish_property("sleep_timer", v.to_string()); }
-        0x221 => { ctx.publish_property("error", v.to_string()); }
+        0x24e => { c::put(ctx, tag, v); il::publish_property(ctx, "light", c::flag(v)); }
+        0x360 => { c::put(ctx, tag, v); il::publish_property(ctx, "sterilize", c::flag(v)); }
+        0x21a => { c::put(ctx, tag, v); il::publish_property(ctx, "sleep_timer", v.to_string()); }
+        0x221 => { il::publish_property(ctx, "error", v.to_string()); }
         // the per-mode wind-strength table (0x2d7/8/9) and everything not exposed
         _ => {}
     }
@@ -154,7 +155,7 @@ fn apply(ctx, tag, v) {
 // force power on and attach it. In auto mode the unit picks the fan itself and a bare fan
 // write is ignored; nothing is done about that (silently changing the user's mode to make
 // a fan request stick would be worse).
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     switch prop {
         "power" => {
             let on = c::to_bool(value);
@@ -182,4 +183,10 @@ fn on_set_property(ctx, prop, value) {
         }
         _ => { c::reject(ctx, prop, "unknown or read-only property"); }
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

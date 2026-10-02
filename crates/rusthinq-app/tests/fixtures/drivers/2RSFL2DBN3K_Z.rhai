@@ -92,6 +92,7 @@
 // offset table above) and so is the only property here that echoes its own write instead.
 
 import "aabb_common" as c;
+import "il_common" as il;
 
 fn f017_base() {
     "F017FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000FFFF00FFFFFFFF00FFFFFFFFFFFFFFFFFF00FFFFFF1EFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF0AFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
@@ -157,9 +158,9 @@ fn start(ctx) {
     ctx.send_raw(aabb_wrap([0xf0, 0xed, 0x12, 0x11, 0x01, 0x00, 0x00, 0x01, 0x04, 0x00]));
 }
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let inner = c::inner(data, 0x10);
@@ -178,7 +179,7 @@ fn on_data(ctx, data) {
         door_stats(ctx, inner);
     } else if inner[1] == 0x3e {
         if inner.len() < 6 { return; }
-        ctx.publish_property("energy_today", (inner[4] * 256 + inner[5]).to_string());
+        il::publish_property(ctx, "energy_today", (inner[4] * 256 + inner[5]).to_string());
     }
 }
 
@@ -187,26 +188,26 @@ fn on_data(ctx, data) {
 // are not published: two more counters whose deltas (this report's door test moved them by 4
 // and 6) do not match either door count or their sum, so what they count is not identified.
 fn door_stats(ctx, r) {
-    ctx.publish_property("door_open_count_fridge", r[9].to_string());
-    ctx.publish_property("door_open_count_freezer", r[15].to_string());
+    il::publish_property(ctx, "door_open_count_fridge", r[9].to_string());
+    il::publish_property(ctx, "door_open_count_freezer", r[15].to_string());
 }
 
 fn status(ctx, r, o) {
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
 
     let u = if r[o + 8] == 1 { "C" } else { "F" };
     if u != unit(ctx) {
         ctx.state_set("unit", u);
-        ctx.publish_il(descriptor(ctx)); // the setpoints' unit and range just changed
+        il::publish_il(ctx, descriptor(ctx)); // the setpoints' unit and range just changed
     }
 
-    ctx.publish_property("fridge_setpoint", fridge_temp(u, r[o + 1]).to_string());
-    ctx.publish_property("freezer_setpoint", freezer_temp(u, r[o + 2]).to_string());
-    ctx.publish_property("express_freeze", if r[o + 3] == 2 { "true" } else { "false" });
-    ctx.publish_property("door", if r[o + 7] == 1 { "true" } else { "false" });
-    ctx.publish_property("smart_care", if r[o + 17] == 1 { "true" } else { "false" });
+    il::publish_property(ctx, "fridge_setpoint", fridge_temp(u, r[o + 1]).to_string());
+    il::publish_property(ctx, "freezer_setpoint", freezer_temp(u, r[o + 2]).to_string());
+    il::publish_property(ctx, "express_freeze", if r[o + 3] == 2 { "true" } else { "false" });
+    il::publish_property(ctx, "door", if r[o + 7] == 1 { "true" } else { "false" });
+    il::publish_property(ctx, "smart_care", if r[o + 17] == 1 { "true" } else { "false" });
     c::pub_name(ctx, "night_glare", night_glare_name(r[o + 30]));
-    ctx.publish_property("door_alarm_mute", if r[o + 84] == 1 { "true" } else { "false" });
+    il::publish_property(ctx, "door_alarm_mute", if r[o + 84] == 1 { "true" } else { "false" });
     c::pub_name(ctx, "ai_saving", ai_saving_name(r[o + 93]));
 }
 
@@ -260,7 +261,7 @@ fn parse_hhmm(text, offset) {
     [hi, mi]
 }
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     let u = unit(ctx);
     switch prop {
         "fridge_setpoint" => {
@@ -294,8 +295,14 @@ fn on_set_property(ctx, prop, value) {
             // No status frame ever echoes this back (see the offset table above), so this is
             // the one property in this driver that publishes straight from its own write
             // rather than waiting for the appliance to say it back.
-            ctx.publish_property(prop, value);
+            il::publish_property(ctx, prop, value);
         }
         _ => { c::reject(ctx, prop, "unknown or read-only property"); }
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

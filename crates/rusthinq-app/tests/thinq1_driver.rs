@@ -52,7 +52,6 @@ fn real_thinq1_b64_driver_replays_nine_captured_cycle_states() {
     let config = Config {
         directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
         topic_prefix: "rusthinq".into(),
-        il_prefix: Some("ildevice".into()),
         bindings: BTreeMap::new(),
         watch: false,
     };
@@ -63,14 +62,10 @@ fn real_thinq1_b64_driver_replays_nine_captured_cycle_states() {
     );
     let initial = host.invoke(1, "__init", "");
     assert_eq!(initial.error, None);
-    let descriptor = publications(initial.outputs);
-    assert_eq!(descriptor.len(), 2);
-    assert_eq!(descriptor[0]["topic"], "ildevice/dishwasher");
-    assert_eq!(descriptor[0]["retain"], true);
-    let descriptor: Value =
-        serde_json::from_str(descriptor[0]["payload"].as_str().unwrap()).unwrap();
-    assert_eq!(descriptor["class"], "dishwasher");
-    assert_eq!(descriptor["model"], "D140110");
+    // The script's own initial publications are opaque here; their content is its tests'.
+    let initial = publications(initial.outputs);
+    assert_eq!(initial.len(), 2);
+    assert!(initial.iter().all(|message| message["retain"] == true));
 
     for (frame, status, process, remaining, door, child_lock) in [
         ("ready", "ready", "none", "93", "false", "false"),
@@ -158,7 +153,6 @@ async fn automatic_driver(external: bool) {
         .with_drivers(Config {
             directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
             topic_prefix: "rusthinq".into(),
-            il_prefix: Some("ildevice".into()),
             bindings: BTreeMap::new(),
             watch: false,
         })
@@ -223,13 +217,11 @@ async fn automatic_driver(external: bool) {
     .unwrap();
     assert_eq!(ack["Header"], envelope["Header"]);
     timeout(Duration::from_secs(3), async {
-        let mut descriptor = false;
         let mut status = false;
-        while !descriptor || !status {
+        while !status {
             match events.recv().await.unwrap() {
                 Event::ScriptOutput { payload, .. } => {
                     let message: Value = serde_json::from_str(&payload).unwrap();
-                    descriptor |= message["topic"] == "ildevice/dishwasher";
                     status |= message["topic"] == "rusthinq/dishwasher/status"
                         && message["payload"] == "running";
                 }
@@ -265,8 +257,6 @@ async fn automatic_driver(external: bool) {
         assert_eq!(retained["rusthinq/dishwasher/process"], "washing");
         assert_eq!(retained["rusthinq/dishwasher/total_time"], "93");
         assert_eq!(retained["rusthinq/dishwasher/available"], "true");
-        let descriptor: Value = serde_json::from_str(&retained["ildevice/dishwasher"]).unwrap();
-        assert_eq!(descriptor["model"], "D140110");
     }
     drop(peer);
     server.shutdown().await;
@@ -405,4 +395,193 @@ async fn broker_frame(peer: &mut tokio::net::TcpStream) -> std::io::Result<(u8, 
         }
     }
     Err(std::io::Error::other("invalid MQTT length"))
+}
+
+/// Broker outage: device traffic and the driver keep running, non-retained output is dropped
+/// and counted rather than failing the script, and reconnect republishes the latest retained state.
+#[tokio::test]
+async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state() {
+    use rusthinq_app::{
+        lifecycle_storage::Storage,
+        runtime::{Event, Runtime},
+    };
+    use rusthinq_server::{Server, thinq1_http::Metadata};
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::{mpsc, oneshot, watch},
+        time::timeout,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Default::default()).unwrap();
+    let (metadata, receiver) = mpsc::channel(4);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (sink, adapter) = rusthinq_app::external_mqtt::new(rusthinq_app::external_mqtt::Config {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        tls: false,
+        ca: None,
+        client: "outage".into(),
+        username: None,
+        password: None,
+        inventory: directory.path().join("retained.json"),
+    })
+    .unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 64)
+        .unwrap()
+        .with_metadata(receiver)
+        .with_drivers(Config {
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
+            topic_prefix: "rusthinq".into(),
+            bindings: BTreeMap::new(),
+            watch: false,
+        })
+        .unwrap()
+        .with_external_mqtt(sink.clone());
+    let handle = runtime.handle();
+    let (adapter_stop, adapter_stopped) = watch::channel(false);
+    let adapter = tokio::spawn(adapter.run(handle.clone(), adapter_stopped));
+    let (first_done, first) = oneshot::channel();
+    let (second_done, second) = oneshot::channel::<BTreeMap<String, String>>();
+    let broker = tokio::spawn(async move {
+        let mut first_done = Some(first_done);
+        let mut second_done = Some(second_done);
+        for connection in 0..2 {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            assert_eq!(broker_frame(&mut peer).await.unwrap().0, 0x10);
+            peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+            let mut retained = BTreeMap::new();
+            while let Ok((header, body)) = broker_frame(&mut peer).await {
+                match header {
+                    0xe0 => break,
+                    0xc0 => {
+                        peer.write_all(&[0xd0, 0]).await.unwrap();
+                        continue;
+                    }
+                    _ => {}
+                }
+                assert_eq!(header, 0x33);
+                let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                let topic = std::str::from_utf8(&body[2..2 + length]).unwrap();
+                let value = std::str::from_utf8(&body[4 + length..]).unwrap();
+                retained.insert(topic.to_string(), value.to_string());
+                let id = &body[2 + length..4 + length];
+                peer.write_all(&[0x40, 2, id[0], id[1]]).await.unwrap();
+                if connection == 0 && retained.len() == 17 {
+                    let _ = first_done.take().unwrap().send(());
+                    break; // drop the connection: the outage
+                }
+                // A reconnect must never clear the device's state (an empty descriptor is a removal).
+                assert!(
+                    connection == 0 || !value.is_empty(),
+                    "reconnect cleared {topic}"
+                );
+                if connection == 1
+                    && retained.len() == 17
+                    && retained
+                        .get("rusthinq/dishwasher/process")
+                        .map(String::as_str)
+                        == Some("rinsing")
+                {
+                    let _ = second_done.take().unwrap().send(retained.clone());
+                }
+            }
+        }
+    });
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    metadata
+        .send(Metadata {
+            device_id: "dishwasher".into(),
+            model_name: "D140110".into(),
+            device_type: "dishwasher".into(),
+        })
+        .await
+        .unwrap();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    server.admit(stream).unwrap();
+    async fn status(peer: &mut tokio::io::DuplexStream, frame: &str) {
+        let envelope = json!({
+            "Header":{"x-lgedm-deviceId":"dishwasher"},
+            "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(captured_frame(frame))}
+        });
+        peer.write_all(
+            &rusthinq_protocol::thinq1::encode(envelope.to_string().as_bytes(), 8192).unwrap(),
+        )
+        .await
+        .unwrap();
+        let ack = timeout(Duration::from_secs(3), async {
+            let size = peer.read_u32().await.unwrap();
+            let mut bytes = vec![0; size as usize];
+            peer.read_exact(&mut bytes).await.unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack["Header"]["x-lgedm-deviceId"], "dishwasher");
+    }
+    status(&mut peer, "running").await;
+    timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap();
+    // During the outage the device is still acknowledged and the driver still runs.
+    timeout(Duration::from_secs(3), async {
+        while !matches!(
+            *sink.status().borrow_and_update(),
+            rusthinq_app::external_mqtt::Status::Failed(_)
+        ) {
+            sink.status().changed().await.unwrap();
+        }
+    })
+    .await
+    .ok();
+    let dropped = sink.dropped_transient();
+    status(&mut peer, "rinsing").await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await.unwrap() {
+                Event::ScriptOutput { payload, .. } => {
+                    let message: Value = serde_json::from_str(&payload).unwrap();
+                    if message["topic"] == "rusthinq/dishwasher/process"
+                        && message["payload"] == "rinsing"
+                    {
+                        break;
+                    }
+                }
+                Event::ScriptStopped { error, .. } => panic!("driver stopped: {error:?}"),
+                Event::ScriptExecuted {
+                    error: Some(error), ..
+                } => panic!("driver failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(sink.dropped_transient() >= dropped);
+    let resynced = timeout(Duration::from_secs(10), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resynced["rusthinq/dishwasher/status"], "running");
+    assert_eq!(resynced["rusthinq/dishwasher/remaining_time"], "9");
+    assert!(handle.snapshot()[0].online);
+    drop(peer);
+    server.shutdown().await;
+    stop.send_replace(true);
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    adapter_stop.send_replace(true);
+    timeout(Duration::from_secs(3), adapter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    broker.abort();
 }

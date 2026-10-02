@@ -1,4 +1,4 @@
-//! L5 bounded, IL-agnostic Rhai execution. The caller owns worker scheduling and sinks.
+//! L5 bounded, semantics-agnostic Rhai execution. The caller owns worker scheduling and sinks.
 mod codecs;
 pub mod context;
 pub mod drivers;
@@ -110,7 +110,8 @@ pub struct Compiled {
     limits: Limits,
 }
 impl Compiled {
-    /// Opt into callbacks taking `(ctx, text)`. No legacy IL or raw MQTT APIs are installed.
+    /// Opt into callbacks taking `(ctx, text)`. Only opaque primitives are installed:
+    /// publish/send, `publish_raw(topic, payload, retain)`, device sends and timers.
     pub fn with_context(
         source: &str,
         limits: Limits,
@@ -135,6 +136,24 @@ impl Compiled {
                 },
             );
         }
+        let buffer = compiled.buffer.clone();
+        compiled.engine.register_fn(
+            "publish_raw",
+            move |_ctx: &mut context::Context,
+                  topic: String,
+                  payload: Dynamic,
+                  retain: bool|
+                  -> Result<(), Box<EvalAltResult>> {
+                let payload: serde_json::Value =
+                    rhai::serde::from_dynamic(&payload).map_err(|e| e.to_string())?;
+                let text = serde_json::json!({"topic":topic,"payload":payload,"retain":retain})
+                    .to_string();
+                buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .emit(text, true)
+            },
+        );
         let buffer = compiled.buffer.clone();
         compiled.engine.register_fn(
             "send_json",
@@ -282,7 +301,7 @@ impl Compiled {
             .consumer = enabled;
     }
     /// Compile off the transport loop, before swapping the running generation.
-    /// No filesystem resolver, MQTT factory, or IL validation is installed.
+    /// No filesystem resolver, MQTT factory, or semantic validation is installed.
     pub fn new(source: &str, limits: Limits, consumer_enabled: bool) -> Result<Self, Error> {
         if limits.source_bytes == 0
             || limits.string_bytes == 0

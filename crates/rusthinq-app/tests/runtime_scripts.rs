@@ -369,7 +369,7 @@ async fn callback_burst_preserves_device_scope_and_publication_order() {
 }
 
 #[tokio::test]
-async fn context_callbacks_bind_device_state_and_reload_without_il_interpretation() {
+async fn context_callbacks_bind_device_state_and_reload_without_interpretation() {
     use rusthinq_scripting::context::Config as ContextConfig;
     let source = r#"import "output_helper" as h; fn on_response(ctx,body){
         let count=ctx.state_get("count");if count==(){count=0;}
@@ -468,6 +468,143 @@ async fn context_callbacks_bind_device_state_and_reload_without_il_interpretatio
     assert_eq!(context.generation, 2);
     assert_eq!(value, "d:model:1");
     assert_eq!(frame(&mut peer).await, br#"{ "Body": {"Cmd":"Get"} }"#);
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn timer_from_replaced_generation_never_fires_and_successor_timer_does() {
+    use rusthinq_scripting::context::Config as ContextConfig;
+    let compiled = |tag: &str| {
+        Compiled::with_context(
+            &format!(
+                r#"fn on_response(ctx,body){{ctx.set_timer("t",150);ctx.publish("{tag}:armed");}}
+                fn on_timer(ctx,name){{ctx.publish("{tag}:"+name);}}"#
+            ),
+            Limits::default(),
+            true,
+            ContextConfig::new("d".into(), "model".into()),
+        )
+        .unwrap()
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let (sink, mut publications) = mpsc::channel(8);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(Sink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let mut peer = identify(&mut server).await;
+    until(&mut events, |e| {
+        matches!(
+            e,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Online { .. })
+        )
+    })
+    .await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            compiled("old"),
+            worker::Config::default(),
+            Callbacks {
+                response: Some("on_response".into()),
+                timer: Some("on_timer".into()),
+                ..Callbacks::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut next = async || {
+        timeout(Duration::from_secs(3), publications.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    response(&mut peer).await;
+    assert_eq!(next().await.1, "old:armed");
+    assert_eq!(
+        handle
+            .reload_script("d".into(), session, 1, compiled("new"))
+            .await,
+        Ok(2)
+    );
+    // The old timer is due during this window; nothing may be delivered.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    response(&mut peer).await;
+    let (context, value) = next().await;
+    assert_eq!((context.generation, value.as_str()), (2, "new:armed"));
+    let (context, value) = next().await;
+    assert_eq!((context.generation, value.as_str()), (2, "new:t"));
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}
+
+// Captured from the fixed 0.1 archive: the same body sent through its ThinQ1
+// DeviceAcceptor (`SendToDevice::T1Json`) and read off the socket. 0.1 names
+// commands `n-<uuid>`; 0.2 uses `n-<counter>`, so only that value is substituted.
+const LEGACY_CONTROL: &str = r#"{"Body":{"Cmd":"Control","CmdOpt":"Operation","CmdWId":"n-3a3473d6-65dc-4341-a963-429532618484","Data":"8CQEAQA=","Format":"B64"},"Header":{"x-lgedm-deviceId":"d"}}"#;
+
+#[tokio::test]
+async fn driver_thinq1_command_matches_legacy_wire_frame() {
+    use rusthinq_scripting::context::Config as ContextConfig;
+    let mut context = ContextConfig::new("d".into(), "model".into());
+    context.driver_api = true;
+    let compiled = Compiled::with_context(
+        r#"fn on_response(ctx,body){ctx.send_json("{\"Cmd\":\"Control\",\"CmdOpt\":\"Operation\",\"Format\":\"B64\",\"Data\":\"8CQEAQA=\"}");}"#,
+        Limits::default(),
+        true,
+        context,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap());
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let mut peer = identify(&mut server).await;
+    until(&mut events, |e| {
+        matches!(
+            e,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Online { .. })
+        )
+    })
+    .await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            compiled,
+            worker::Config::default(),
+            Callbacks {
+                response: Some("on_response".into()),
+                ..Callbacks::default()
+            },
+        )
+        .await
+        .unwrap();
+    response(&mut peer).await;
+    let sent = frame(&mut peer).await;
+    let value: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+    let id = value["Body"]["CmdWId"].as_str().unwrap();
+    assert!(id.strip_prefix("n-").unwrap().parse::<u64>().is_ok());
+    let expected = LEGACY_CONTROL.replace("n-3a3473d6-65dc-4341-a963-429532618484", id);
+    assert_eq!(String::from_utf8(sent).unwrap(), expected);
     server.shutdown().await;
     stop.send_replace(true);
     task.await.unwrap().unwrap();

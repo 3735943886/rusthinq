@@ -3,7 +3,7 @@ fn compiled(source: &str) -> Compiled {
     Compiled::new(source, Limits::default(), true).unwrap()
 }
 #[test]
-fn opaque_outputs_preserve_order_and_global_state_without_il_interpretation() {
+fn opaque_outputs_preserve_order_and_global_state_without_interpretation() {
     let mut host = Host::new(compiled(
         "let n=0; fn input(value) { n+=1; publish(value); send(n.to_string()); }",
     ));

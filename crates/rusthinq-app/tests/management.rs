@@ -342,7 +342,6 @@ async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_wi
     .with_drivers(drivers::Config {
         directory: directory.path().into(),
         topic_prefix: "test".into(),
-        il_prefix: None,
         bindings: Default::default(),
         watch: false,
     })

@@ -19,6 +19,7 @@
 // accepts.
 
 import "tlv_common" as c;
+import "il_common" as il;
 
 // ---- model ------------------------------------------------------------------------
 
@@ -219,11 +220,11 @@ fn start(ctx) {
 }
 
 fn publish_config(ctx) {
-    ctx.publish_il(descriptor(ctx));
+    il::publish_il(ctx, descriptor(ctx));
 }
 
 fn on_drop(ctx) {
-    ctx.publish_property("available", "false");
+    il::publish_property(ctx, "available", "false");
 }
 
 fn on_timer(ctx, name) {
@@ -253,20 +254,20 @@ fn on_data(ctx, data) {
     ctx.state_set("emode", mode);
     settle_energy(ctx, energy, before != mode && mode == "cool");
     if frame.tlvs.some(|e| e.t == 0x290 || e.t == 0x291 || e.t == 0x3d5 || e.t == 0x3d6 || e.t == 0x3d7) {
-        ctx.publish_property("wind_mode", wind_name(ctx));
+        il::publish_property(ctx, "wind_mode", wind_name(ctx));
     }
     if frame.tlvs.some(|e| e.t == 0x355 || e.t == 0x356) { publish_filter(ctx); }
     publish_action(ctx);
 
     if frame.first {
-        ctx.publish_property("available", "true");
+        il::publish_property(ctx, "available", "true");
         // Ask the cloud not to relay tag 1200 (the appliance's noisy periodic report).
         ctx.send_clip("setMaskingInfo", 0, "{\"blacklist_tlv\":\"1200\"}");
     }
 }
 
 // The capability reply: adopt the setpoint range the unit reports, and say so in the descriptor
-// (the host then refuses a setpoint outside it).
+// (il_common then refuses a setpoint outside it).
 fn on_caps(ctx, tlvs) {
     let lo = ();
     let hi = ();
@@ -280,40 +281,40 @@ fn on_caps(ctx, tlvs) {
     if lo == range_min(ctx) && hi == range_max(ctx) { return; }
     ctx.state_set("range_min", lo);
     ctx.state_set("range_max", hi);
-    ctx.publish_il(descriptor(ctx));
+    il::publish_il(ctx, descriptor(ctx));
 }
 
 // Apply one wire tag.
 fn apply(ctx, tag, v) {
     c::put(ctx, tag, v);
     switch tag {
-        0x1f7 => { ctx.publish_property("power", c::flag(v)); }
+        0x1f7 => { il::publish_property(ctx, "power", c::flag(v)); }
         0x1f9 => {
             let name = mode_name(v);
-            if name != () { ctx.publish_property("mode", name); }
+            if name != () { il::publish_property(ctx, "mode", name); }
         }
         0x1fa => {
             let name = fan_name(v);
-            if name != () { ctx.publish_property("fan", name); }
+            if name != () { il::publish_property(ctx, "fan", name); }
         }
-        0x1fd => { ctx.publish_property("temperature", half(v)); }
-        0x1fe => { ctx.publish_property("target", half(v)); }
-        0x336 => { ctx.publish_property("humidity", (v / 10.0).round().to_int().to_string()); }
-        0x205 => { ctx.publish_property("swing_vertical", c::flag(v)); }
-        0x206 => { ctx.publish_property("swing_horizontal", c::flag(v)); }
-        0x23f => { ctx.publish_property("comfort_saving", c::flag(v)); }
+        0x1fd => { il::publish_property(ctx, "temperature", half(v)); }
+        0x1fe => { il::publish_property(ctx, "target", half(v)); }
+        0x336 => { il::publish_property(ctx, "humidity", (v / 10.0).round().to_int().to_string()); }
+        0x205 => { il::publish_property(ctx, "swing_vertical", c::flag(v)); }
+        0x206 => { il::publish_property(ctx, "swing_horizontal", c::flag(v)); }
+        0x23f => { il::publish_property(ctx, "comfort_saving", c::flag(v)); }
         0x20e => {
             let name = auto_dry_name(v);
-            if name != () { ctx.publish_property("auto_dry", name); }
+            if name != () { il::publish_property(ctx, "auto_dry", name); }
         }
-        0x225 => { ctx.publish_property("auto_dry_remaining", v.to_string()); }
-        0x21a => { ctx.publish_property("sleep_timer", v.to_string()); }
+        0x225 => { il::publish_property(ctx, "auto_dry_remaining", v.to_string()); }
+        0x21a => { il::publish_property(ctx, "sleep_timer", v.to_string()); }
         0x21f => {
             let name = display_name(v);
-            if name != () { ctx.publish_property("display", name); }
+            if name != () { il::publish_property(ctx, "display", name); }
         }
-        0x221 => { ctx.publish_property("error", v.to_string()); }
-        0x2b3 => { ctx.publish_property("power_draw", v.to_string()); }
+        0x221 => { il::publish_property(ctx, "error", v.to_string()); }
+        0x2b3 => { il::publish_property(ctx, "power_draw", v.to_string()); }
         _ => {}
     }
 }
@@ -325,11 +326,11 @@ fn settle_energy(ctx, reported, entered_cool) {
     let want = ctx.state_get("energy_want");
     if entered_cool && want != () {
         if (reported != 0) != want { c::write(ctx, 0x20d, if want { 1 } else { 0 }, []); }
-        ctx.publish_property("energy_save", c::flag(if want { 1 } else { 0 }));
+        il::publish_property(ctx, "energy_save", c::flag(if want { 1 } else { 0 }));
     } else if reported != () && effective_mode(ctx) == "cool" {
         c::put(ctx, 0x20d, reported);
         ctx.state_set("energy_want", reported != 0);
-        ctx.publish_property("energy_save", c::flag(reported));
+        il::publish_property(ctx, "energy_save", c::flag(reported));
     }
 }
 
@@ -337,15 +338,15 @@ fn publish_filter(ctx) {
     let life = c::get(ctx, 0x356);
     let left = c::get(ctx, 0x355);
     if life > 0 {
-        ctx.publish_property("filter_remaining", (left * 100.0 / life).round().to_int().to_string());
-        ctx.publish_property("filter_used", (life - left).to_string());
-        ctx.publish_property("filter_life", life.to_string());
+        il::publish_property(ctx, "filter_remaining", (left * 100.0 / life).round().to_int().to_string());
+        il::publish_property(ctx, "filter_used", (life - left).to_string());
+        il::publish_property(ctx, "filter_life", life.to_string());
     }
 }
 
 fn publish_action(ctx) {
     let action = action_name(ctx);
-    if action != () { ctx.publish_property("action", action); }
+    if action != () { il::publish_property(ctx, "action", action); }
 
     let active = action == "cooling" || action == "drying" || action == "active";
     let was = ctx.state_get("active") == true;
@@ -356,7 +357,7 @@ fn publish_action(ctx) {
 
 // ---- writes -----------------------------------------------------------------------
 
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     switch prop {
         "power" => {
             let on = c::to_bool(value);
@@ -384,7 +385,7 @@ fn on_set_property(ctx, prop, value) {
         "energy_save" => {
             let on = c::to_bool(value);
             ctx.state_set("energy_want", on);
-            ctx.publish_property("energy_save", c::flag(if on { 1 } else { 0 }));
+            il::publish_property(ctx, "energy_save", c::flag(if on { 1 } else { 0 }));
             // Only takes effect while running in cool; otherwise it is written on entering cool.
             if effective_mode(ctx) == "cool" { c::write(ctx, 0x20d, if on { 1 } else { 0 }, []); }
         }
@@ -414,8 +415,14 @@ fn on_set_property(ctx, prop, value) {
                 tlvs.push(#{ t: f, v: v });
             }
             ctx.send_raw(tlv_frame_build(c::write_header(), tlvs));
-            ctx.publish_property("wind_mode", value);
+            il::publish_property(ctx, "wind_mode", value);
         }
         _ => { c::reject(ctx, prop, "unknown or read-only property"); }
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }

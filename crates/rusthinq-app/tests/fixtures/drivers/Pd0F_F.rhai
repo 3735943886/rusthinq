@@ -14,6 +14,7 @@
 
 import "aabb_common" as c;
 import "monitoring_common" as m;
+import "il_common" as il;
 
 fn dev() { 0x20 }
 fn payload_len() { 25 }
@@ -139,9 +140,9 @@ fn descriptor(ctx) {
 
 // ---- host hooks -------------------------------------------------------------------
 
-fn publish_config(ctx) { ctx.publish_il(descriptor(ctx)); }
+fn publish_config(ctx) { il::publish_il(ctx, descriptor(ctx)); }
 
-fn on_drop(ctx) { ctx.publish_property("available", "false"); }
+fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let a = m::ack(data, dev());
@@ -152,40 +153,40 @@ fn on_data(ctx, data) {
     let b = r.body;
     let p = r.p;
 
-    ctx.publish_property("available", "true");
+    il::publish_property(ctx, "available", "true");
     let state = b[p];
     let off = state == 0;
     ctx.state_set("state", state);
 
     let chosen = m::follow(ctx, b[p + 5], startable());
-    if chosen != () { ctx.publish_property("course_select", course_name(chosen)); }
+    if chosen != () { il::publish_property(ctx, "course_select", course_name(chosen)); }
 
-    ctx.publish_property("power", if off { "false" } else { "true" });
+    il::publish_property(ctx, "power", if off { "false" } else { "true" });
     c::pub_name(ctx, "status", state_name(state));
     c::pub_name(ctx, "course", course_name(b[p + 5]));
 
     // Zeroed while off: the appliance keeps the last cycle's figures in these bytes, which would
     // otherwise read as a countdown frozen mid-cycle.
-    ctx.publish_property("remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
-    ctx.publish_property("initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
-    ctx.publish_property("reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
+    il::publish_property(ctx, "remaining_time", if off { "0" } else { (b[p + 1] * 60 + b[p + 2]).to_string() });
+    il::publish_property(ctx, "initial_time", if off { "0" } else { (b[p + 3] * 60 + b[p + 4]).to_string() });
+    il::publish_property(ctx, "reserve_time", if off { "0" } else { (b[p + 12] * 60 + b[p + 13]).to_string() });
 
     c::pub_name(ctx, "temp", temp_name(b[p + 9]));
-    ctx.publish_property("rinse", b[p + 10].to_string());
-    ctx.publish_property("spin", if b[p + 8] != 0 { "true" } else { "false" });
+    il::publish_property(ctx, "rinse", b[p + 10].to_string());
+    il::publish_property(ctx, "spin", if b[p + 8] != 0 { "true" } else { "false" });
 
     let error = b[p + 6];
-    ctx.publish_property("error", if error != 0 { "true" } else { "false" });
-    ctx.publish_property("error_message", error_message(error));
+    il::publish_property(ctx, "error", if error != 0 { "true" } else { "false" });
+    il::publish_property(ctx, "error_message", error_message(error));
 
     let flags = b[p + 14];
-    ctx.publish_property("child_lock", c::bit(flags, 0x01));
-    ctx.publish_property("audible_diagnosis", c::bit(flags, 0x02));
-    ctx.publish_property("door_lock", c::bit(flags, 0x08));
+    il::publish_property(ctx, "child_lock", c::bit(flags, 0x01));
+    il::publish_property(ctx, "audible_diagnosis", c::bit(flags, 0x02));
+    il::publish_property(ctx, "door_lock", c::bit(flags, 0x08));
     let opt2 = b[p + 15];
-    ctx.publish_property("sterilize", c::bit(opt2, 0x02));
-    ctx.publish_property("warm_water", c::bit(opt2, 0x10));
-    ctx.publish_property("remote_start", c::bit(b[p + 16], 0x04));
+    il::publish_property(ctx, "sterilize", c::bit(opt2, 0x02));
+    il::publish_property(ctx, "warm_water", c::bit(opt2, 0x10));
+    il::publish_property(ctx, "remote_start", c::bit(b[p + 16], 0x04));
     // Decoded by the cloud but not published: preState (rec[19]), the smart / downloaded course
     // slots (rec[20], rec[23]), and soil / water level / water flow / soak, for which the model
     // JSON gives exactly one value each: this drawer washer has no such controls. rec[11],
@@ -195,14 +196,14 @@ fn on_data(ctx, data) {
 // The drawer obeys none of this unless Remote Start is armed on its own panel, a deliberate
 // piece of LG's design that a command cannot switch on. While the appliance is asleep with its
 // Wi-Fi module off nothing reaches it at all.
-fn on_set_property(ctx, prop, value) {
+fn set_property(ctx, prop, value) {
     if prop == "course_select" {
         let code = course_code(value);
         if code == () || !m::select(ctx, code, startable()) {
             c::reject(ctx, prop, "not a course this drawer can start");
             return;
         }
-        ctx.publish_property("course_select", value);
+        il::publish_property(ctx, "course_select", value);
     } else if prop == "start" {
         let resume = ctx.state_get("state") == 2;
         let payload = start_payload(m::selected(ctx), resume);
@@ -215,4 +216,10 @@ fn on_set_property(ctx, prop, value) {
     } else {
         c::reject(ctx, prop, "unknown or read-only property");
     }
+}
+
+// Commands are validated against the IL descriptor here, in the scripts, not by rusthinq.
+fn on_set_property(ctx, prop, value) {
+    let value = il::validate(ctx, prop, value);
+    if value != () { set_property(ctx, prop, value); }
 }
