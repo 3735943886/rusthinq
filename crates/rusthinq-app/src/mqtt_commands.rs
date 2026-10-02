@@ -1,5 +1,5 @@
 //! Owned command subscriber; clean sessions never replay retained instructions.
-use crate::{external_mqtt::Config, runtime::Handle};
+use crate::{api::AppHandle as Handle, external_mqtt::Config};
 use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
@@ -111,7 +111,7 @@ async fn connected(
                 if !faulted && let Some(prop) = property(prefix, &device, &topic) {
                     let input = serde_json::json!({"prop":prop,"value":value}).to_string();
                     if let Err(error) = app
-                        .invoke_script(
+                        .adapter_invoke(
                             device.clone(),
                             session,
                             generation,
@@ -140,9 +140,10 @@ async fn connected(
 pub(crate) async fn run(
     mut config: Config,
     prefix: String,
-    app: Handle,
+    app: impl Into<Handle>,
     mut stop: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    let app = app.into();
     // Independent client ID preserves the publisher's exclusive PUBACK stream.
     let mut client_hash = std::collections::hash_map::DefaultHasher::new();
     config.client.hash(&mut client_hash);
@@ -229,7 +230,8 @@ mod tests {
         .await
         .unwrap();
         let (subscriber, mut broker) = tokio::io::duplex(8192);
-        let route = tokio::spawn(async move { connected(Box::new(subscriber), "lg", &app).await });
+        let route =
+            tokio::spawn(async move { connected(Box::new(subscriber), "lg", &app.into()).await });
         assert_eq!(packet(&mut broker).await.unwrap()[0], 0x82);
         broker.write_all(&[0x90, 3, 0, 1, 1]).await.unwrap();
         let mut body = vec![0, 14];

@@ -1,8 +1,5 @@
 //! Broker-independent management API and existing dashboard projection.
-use crate::{
-    api::{Delivery, Reject},
-    runtime::Handle,
-};
+use crate::api::{AppHandle as Handle, CloudError, Delivery, Reject};
 use axum::{
     Json, Router,
     extract::{
@@ -79,24 +76,19 @@ struct App {
     config: Config,
     stop: watch::Receiver<bool>,
     sockets: Arc<Semaphore>,
-    cloud: Option<crate::cloud_account::Handle>,
 }
-pub fn router(handle: Handle, config: Config, stop: watch::Receiver<bool>) -> io::Result<Router> {
-    router_with_cloud(handle, config, stop, None)
-}
-pub fn router_with_cloud(
-    handle: Handle,
+pub fn router(
+    handle: impl Into<Handle>,
     config: Config,
     stop: watch::Receiver<bool>,
-    cloud: Option<crate::cloud_account::Handle>,
 ) -> io::Result<Router> {
+    let handle = handle.into();
     config.validate()?;
     Ok(build(App {
         handle,
         config,
         stop,
         sockets: Arc::new(Semaphore::new(64)),
-        cloud,
     }))
 }
 fn build(app: App) -> Router {
@@ -441,7 +433,7 @@ async fn invoke(
             match reject {
                 Reject::StaleSession => StatusCode::CONFLICT,
                 Reject::Busy => StatusCode::TOO_MANY_REQUESTS,
-                Reject::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+                Reject::Stopped | Reject::Disabled => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::BAD_REQUEST,
             },
             &format!("{reject:?}"),
@@ -564,7 +556,7 @@ fn rejected(reject: Reject) -> Response {
     let status = match reject {
         Reject::StaleSession => StatusCode::CONFLICT,
         Reject::Busy => StatusCode::TOO_MANY_REQUESTS,
-        Reject::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+        Reject::Stopped | Reject::Disabled => StatusCode::SERVICE_UNAVAILABLE,
         Reject::PayloadExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::BAD_REQUEST,
     };
@@ -658,10 +650,7 @@ async fn write(socket: &mut WebSocket, value: Value) -> bool {
 
 /// Own HTTP tasks and drain upgraded sockets through their stop receiver/permits.
 async fn cloud_status(State(app): State<App>) -> Json<Value> {
-    Json(match app.cloud {
-        Some(cloud) => json!({"enabled":true,"account":cloud.status()}),
-        None => json!({"enabled":false}),
-    })
+    Json(app.handle.cloud_status())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -673,16 +662,15 @@ struct CloudLogin {
 struct CloudComplete {
     url: String,
 }
-fn cloud_result(result: Result<Value, crate::cloud_account::Error>) -> Response {
+fn cloud_result(result: Result<Value, CloudError>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             let status = match error {
-                crate::cloud_account::Error::InvalidInput => StatusCode::BAD_REQUEST,
-                crate::cloud_account::Error::Busy => StatusCode::TOO_MANY_REQUESTS,
-                crate::cloud_account::Error::Unavailable
-                | crate::cloud_account::Error::Cancelled => StatusCode::CONFLICT,
-                crate::cloud_account::Error::Authentication => StatusCode::UNAUTHORIZED,
+                CloudError::InvalidInput => StatusCode::BAD_REQUEST,
+                CloudError::Busy => StatusCode::TOO_MANY_REQUESTS,
+                CloudError::Unavailable | CloudError::Cancelled => StatusCode::CONFLICT,
+                CloudError::Authentication => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
             (status, Json(json!({"error":error.to_string()}))).into_response()
@@ -690,44 +678,24 @@ fn cloud_result(result: Result<Value, crate::cloud_account::Error>) -> Response 
     }
 }
 async fn cloud_login(State(app): State<App>, Json(input): Json<CloudLogin>) -> Response {
-    cloud_result(match app.cloud {
-        Some(cloud) => cloud.login(input.country).await,
-        None => Err(crate::cloud_account::Error::Unavailable),
-    })
+    cloud_result(app.handle.cloud_login(input.country).await)
 }
 async fn cloud_complete(State(app): State<App>, Json(input): Json<CloudComplete>) -> Response {
-    cloud_result(match app.cloud {
-        Some(cloud) => cloud.complete(input.url).await,
-        None => Err(crate::cloud_account::Error::Unavailable),
-    })
+    cloud_result(app.handle.cloud_complete(input.url).await)
 }
 async fn cloud_logout(State(app): State<App>) -> Response {
-    cloud_result(match app.cloud {
-        Some(cloud) => cloud.logout().await,
-        None => Err(crate::cloud_account::Error::Unavailable),
-    })
+    cloud_result(app.handle.cloud_logout().await)
 }
 async fn cloud_refresh(State(app): State<App>) -> Response {
-    cloud_result(match app.cloud {
-        Some(cloud) => cloud.refresh().await,
-        None => Err(crate::cloud_account::Error::Unavailable),
-    })
+    cloud_result(app.handle.cloud_refresh().await)
 }
 pub async fn serve(
     listener: TcpListener,
-    handle: Handle,
-    config: Config,
-    stop: watch::Receiver<bool>,
-) -> io::Result<()> {
-    serve_with_cloud(listener, handle, config, stop, None).await
-}
-pub async fn serve_with_cloud(
-    listener: TcpListener,
-    handle: Handle,
+    handle: impl Into<Handle>,
     config: Config,
     mut stop: watch::Receiver<bool>,
-    cloud: Option<crate::cloud_account::Handle>,
 ) -> io::Result<()> {
+    let handle = handle.into();
     config.validate()?;
     let (owned_stop, owned_stopped) = watch::channel(*stop.borrow());
     let sockets = Arc::new(Semaphore::new(64));
@@ -736,7 +704,6 @@ pub async fn serve_with_cloud(
         config,
         stop: owned_stopped.clone(),
         sockets: sockets.clone(),
-        cloud,
     });
     let mut tasks = JoinSet::new();
     let mut failure = None;

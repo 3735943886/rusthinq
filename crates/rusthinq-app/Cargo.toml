@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["gui"]
+default = ["bridge", "scripting", "gui"]
+bridge = ["dep:rusthinq-bridge"]
+scripting = ["dep:rusthinq-scripting"]
 gui = []
 
 [dependencies]
@@ -14,8 +16,8 @@ rusthinq-server = { path = "../rusthinq-server" }
 tempfile = "3"
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
-rusthinq-bridge = { path = "../rusthinq-bridge" }
-rusthinq-scripting = { path = "../rusthinq-scripting" }
+rusthinq-bridge = { path = "../rusthinq-bridge", optional = true }
+rusthinq-scripting = { path = "../rusthinq-scripting", optional = true }
 tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 axum = { version = "0.8", features = ["ws"] }

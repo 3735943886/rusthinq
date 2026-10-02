@@ -284,12 +284,19 @@ impl Config {
             external_mqtt,
             cloud_account: match value.get("cloud_account") {
                 None => None,
-                Some(value) => Some(PathBuf::from(
-                    value
-                        .as_str()
-                        .filter(|path| !path.is_empty())
-                        .ok_or_else(|| invalid("invalid cloud_account path"))?,
-                )),
+                Some(value) => {
+                    if !cfg!(feature = "bridge") {
+                        return Err(invalid("bridge feature is disabled"));
+                    }
+                    Some(
+                        parent.join(
+                            value
+                                .as_str()
+                                .filter(|path| !path.is_empty())
+                                .ok_or_else(|| invalid("invalid cloud_account path"))?,
+                        ),
+                    )
+                }
             },
         })
     }
@@ -301,11 +308,15 @@ pub struct Daemon {
     thin: (FrontDoor, TcpListener),
     mqtt: (FrontDoor, TcpListener),
     endpoints: (SocketAddr, SocketAddr, SocketAddr),
+    #[cfg(feature = "bridge")]
     firmware: rusthinq_bridge::passthrough::Relay,
     management: Option<(crate::management::Config, TcpListener)>,
     external_mqtt: Option<crate::external_mqtt::Runtime>,
+    #[cfg(feature = "bridge")]
     cloud_account: Option<(crate::cloud_account::Handle, crate::cloud_account::Runtime)>,
+    #[cfg(feature = "scripting")]
     driver_watch: Option<crate::drivers::Config>,
+    #[cfg(feature = "scripting")]
     commands: Option<(crate::external_mqtt::Config, String)>,
 }
 impl Daemon {
@@ -317,10 +328,21 @@ impl Daemon {
         if let Some(drivers) = &config.drivers {
             drivers.validate()?;
         }
+        if let Some(management) = &config.management {
+            management.validate()?;
+        }
+        if let Some(external) = &config.external_mqtt {
+            external.validate()?;
+        }
+        if config.cloud_account.is_some() && !cfg!(feature = "bridge") {
+            return Err(invalid("bridge feature is disabled"));
+        }
+        #[cfg(feature = "bridge")]
         let cloud_account = match config.cloud_account.clone() {
             Some(path) => Some(crate::cloud_account::open(path).await?),
             None => None,
         };
+        #[cfg(feature = "scripting")]
         let commands = config.external_mqtt.clone().zip(
             config
                 .drivers
@@ -332,6 +354,7 @@ impl Daemon {
             .clone()
             .map(crate::external_mqtt::new)
             .transpose()?;
+        #[cfg(feature = "scripting")]
         let drivers = config.drivers.clone();
         let thin = TcpListener::bind(config.thinq1_bind).await?;
         let mqtt = TcpListener::bind(config.mqtt_bind).await?;
@@ -374,15 +397,22 @@ impl Daemon {
             vec![identities.next().expect("three identities")],
             None,
         )?;
+        #[cfg(feature = "bridge")]
         let firmware = rusthinq_bridge::passthrough::Relay::new(
             Default::default(),
             Arc::new(rusthinq_bridge::passthrough::HttpsConnector),
         )?;
+        #[cfg(feature = "bridge")]
         firmware.confirm_local(&name)?;
+        #[cfg(feature = "bridge")]
+        let passthrough =
+            Some(Arc::new(firmware.clone()) as Arc<dyn rusthinq_server::tls::Passthrough>);
+        #[cfg(not(feature = "bridge"))]
+        let passthrough = None;
         let http_front = FrontDoor::new(
             TlsConfig::default(),
             vec![identities.next().expect("three identities")],
-            Some(Arc::new(firmware.clone())),
+            passthrough,
         )?;
         let (signer, signing) = Signer::new(ca.clone(), Default::default())?;
         let mut provisioning_config = provisioning::Config::new(name);
@@ -408,10 +438,15 @@ impl Daemon {
             256,
             Some((1_000_000, 10_000)),
         )?
-        .with_firmware(firmware.clone())
         .with_metadata(metadata)
         .with_local_service(http_front, http, Arc::new(https))?;
+        #[cfg(feature = "bridge")]
+        {
+            service = service.with_firmware(firmware.clone());
+        }
+        #[cfg(feature = "scripting")]
         let driver_watch = drivers.as_ref().filter(|config| config.watch).cloned();
+        #[cfg(feature = "scripting")]
         if let Some(drivers) = drivers {
             service = service.with_drivers(drivers)?;
         }
@@ -421,20 +456,29 @@ impl Daemon {
         } else {
             None
         };
+        #[cfg(feature = "bridge")]
+        if let Some((account, _)) = &cloud_account {
+            service.handle().attach_cloud_account(account.clone())?;
+        }
         Ok(Self {
             service,
             signer,
             thin: (thin_front, thin),
             mqtt: (mqtt_front, mqtt),
             endpoints,
+            #[cfg(feature = "bridge")]
             firmware,
             management,
             external_mqtt,
+            #[cfg(feature = "bridge")]
             cloud_account,
+            #[cfg(feature = "scripting")]
             driver_watch,
+            #[cfg(feature = "scripting")]
             commands,
         })
     }
+    #[cfg(feature = "bridge")]
     pub fn firmware(&self) -> rusthinq_bridge::passthrough::Relay {
         self.firmware.clone()
     }
@@ -458,6 +502,7 @@ impl Daemon {
         let handle = self.service.handle();
         let external_handle = handle.external_mqtt();
         let mut core = tokio::spawn(self.service.serve(self.thin, self.mqtt, core_stopped));
+        #[cfg(feature = "scripting")]
         if let Some(config) = self.driver_watch {
             tasks.spawn(crate::driver_watch::run(
                 config,
@@ -465,6 +510,7 @@ impl Daemon {
                 services_stopped.clone(),
             ));
         }
+        #[cfg(feature = "scripting")]
         if let Some((config, prefix)) = self.commands {
             tasks.spawn(crate::mqtt_commands::run(
                 config,
@@ -476,20 +522,16 @@ impl Daemon {
         if let Some(external) = self.external_mqtt {
             tasks.spawn(external.run(handle.clone(), services_stopped.clone()));
         }
-        let cloud = self
-            .cloud_account
-            .as_ref()
-            .map(|(handle, _)| handle.clone());
+        #[cfg(feature = "bridge")]
         if let Some((_, runtime)) = self.cloud_account {
             tasks.spawn(runtime.run(services_stopped.clone()));
         }
         if let Some((config, listener)) = self.management {
-            tasks.spawn(crate::management::serve_with_cloud(
+            tasks.spawn(crate::management::serve(
                 listener,
                 handle.clone(),
                 config,
                 services_stopped,
-                cloud,
             ));
         }
         let mut failure = None;

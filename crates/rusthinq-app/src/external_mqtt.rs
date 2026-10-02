@@ -1,9 +1,9 @@
 //! Optional MQTT output adapter. Retained ownership precedes every wire publish.
 use crate::{
+    api::AppHandle as Application,
     cleanup_mqtt::Session,
     lifecycle_cleanup,
     retained_cleanup::Ledger,
-    runtime::Handle as Application,
     scripts::{Context, PublishSink},
 };
 use openssl::ssl::{SslConnector, SslMethod};
@@ -362,9 +362,10 @@ fn current(app: &Application, message: &Publication) -> bool {
 impl Runtime {
     pub async fn run(
         mut self,
-        app: Application,
+        app: impl Into<Application>,
         mut stop: watch::Receiver<bool>,
     ) -> io::Result<()> {
+        let app = app.into();
         let mut delay = 1u64;
         while !*stop.borrow() {
             self.shared.status.send_replace(Status::Connecting);
@@ -414,7 +415,7 @@ impl Runtime {
         mut ledger: Ledger,
         stop: &mut watch::Receiver<bool>,
     ) -> io::Result<()> {
-        let mut events = app.subscribe(); // before recovery snapshot
+        let mut events = app.adapter_events(); // before recovery snapshot
         let mut versions = BTreeMap::new();
         let mut scopes = BTreeMap::<String, Context>::new();
         let mut ping = Instant::now() + Duration::from_secs(30);

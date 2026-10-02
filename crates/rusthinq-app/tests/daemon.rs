@@ -32,13 +32,13 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         legacy_tls: false,
         management: Some(rusthinq_app::management::Config {
             bind: "127.0.0.1:0".parse().unwrap(),
-            gui: true,
+            gui: cfg!(feature = "gui"),
             credentials: None,
             raw_inject: false,
         }),
         drivers: None,
         external_mqtt: None,
-        cloud_account: Some(dir.path().join("account.json")),
+        cloud_account: cfg!(feature = "bridge").then(|| dir.path().join("account.json")),
     };
     let daemon = Daemon::prepare(config).await.unwrap();
     let (_, mqtt, http) = daemon.endpoints();
@@ -55,11 +55,12 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        String::from_utf8(page)
-            .unwrap()
-            .contains("management panel")
-    );
+    let page = String::from_utf8(page).unwrap();
+    if cfg!(feature = "gui") {
+        assert!(page.contains("management panel"));
+    } else {
+        assert!(page.starts_with("HTTP/1.1 404"));
+    }
     let mut account = TcpStream::connect(management).await.unwrap();
     account
         .write_all(b"GET /api/cloud HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -73,7 +74,7 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
     assert!(
         String::from_utf8(status)
             .unwrap()
-            .contains("\"enabled\":true")
+            .contains(&format!("\"enabled\":{}", cfg!(feature = "bridge")))
     );
     let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
     connector
@@ -149,7 +150,11 @@ fn configuration_resolves_paths_and_rejects_typographical_fields() {
     );
     value["drivers"] = serde_json::json!({"directory":".","watch":true});
     std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
-    assert!(Config::load(&path).unwrap().drivers.unwrap().watch);
+    if cfg!(feature = "scripting") {
+        assert!(Config::load(&path).unwrap().drivers.unwrap().watch);
+    } else {
+        assert!(Config::load(&path).is_err());
+    }
     value["drivers"]["watch"] = serde_json::json!("true");
     std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).is_err());
@@ -194,6 +199,7 @@ async fn bind_failure_does_not_create_lifecycle_checkpoint() {
     assert!(!ledger.exists());
 }
 
+#[cfg(feature = "scripting")]
 #[tokio::test]
 async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
     use rusthinq_app::scripts::Callbacks;

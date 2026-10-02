@@ -1,3 +1,4 @@
+#![cfg(feature = "scripting")]
 use rusthinq_app::scripts::Owner;
 use rusthinq_lifecycle::{Device, Entry, Removal, SessionKey, Step};
 use rusthinq_scripting::{Compiled, Error, Limits, Output, worker::Config};

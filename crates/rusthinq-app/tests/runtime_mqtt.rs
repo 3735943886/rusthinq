@@ -1,3 +1,4 @@
+#![cfg(feature = "scripting")]
 use rusthinq_app::{
     lifecycle_storage::Storage,
     runtime::{Event, Runtime},
@@ -258,6 +259,7 @@ async fn auto_driver(external: bool, watched: bool) {
     assert!(stored.state().metadata["d"].thinq2);
 }
 
+#[cfg(feature = "bridge")]
 #[tokio::test]
 async fn completed_local_provisioning_protects_endpoints_from_firmware_learning() {
     let directory = tempfile::tempdir().unwrap();

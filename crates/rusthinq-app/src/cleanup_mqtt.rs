@@ -15,6 +15,7 @@ pub struct Session<S> {
     usable: bool,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
+    #[cfg(feature = "scripting")]
     pub(crate) fn into_stream(self) -> S {
         self.stream
     }

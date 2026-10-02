@@ -1,3 +1,4 @@
+#![cfg(feature = "scripting")]
 use rusthinq_app::{
     lifecycle_storage::Storage,
     runtime::{Event, Handle, Runtime},

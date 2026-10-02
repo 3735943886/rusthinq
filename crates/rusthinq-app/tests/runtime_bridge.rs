@@ -1,3 +1,4 @@
+#![cfg(feature = "bridge")]
 use rusthinq_app::{
     lifecycle_storage::Storage,
     runtime::{Event, Runtime},

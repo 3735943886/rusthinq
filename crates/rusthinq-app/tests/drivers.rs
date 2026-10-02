@@ -1,3 +1,4 @@
+#![cfg(feature = "scripting")]
 use rusthinq_app::drivers::Config;
 use rusthinq_scripting::{Host, Output};
 use serde_json::{Value, json};

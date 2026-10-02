@@ -1,7 +1,10 @@
 //! L5 bounded, IL-agnostic Rhai execution. The caller owns worker scheduling and sinks.
 mod codecs;
 pub mod context;
+pub mod drivers;
 pub mod modules;
+pub mod preparation;
+pub mod scheduling;
 pub mod worker;
 use rhai::{
     AST, CallFnOptions, Dynamic, Engine, EvalAltResult, Scope,

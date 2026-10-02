@@ -23,7 +23,7 @@ use tower::ServiceExt;
 fn config(gui: bool) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        gui,
+        gui: gui && cfg!(feature = "gui"),
         credentials: None,
         raw_inject: false,
     }
@@ -238,6 +238,7 @@ async fn sockets_get_initial_snapshot_and_shutdown_joins_idle_http_and_upgrades(
     assert!(timeout(Duration::from_secs(1), socket.next()).await.is_ok());
 }
 
+#[cfg(feature = "bridge")]
 #[tokio::test]
 async fn cloud_account_api_reports_status_and_durable_logout_without_broker() {
     let dir = tempfile::tempdir().unwrap();
@@ -255,8 +256,12 @@ async fn cloud_account_api_reports_status_and_durable_logout_without_broker() {
     .unwrap();
     let (stop, stopped) = watch::channel(false);
     let task = tokio::spawn(account.run(stopped.clone()));
-    let app = management::router_with_cloud(runtime.handle(), config(false), stopped, Some(cloud))
+    runtime
+        .handle()
+        .attach_cloud_account(cloud.clone())
         .unwrap();
+    assert!(runtime.handle().attach_cloud_account(cloud).is_err());
+    let app = management::router(runtime.handle(), config(false), stopped).unwrap();
     let response = app
         .clone()
         .oneshot(request("/api/cloud", "GET", json!({})))

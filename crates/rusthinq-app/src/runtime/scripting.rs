@@ -43,10 +43,6 @@ impl Runtime {
         let Some(generation) = owner.generation(&id.device) else {
             return;
         };
-        if self.script_results.len() + self.script_buffer.len() >= self.script_limit {
-            self.script_rejected(id.device.clone(), "callback capacity exceeded");
-            return;
-        }
         let input = match input {
             Ok(input) => input,
             Err(error) => {
@@ -54,9 +50,12 @@ impl Runtime {
                 return;
             }
         };
-        let Some(sequence) = self.script_sequence.checked_add(1) else {
-            self.script_rejected(id.device.clone(), "callback sequence exhausted");
-            return;
+        let sequence = match self.script_schedule.next_sequence() {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.script_rejected(id.device.clone(), error);
+                return;
+            }
         };
         match owner.invoke(
             &self.model.devices(),
@@ -67,11 +66,9 @@ impl Runtime {
         ) {
             Ok(call) => {
                 let device = id.device.clone();
-                self.script_sequence = sequence;
-                self.script_order
-                    .entry(device.clone())
-                    .or_default()
-                    .push_back(sequence);
+                self.script_schedule
+                    .admitted(device.clone(), sequence)
+                    .expect("single owner reserves admission without yielding");
                 self.script_results
                     .spawn(async move { (sequence, device, call.wait().await) });
             }
@@ -89,35 +86,17 @@ impl Runtime {
             .scripts
             .as_mut()
             .ok_or(rusthinq_scripting::Error::InvalidConfig)?;
-        if self.script_results.len() + self.script_buffer.len() >= self.script_limit {
-            return Err(rusthinq_scripting::Error::Busy);
-        }
-        let sequence = self
-            .script_sequence
-            .checked_add(1)
-            .ok_or(rusthinq_scripting::Error::GenerationExhausted)?;
+        let sequence = self.script_schedule.next_sequence()?;
         let call = owner.invoke(&self.model.devices(), &device, generation, function, input)?;
-        self.script_sequence = sequence;
-        self.script_order
-            .entry(device.clone())
-            .or_default()
-            .push_back(sequence);
+        self.script_schedule
+            .admitted(device.clone(), sequence)
+            .expect("single owner reserves admission without yielding");
         self.script_results
             .spawn(async move { (sequence, device, call.wait().await) });
         Ok(sequence)
     }
     pub(super) fn fire_timers(&mut self) {
-        let due: Vec<_> = self
-            .script_timers
-            .iter()
-            .filter(|(_, (_, deadline))| *deadline <= Instant::now())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for (device, name) in due {
-            let (context, _) = self
-                .script_timers
-                .remove(&(device.clone(), name.clone()))
-                .expect("due timer");
+        for (device, name, context) in self.script_schedule.due_timers(Instant::now()) {
             if !self.model.devices().iter().any(|d| {
                 d.entry.id == device
                     && d.session == Some(context.session)
@@ -152,33 +131,17 @@ impl Runtime {
         completion: Result<crate::scripts::Completion, rusthinq_scripting::Error>,
         dispatch: bool,
     ) {
-        self.script_buffer
-            .insert(sequence, (device.clone(), completion));
-        while let Some(next) = self
-            .script_order
-            .get(&device)
-            .and_then(|queue| queue.front())
-            .copied()
-        {
-            let Some((id, completion)) = self.script_buffer.remove(&next) else {
-                break;
-            };
-            self.script_order
-                .get_mut(&device)
-                .expect("callback queue")
-                .pop_front();
-            if dispatch {
-                self.script_complete(next, id, completion);
-            } else {
-                self.script_rejected(id, rusthinq_scripting::Error::Stopped);
+        match self.script_schedule.complete(sequence, &device, completion) {
+            Ok(ready) => {
+                for (next, id, completion) in ready {
+                    if dispatch {
+                        self.script_complete(next, id, completion);
+                    } else {
+                        self.script_rejected(id, rusthinq_scripting::Error::Stopped);
+                    }
+                }
             }
-        }
-        if self
-            .script_order
-            .get(&device)
-            .is_some_and(|queue| queue.is_empty())
-        {
-            self.script_order.remove(&device);
+            Err(error) => self.script_rejected(device, error),
         }
     }
     pub(super) fn script_complete(
@@ -228,7 +191,10 @@ impl Runtime {
                     .ok_or_else(|| "publication sink disabled".to_string())
                     .and_then(|sink| sink.try_publish(&context, payload)),
                 rusthinq_scripting::Output::Send(payload) => {
-                    if self.script_deliveries.len() >= self.script_limit {
+                    if !self
+                        .script_schedule
+                        .delivery_available(self.script_deliveries.len())
+                    {
                         Err("delivery capacity exceeded".into())
                     } else {
                         match self.server.send(
@@ -249,36 +215,19 @@ impl Runtime {
                     }
                 }
                 rusthinq_scripting::Output::Timer { name, after_ms } => {
-                    let key = (device.clone(), name);
-                    if let Some(after_ms) = after_ms {
-                        if self
-                            .script_callbacks
-                            .get(&device)
-                            .and_then(|c| c.timer.as_ref())
-                            .is_none()
-                        {
-                            Err("timer callback disabled".into())
-                        } else if !self.script_timers.contains_key(&key)
-                            && self
-                                .script_timers
-                                .keys()
-                                .filter(|(id, _)| id == &device)
-                                .count()
-                                >= 64
-                        {
-                            Err("timer capacity exceeded".into())
-                        } else if let Some(deadline) =
-                            Instant::now().checked_add(Duration::from_millis(after_ms))
-                        {
-                            self.script_timers.insert(key, (context.clone(), deadline));
-                            Ok(())
-                        } else {
-                            Err("timer deadline exceeded".into())
-                        }
-                    } else {
-                        self.script_timers.remove(&key);
-                        Ok(())
-                    }
+                    let enabled = self
+                        .script_callbacks
+                        .get(&device)
+                        .and_then(|c| c.timer.as_ref())
+                        .is_some();
+                    self.script_schedule.set_timer(
+                        device.clone(),
+                        name,
+                        context.clone(),
+                        after_ms,
+                        enabled,
+                        Instant::now(),
+                    )
                 }
             };
             if let Err(reason) = result {
@@ -402,11 +351,186 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request.device.clone(), (request.session, 1, false));
-            self.script_timers
-                .retain(|(id, _), _| id != &request.device);
+            self.script_schedule
+                .retain_timers(|id, _| id != request.device);
             self.script_callbacks
                 .insert(request.device, request.callbacks);
         }
         let _ = request.result.send(result);
     }
 }
+
+impl Runtime {
+    pub(super) fn prepare_scripts_turn(&mut self, stopping: bool) {
+        self.reap_completed_scripts();
+        if self.pending_attach.is_some()
+            && !self
+                .scripts
+                .as_ref()
+                .is_some_and(|owner| owner.retirement_pending())
+        {
+            let request = self.pending_attach.take().expect("pending attachment");
+            self.attach_request(request, stopping);
+            self.reap_completed_scripts();
+        }
+    }
+    pub(super) async fn stop_scripts(&mut self) -> io::Result<()> {
+        while let Some(result) = self.driver_preparation.join_next().await {
+            let _ = result.map_err(io::Error::other)?;
+        }
+        if let Some(scripts) = self.scripts.take() {
+            match scripts.shutdown_with_outputs().await {
+                Ok(outputs) => self.retirement_outputs(outputs),
+                Err(error) => self.script_rejected(String::new(), error),
+            }
+        }
+        if let Some(request) = self.pending_attach.take() {
+            let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+        }
+        self.script_attach.close();
+        Ok(())
+    }
+    pub(super) async fn drain_script_results(&mut self) -> io::Result<()> {
+        while let Ok(request) = self.script_attach.try_recv() {
+            request.cancel();
+        }
+        while let Some(result) = self.script_results.join_next().await {
+            let (sequence, device, completion) = result.map_err(io::Error::other)?;
+            self.script_result(sequence, device, completion, false);
+        }
+        while let Some(result) = self.script_deliveries.join_next().await {
+            let (context, delivery) = result.map_err(io::Error::other)?;
+            self.emit(Event::ScriptDelivery { context, delivery });
+        }
+        Ok(())
+    }
+    pub(super) fn reconcile_scripts(&mut self, devices: &[Device]) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.reconcile(&self.model.devices());
+        }
+        self.shared
+            .retired_scripts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, context| {
+                devices.iter().any(|device| {
+                    device.entry.id == context.device
+                        && device.entry.incarnation == context.session.incarnation
+                        && device.entry.last_generation == context.session.generation
+                        && device.session.is_none()
+                        && device.removal.is_none()
+                })
+            });
+        self.script_schedule.retain_timers(|_, context| {
+            devices.iter().any(|device| {
+                device.entry.id == context.device
+                    && device.session == Some(context.session)
+                    && device.online
+                    && device.removal.is_none()
+            })
+        });
+        self.preparation_policy.retain(|id, session| {
+            devices
+                .iter()
+                .any(|d| d.entry.id == id && d.session == Some(*session) && d.removal.is_none())
+        });
+        self.shared
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, (session, _, _)| {
+                devices.iter().any(|d| {
+                    d.entry.id == *id && d.session == Some(*session) && d.removal.is_none()
+                })
+            });
+        self.script_callbacks.retain(|id, _| {
+            self.model.devices().iter().any(|device| {
+                &device.entry.id == id && device.session.is_some() && device.removal.is_none()
+            })
+        });
+    }
+}
+
+macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($branches:tt)*) => { tokio::select! { biased;
+                Some(result)=async {$runtime.scripts.as_mut().expect("script owner").reap_next().await}, if $runtime.scripts.as_ref().is_some_and(|owner|owner.has_reaping())=>{$runtime.retirement_result(result);},
+                Some(result)=$runtime.driver_preparation.join_next(), if !$runtime.driver_preparation.is_empty() && !$stopping && !$runtime.scripts.as_ref().is_some_and(|owner|owner.retirement_pending())=>{
+                    let (id,session,model,prepared)=result.map_err(io::Error::other)?;
+                    $runtime.reconcile();
+                    let current=$runtime.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none()) && $runtime.preparation_policy.is_current(&id,&session,&model);
+                    if current {
+                        let result=match prepared {
+                            Err(error)=>Err(error),
+                            Ok(mut compiled)=>{
+                                compiled.set_consumer_enabled($runtime.script_sink.is_some());
+                                $runtime.reconcile();
+                                if !$runtime.scripts.as_ref().expect("driver owner").can_attach() && $runtime.scripts.as_ref().expect("driver owner").retirement_pending() {
+                                    $runtime.driver_preparation.spawn(async move {(id,session,model,Ok(compiled))});
+                                    continue;
+                                }
+                                let current=$runtime.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none());
+                                if current && !*$stop.borrow() {$runtime.scripts.as_mut().expect("driver owner").attach(&$runtime.model.devices(),id.clone(),session,compiled,rusthinq_scripting::worker::Config {capacity:16,input_bytes:131072,source_bytes:524288})} else {Err(rusthinq_scripting::Error::Stale)}
+                            }
+                        };
+                        if let Err(error)=result {$runtime.script_rejected(id.clone(),error);}
+                        else {
+                            $runtime.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),shutdown:Some("__drop".into()),data_encoding:crate::scripts::DataEncoding::Hex});
+                            let _=$runtime.scripts.as_ref().expect("driver owner").set_shutdown_callback(&id,Some("__drop".into()));
+                            $runtime.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(id.clone(),(session,1,false));
+                            if let Err(error)=$runtime.invoke_script(id.clone(),1,"__init".into(),String::new()) {$runtime.script_rejected(id.clone(),error);}
+                            {let queue=$runtime.preparation_policy.take_buffer(&id,&session);
+                                for data in queue {if let Err(error)=$runtime.invoke_script(id.clone(),1,"__data".into(),rusthinq_protocol::hex::encode(data)) {$runtime.script_rejected(id.clone(),error);break;}}
+                            }
+                        }
+                    }
+                    for device in $runtime.model.devices() {$runtime.prepare_driver(&device.entry.id);}
+                },
+                Some(result) = $runtime.script_deliveries.join_next(), if !$runtime.script_deliveries.is_empty() => {
+                    let (context, delivery) = result.map_err(io::Error::other)?;
+                    $runtime.emit(Event::ScriptDelivery {context, delivery});
+                }
+                Some(result) = $runtime.script_results.join_next(), if !$runtime.script_results.is_empty() => {
+                    let (sequence, device, completion) = result.map_err(io::Error::other)?;
+                    $runtime.script_result(sequence, device, completion, !$stopping && !*$stop.borrow() && $stop.has_changed().is_ok());
+                }
+                Some(command) = $runtime.script_attach.recv(), if !$stopping && $runtime.pending_attach.is_none() => match command {
+                ScriptCommand::Invoke {device,session,generation,function,input,result}=>{
+                    if !result.is_closed() {
+                        $runtime.reconcile();
+                        let current=$runtime.model.devices().iter().any(|d|d.entry.id==device && d.session==Some(session) && d.online && d.removal.is_none());
+                        let outcome=if current {$runtime.invoke_script(device,generation,function,input)} else {Err(rusthinq_scripting::Error::Stale)};
+                        let _=result.send(outcome);
+                    }
+                },
+                ScriptCommand::Attach(request) => {$runtime.attach_request(request,*$stop.borrow() || $stop.has_changed().is_err());},
+                ScriptCommand::Reload(request) => {
+                    let mut request = *request;
+                    if !request.result.is_closed() {
+                        $runtime.reconcile();
+                        request.compiled.set_consumer_enabled($runtime.script_sink.is_some());
+                        let current = $runtime.model.devices().iter().any(|device|
+                            device.entry.id == request.device && device.session == Some(request.session) && device.removal.is_none());
+                        let result = if !current {Err(rusthinq_scripting::Error::Stale)}
+                        else if request.initialize && let Err(error)=$runtime.script_schedule.next_sequence() {Err(error)}
+                        else if let Some(owner) = $runtime.scripts.as_mut() {
+                            match owner.reload(&$runtime.model.devices(), &request.device, request.generation, request.compiled) {
+                                Ok(reload) => reload.wait().await,
+                                Err(error) => Err(error),
+                            }
+                        } else {Err(rusthinq_scripting::Error::InvalidConfig)};
+                        $runtime.reconcile();
+                        let current = $runtime.model.devices().iter().any(|device|
+                            device.entry.id == request.device && device.session == Some(request.session) && device.removal.is_none());
+                        let result = if *$stop.borrow() || $stop.has_changed().is_err() {Err(rusthinq_scripting::Error::Stopped)}
+                            else if !current {Err(rusthinq_scripting::Error::Stale)} else {result};
+                        if let Ok(generation)=result {$runtime.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(request.device.clone(),(request.session,generation,false));$runtime.script_schedule.retain_timers(|id,_|id!=request.device);}
+                        // Queue initialization before another actor turn can admit commands/data.
+                        let result=match result {
+                            Ok(generation) if request.initialize=>$runtime.invoke_script(request.device.clone(),generation,"__init".into(),String::new()).map(|_|generation),
+                            other=>other,
+                        };
+                        let _ = request.result.send(result);
+                    }
+                },
+                },
+ $($branches)* } }; }
+pub(super) use runtime_select;

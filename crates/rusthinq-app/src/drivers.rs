@@ -1,147 +1,17 @@
-//! Bounded off-thread driver/module preparation, with explicit filesystem ownership.
-use rusthinq_scripting::{Compiled, Error, Limits, context, modules::Source};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::{self, Read},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
-const MAX_SOURCE: usize = 524288;
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub watch: bool,
-    pub directory: PathBuf,
-    pub topic_prefix: String,
-    pub il_prefix: Option<String>,
-    pub bindings: BTreeMap<String, String>,
-}
-fn name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-fn read(root: &Path, name: &str) -> io::Result<String> {
-    if !self::name(name) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid driver/module name",
-        ));
-    }
-    let path = root.join(format!("{name}.rhai")).canonicalize()?;
-    if !path.starts_with(root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "driver escapes configured directory",
-        ));
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_SOURCE as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SOURCE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "driver source exceeded",
-        ));
-    }
-    String::from_utf8(bytes).map_err(io::Error::other)
-}
-fn modules(
-    root: &Path,
-    source: &str,
-    seen: &mut BTreeSet<String>,
-    visiting: &mut BTreeSet<String>,
-    bundle: &mut Vec<Source>,
-    total: &mut usize,
-) -> io::Result<()> {
-    for line in source.lines() {
-        let Some(import) = line.trim().strip_prefix("import ") else {
-            continue;
-        };
-        let module = import
-            .trim()
-            .strip_prefix('"')
-            .and_then(|value| value.split_once('"').map(|pair| pair.0))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "only static named imports are supported",
-                )
-            })?;
-        if seen.contains(module) {
-            continue;
-        }
-        if visiting.len() + seen.len() >= 16 || !visiting.insert(module.into()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cyclic/oversized driver module bundle",
-            ));
-        }
-        let source = read(root, module)?;
-        *total = total
-            .checked_add(source.len() + module.len())
-            .filter(|total| *total <= MAX_SOURCE)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "module source budget exceeded")
-            })?;
-        modules(root, &source, seen, visiting, bundle, total)?;
-        visiting.remove(module);
-        seen.insert(module.into());
-        bundle.push(Source {
-            name: module.into(),
-            source,
-        });
-    }
-    Ok(())
-}
+//! Driver preparation delegates to L5; L6 only supplies configuration and owns jobs.
+pub use crate::driver_config::Config;
 impl Config {
-    pub fn validate(&self) -> io::Result<()> {
-        if !self.directory.is_dir()
-            || self.topic_prefix.is_empty()
-            || self.topic_prefix.len() > 256
-            || self.topic_prefix.contains(['#', '+', '\0'])
-            || self.il_prefix.as_ref().is_some_and(|prefix| {
-                prefix.is_empty() || prefix.len() > 256 || prefix.contains(['#', '+', '\0'])
-            })
-            || self.bindings.len() > 256
-            || self.bindings.iter().any(|(id, model)| {
-                id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) || !name(model)
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid driver configuration",
-            ));
+    pub(crate) fn engine_config(&self) -> rusthinq_scripting::drivers::Config {
+        rusthinq_scripting::drivers::Config {
+            watch: self.watch,
+            directory: self.directory.clone(),
+            topic_prefix: self.topic_prefix.clone(),
+            il_prefix: self.il_prefix.clone(),
+            bindings: self.bindings.clone(),
         }
-        Ok(())
     }
-    /// Fingerprint only this model and its static module dependencies.
-    pub(crate) fn source_revision(&self, id: &str, model: &str) -> io::Result<u64> {
-        use std::hash::{Hash, Hasher};
-        let root = self.directory.canonicalize()?;
-        let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model)?;
-        let mut bundle = Vec::new();
-        let mut total = source.len();
-        modules(
-            &root,
-            &source,
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut bundle,
-            &mut total,
-        )?;
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        model.hash(&mut hash);
-        source.hash(&mut hash);
-        for module in bundle {
-            module.name.hash(&mut hash);
-            module.source.hash(&mut hash);
-        }
-        Ok(hash.finish())
+    pub(crate) fn source_revision(&self, id: &str, model: &str) -> std::io::Result<u64> {
+        self.engine_config().source_revision(id, model)
     }
     pub fn prepare(
         &self,
@@ -149,86 +19,7 @@ impl Config {
         model: &str,
         thinq2: bool,
         consumer: bool,
-    ) -> Result<Compiled, Error> {
-        let root = self
-            .directory
-            .canonicalize()
-            .map_err(|e| Error::Compile(e.to_string()))?;
-        let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model).map_err(|e| Error::Compile(e.to_string()))?;
-        let mut bundle = Vec::new();
-        let mut total = source.len();
-        modules(
-            &root,
-            &source,
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut bundle,
-            &mut total,
-        )
-        .map_err(|e| Error::Compile(e.to_string()))?;
-        let mut ctx = context::Config::new(id.into(), model.into());
-        ctx.topic_prefix = self.topic_prefix.clone();
-        ctx.il_prefix = self.il_prefix.clone();
-        ctx.thinq2 = thinq2;
-        ctx.driver_api = true;
-        ctx.message_seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| Error::Compile(e.to_string()))?
-            .as_millis()
-            .try_into()
-            .map_err(|_| Error::GenerationExhausted)?;
-        ctx.state_keys = 256;
-        ctx.state_bytes = 262144;
-        let limits = Limits {
-            source_bytes: MAX_SOURCE,
-            string_bytes: 131072,
-            operations: 5_000_000,
-            outputs: 256,
-            output_bytes: 1_048_576,
-        };
-        let compiled = Compiled::with_context(&source, limits, consumer, ctx)?;
-        let mut entry = String::new();
-        entry.push_str("fn __init(ctx,text) {");
-        if compiled.has_function("publish_config", 1) {
-            entry.push_str("publish_config(ctx);");
-        }
-        if compiled.has_function("start", 1) {
-            entry.push_str("start(ctx);");
-        }
-        entry.push_str("}\n");
-        entry.push_str("fn __data(ctx,text) {");
-        if compiled.has_function("on_data", 2) {
-            if thinq2 {
-                entry.push_str("on_data(ctx,hex_decode(text));");
-            } else {
-                entry.push_str("let body=json_parse(bytes_utf8(hex_decode(text))).Body; if body.Format==\"B64\" && body.Data!=() {on_data(ctx,base64_decode(body.Data));}");
-            }
-        }
-        entry.push_str("}\nfn __response(ctx,text) {");
-        if compiled.has_function("on_response", 2) {
-            entry.push_str("on_response(ctx,json_parse(text));");
-        }
-        entry.push_str("}\nfn __timer(ctx,text) {");
-        if compiled.has_function("on_timer", 2) {
-            entry.push_str("on_timer(ctx,text);");
-        }
-        entry.push_str("}\nfn __drop(ctx,text) {");
-        if compiled.has_function("on_drop", 1) {
-            entry.push_str("on_drop(ctx);");
-        }
-        entry.push_str("}\nfn __command(ctx,text) {let command=json_parse(text);let value=__validate(ctx,command.prop,command.value);if value!=() {");
-        if compiled.has_function("on_set_property", 3) {
-            entry.push_str("on_set_property(ctx,command.prop,value);");
-        } else {
-            entry.push_str(
-                "__reject(ctx,command.prop,\"unsupported\",\"driver has no command callback\");",
-            );
-        }
-        entry.push_str("}}\n");
-        compiled
-            .with_entry(&entry)?
-            .with_support(include_str!("../assets/driver_support.rhai"))?
-            .with_modules(bundle)
+    ) -> Result<rusthinq_scripting::Compiled, rusthinq_scripting::Error> {
+        self.engine_config().prepare(id, model, thinq2, consumer)
     }
 }

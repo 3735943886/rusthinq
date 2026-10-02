@@ -50,10 +50,12 @@ impl Service {
     pub fn handle(&self) -> Handle {
         self.runtime.handle()
     }
+    #[cfg(feature = "scripting")]
     pub fn with_scripts(mut self, owner: crate::scripts::Owner) -> Self {
         self.runtime = self.runtime.with_scripts(owner);
         self
     }
+    #[cfg(feature = "scripting")]
     pub fn with_script_sink(mut self, sink: Arc<dyn crate::scripts::PublishSink>) -> Self {
         self.runtime = self.runtime.with_script_sink(sink);
         self
@@ -62,6 +64,7 @@ impl Service {
         self.runtime = self.runtime.with_external_mqtt(handle);
         self
     }
+    #[cfg(feature = "scripting")]
     pub fn with_drivers(mut self, config: crate::drivers::Config) -> io::Result<Self> {
         self.runtime = self.runtime.with_drivers(config)?;
         Ok(self)
@@ -82,6 +85,7 @@ impl Service {
         self.local.push((front, listener, service));
         Ok(self)
     }
+    #[cfg(feature = "bridge")]
     pub fn with_firmware(mut self, relay: rusthinq_bridge::passthrough::Relay) -> Self {
         self.runtime = self.runtime.with_firmware(relay);
         self

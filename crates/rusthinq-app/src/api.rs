@@ -20,6 +20,7 @@ impl From<rusthinq_server::Delivery> for Delivery {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
+    Disabled,
     StaleSession,
     Busy,
     Stopped,
@@ -82,6 +83,7 @@ impl Handle {
             None => Ok(None),
         }
     }
+    #[cfg(feature = "scripting")]
     pub async fn adapter_invoke(
         &self,
         id: String,
@@ -144,5 +146,184 @@ fn event_value(event: Event) -> Value {
             json!({"type":"metadata","device":metadata.device_id,"model":metadata.model_name,"deviceType":metadata.device_type})
         }
         other => json!({"type":"stateChanged","detail":format!("{other:?}")}),
+    }
+}
+
+#[cfg(not(feature = "scripting"))]
+impl Handle {
+    pub async fn adapter_invoke(
+        &self,
+        _id: String,
+        _session: SessionKey,
+        _generation: u64,
+        _function: String,
+        _input: String,
+    ) -> Result<u64, Reject> {
+        Err(Reject::Disabled)
+    }
+}
+
+/// Adapter boundary. Runtime/transport handles, worker objects and receipts do not escape.
+#[derive(Clone)]
+pub struct AppHandle(Handle);
+impl From<Handle> for AppHandle {
+    fn from(handle: Handle) -> Self {
+        Self(handle)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Metadata {
+    pub device_id: String,
+    pub model_name: String,
+    pub device_type: String,
+}
+#[derive(Debug)]
+pub enum CloudError {
+    Busy,
+    Stopped,
+    InvalidInput,
+    Unavailable,
+    Remote,
+    Storage,
+    Cancelled,
+    Authentication,
+    Rejected,
+}
+impl std::fmt::Display for CloudError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cloud account: {self:?}")
+    }
+}
+impl std::error::Error for CloudError {}
+impl From<crate::cloud_account::Error> for CloudError {
+    fn from(error: crate::cloud_account::Error) -> Self {
+        use crate::cloud_account::Error as E;
+        match error {
+            E::Busy => Self::Busy,
+            E::Stopped => Self::Stopped,
+            E::InvalidInput => Self::InvalidInput,
+            E::Unavailable => Self::Unavailable,
+            E::Remote => Self::Remote,
+            E::Storage => Self::Storage,
+            E::Cancelled => Self::Cancelled,
+            E::Authentication => Self::Authentication,
+            E::Rejected => Self::Rejected,
+        }
+    }
+}
+impl AppHandle {
+    pub fn snapshot(&self) -> Vec<rusthinq_lifecycle::Device> {
+        self.0.snapshot()
+    }
+    pub fn durable_devices(&self) -> Vec<rusthinq_lifecycle::Entry> {
+        self.0.durable_devices()
+    }
+    pub fn driver_models(&self) -> std::collections::BTreeMap<String, (SessionKey, String, bool)> {
+        self.0.driver_models()
+    }
+    pub fn script_states(&self) -> std::collections::BTreeMap<String, (SessionKey, u64, bool)> {
+        self.0.script_states()
+    }
+    pub fn persisted_models(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::lifecycle_storage::DeviceMetadata> {
+        self.0.persisted_models()
+    }
+    pub fn metadata_snapshot(&self) -> Vec<Metadata> {
+        self.0
+            .metadata_snapshot()
+            .into_iter()
+            .map(|m| Metadata {
+                device_id: m.device_id,
+                model_name: m.model_name,
+                device_type: m.device_type,
+            })
+            .collect()
+    }
+    pub fn cleanup_status(&self) -> tokio::sync::watch::Receiver<crate::runtime::CleanupStatus> {
+        self.0.cleanup_status()
+    }
+    pub fn external_mqtt(&self) -> Option<crate::external_mqtt::Handle> {
+        self.0.external_mqtt()
+    }
+    pub(crate) fn retired_script(&self, id: &str) -> Option<crate::script_types::Context> {
+        self.0.retired_script(id)
+    }
+    #[cfg(feature = "scripting")]
+    pub(crate) fn driver_error(&self, device: String, reason: String) {
+        self.0.driver_error(device, reason)
+    }
+    pub fn adapter_events(&self) -> Events {
+        self.0.adapter_events()
+    }
+    pub async fn adapter_forget(&self, id: String, incarnation: u64) -> Result<(), Reject> {
+        self.0.adapter_forget(id, incarnation).await
+    }
+    pub async fn adapter_send(
+        &self,
+        id: String,
+        session: SessionKey,
+        payload: Vec<u8>,
+    ) -> Result<Delivery, Reject> {
+        self.0.adapter_send(id, session, payload).await
+    }
+    pub async fn adapter_inject(
+        &self,
+        id: String,
+        session: SessionKey,
+        data: Vec<u8>,
+        to_device: bool,
+    ) -> Result<Option<Delivery>, Reject> {
+        self.0.adapter_inject(id, session, data, to_device).await
+    }
+    pub async fn adapter_invoke(
+        &self,
+        id: String,
+        session: SessionKey,
+        generation: u64,
+        function: String,
+        input: String,
+    ) -> Result<u64, Reject> {
+        self.0
+            .adapter_invoke(id, session, generation, function, input)
+            .await
+    }
+    pub fn cloud_status(&self) -> Value {
+        match self.0.cloud_account() {
+            Some(account) => json!({"enabled":true,"account":account.status()}),
+            None => json!({"enabled":false}),
+        }
+    }
+    pub async fn cloud_login(&self, country: String) -> Result<Value, CloudError> {
+        self.0
+            .cloud_account()
+            .ok_or(CloudError::Unavailable)?
+            .login(country)
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn cloud_complete(&self, url: String) -> Result<Value, CloudError> {
+        self.0
+            .cloud_account()
+            .ok_or(CloudError::Unavailable)?
+            .complete(url)
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn cloud_refresh(&self) -> Result<Value, CloudError> {
+        self.0
+            .cloud_account()
+            .ok_or(CloudError::Unavailable)?
+            .refresh()
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn cloud_logout(&self) -> Result<Value, CloudError> {
+        self.0
+            .cloud_account()
+            .ok_or(CloudError::Unavailable)?
+            .logout()
+            .await
+            .map_err(Into::into)
     }
 }

@@ -1,5 +1,26 @@
 use super::*;
 impl Handle {
+    /// Composition-only binding; L4 remains the sole account state/policy owner.
+    #[cfg(feature = "bridge")]
+    pub fn attach_cloud_account(&self, account: crate::cloud_account::Handle) -> io::Result<()> {
+        let mut binding = self.0.cloud.lock().unwrap_or_else(|e| e.into_inner());
+        if binding.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cloud account already bound",
+            ));
+        }
+        *binding = Some(account);
+        Ok(())
+    }
+    pub(crate) fn cloud_account(&self) -> Option<crate::cloud_account::Handle> {
+        self.0
+            .cloud
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn persisted_models(&self) -> BTreeMap<String, crate::lifecycle_storage::DeviceMetadata> {
         self.0
             .persisted_models
@@ -15,6 +36,7 @@ impl Handle {
             .get(id)
             .cloned()
     }
+    #[cfg(feature = "scripting")]
     pub(crate) fn driver_error(&self, device: String, reason: String) {
         let _ = self.0.events.send(Event::Rejected { device, reason });
     }
@@ -71,6 +93,7 @@ impl Handle {
             .clone()
     }
     /// Compile before admission; the captured incarnation/session must still be current.
+    #[cfg(feature = "scripting")]
     pub async fn attach_script(
         &self,
         device: String,
@@ -122,6 +145,7 @@ impl Handle {
             .collect()
     }
     /// Returns ordered execution admission; ScriptExecuted reports the eventual outcome.
+    #[cfg(feature = "scripting")]
     pub async fn invoke_script(
         &self,
         device: String,
@@ -154,6 +178,7 @@ impl Handle {
     }
     /// Supply a successfully compiled replacement; admission fences session and generation.
     /// Callback names/encoding are kept. A lost reply must not trigger automatic retry.
+    #[cfg(feature = "scripting")]
     pub async fn reload_script(
         &self,
         device: String,
@@ -164,6 +189,7 @@ impl Handle {
         self.reload_prepared(device, session, generation, compiled, false)
             .await
     }
+    #[cfg(feature = "scripting")]
     pub(crate) async fn reload_driver(
         &self,
         device: String,
@@ -174,6 +200,7 @@ impl Handle {
         self.reload_prepared(device, session, generation, compiled, true)
             .await
     }
+    #[cfg(feature = "scripting")]
     async fn reload_prepared(
         &self,
         device: String,

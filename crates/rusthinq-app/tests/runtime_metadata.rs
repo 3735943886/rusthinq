@@ -153,6 +153,19 @@ async fn model_information_survives_restart_and_is_rebound_only_to_current_incar
     assert_eq!(new.incarnation, original.incarnation);
     assert!(new.generation > original.generation);
     assert_eq!(handle.driver_models()["d"].0, new);
+    handle
+        .forget_scoped("d".into(), new.incarnation)
+        .await
+        .unwrap();
+    until(&mut events, |event| {
+        matches!(
+            event,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Removed { .. })
+        )
+    })
+    .await;
+    assert!(handle.driver_models().is_empty());
+    assert!(handle.metadata_snapshot().is_empty());
     drop(peer);
     server.shutdown().await;
     stop.send_replace(true);
