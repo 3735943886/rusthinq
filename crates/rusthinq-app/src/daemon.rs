@@ -319,7 +319,7 @@ pub struct Daemon {
     #[cfg(feature = "scripting")]
     driver_watch: Option<crate::drivers::Config>,
     #[cfg(feature = "scripting")]
-    commands: Option<(crate::external_mqtt::Config, String)>,
+    commands: Option<(crate::external_mqtt::Config, String, bool)>,
 }
 impl Daemon {
     /// Binds all endpoints before durable generation reservation. No CA creation.
@@ -351,12 +351,22 @@ impl Daemon {
             None => None,
         };
         #[cfg(feature = "scripting")]
-        let commands = config.external_mqtt.clone().zip(
-            config
-                .drivers
-                .as_ref()
-                .map(|drivers| drivers.topic_prefix.clone()),
-        );
+        let commands = config
+            .external_mqtt
+            .clone()
+            .zip(
+                config
+                    .drivers
+                    .as_ref()
+                    .map(|drivers| drivers.topic_prefix.clone()),
+            )
+            .map(|(mqtt, prefix)| {
+                (
+                    mqtt,
+                    prefix,
+                    config.management.as_ref().is_some_and(|m| m.raw_inject),
+                )
+            });
         let external = config
             .external_mqtt
             .clone()
@@ -535,11 +545,12 @@ impl Daemon {
             ));
         }
         #[cfg(feature = "scripting")]
-        if let Some((config, prefix)) = self.commands {
+        if let Some((config, prefix, raw_enabled)) = self.commands {
             tasks.spawn(crate::mqtt_commands::run(
                 config,
                 prefix,
                 handle.clone(),
+                raw_enabled,
                 core_stop.subscribe(),
             ));
         }

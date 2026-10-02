@@ -435,10 +435,17 @@ async fn wire<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
     .unwrap()
 }
 async fn event(events: &mut broadcast::Receiver<Event>) -> Event {
-    timeout(Duration::from_secs(3), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            // Wire observation is independent of the protocol sequence under test.
+            if !matches!(event, Event::Sent(..)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 async fn setup<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, did: &str, keep_alive: u16) {
     setup_with_client(stream, did, keep_alive, "x").await;

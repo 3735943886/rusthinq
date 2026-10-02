@@ -95,6 +95,7 @@ impl Decoded {
 #[derive(Debug)]
 pub enum EncodeError {
     TlvTooLarge,
+    InvalidTlv,
     AabbTooLarge,
     InvalidHex(String),
 }
@@ -102,6 +103,7 @@ pub enum EncodeError {
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidTlv => f.write_str("TLV tag or value exceeds wire encoding"),
             Self::AabbTooLarge => f.write_str("AABB payload exceeds short framing"),
             Self::TlvTooLarge => f.write_str("TLV payload exceeds 255 bytes"),
             Self::InvalidHex(s) => write!(f, "invalid hex body: {s}"),
@@ -126,6 +128,13 @@ pub fn encode_packet(input: &EncodeInput) -> Result<(String, Vec<u8>), EncodeErr
 }
 
 fn encode_tlv(input: &TlvEncodeInput) -> Result<Vec<u8>, EncodeError> {
+    if input
+        .tlv
+        .iter()
+        .any(|item| item.t > 1023 || item.v > 0xffffff)
+    {
+        return Err(EncodeError::InvalidTlv);
+    }
     let tlv_bytes = tlv::build(&input.tlv);
     if tlv_bytes.len() > 255 {
         return Err(EncodeError::TlvTooLarge);

@@ -23,3 +23,6 @@ toml = "0.8"
 tempfile = "3"
 
 [dev-dependencies]
+rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
+rusthinq-app = { path = "../rusthinq-app", default-features = false }
+rusthinq-server = { path = "../rusthinq-server" }

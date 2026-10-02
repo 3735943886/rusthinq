@@ -172,3 +172,21 @@ fn module_imports_do_not_repeat_initialization_or_reset_mutable_scope() {
     assert_eq!(second.error, None);
     assert_eq!(second.outputs, vec![Output::Publish("2".into())]);
 }
+
+#[test]
+fn entry_added_after_module_preparation_uses_the_same_import_environment() {
+    let compiled = Compiled::with_context(
+        "import \"helper\" as h; fn original(ctx,v){ctx.send(h::value(v));}",
+        Limits::default(),
+        true,
+        Config::new("d".into(), "m".into()),
+    )
+    .unwrap()
+    .with_modules(vec![module("helper", "fn value(v){\"module:\"+v}")])
+    .unwrap()
+    .with_entry("fn added(ctx,v){original(ctx,v);}")
+    .unwrap();
+    let result = Host::new(compiled).invoke(1, "added", "value");
+    assert_eq!(result.error, None);
+    assert_eq!(result.outputs, vec![Output::Send("module:value".into())]);
+}

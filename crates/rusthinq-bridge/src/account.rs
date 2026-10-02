@@ -138,6 +138,32 @@ impl Handle {
             .ok_or(Error::Unavailable)?;
         Ok(client)
     }
+    /// Read-only cloud inventory, bound to the captured authenticated account lease.
+    pub async fn list_devices(&self) -> Result<serde_json::Value, Error> {
+        let mut cancelled = self.cancellation();
+        let client = self.authenticated_client()?;
+        let mut clients = self.clients();
+        let account = client
+            .account_identity()
+            .ok_or(Error::Unavailable)?
+            .to_owned();
+        let deadline = client
+            .expires_at()
+            .ok_or(Error::Unavailable)?
+            .min(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+        let request = client.list_devices();
+        tokio::pin!(request);
+        loop {
+            tokio::select! { biased;
+                _ = cancelled.changed() => return Err(Error::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(Error::Unavailable),
+                changed = clients.changed() => {
+                    if changed.is_err() || !clients.borrow().as_ref().is_some_and(|c| c.authenticated() && c.account_identity() == Some(account.as_str())) { return Err(Error::Cancelled); }
+                }
+                result = &mut request => return result.map(|devices|serde_json::json!({"devices":devices})).map_err(|_|Error::Remote),
+            }
+        }
+    }
     pub fn status(&self) -> Status {
         let mut status = self.status.borrow().clone();
         if status
@@ -333,15 +359,16 @@ impl Runtime {
                 self.publish(active.as_ref(), true, None);
             }
             let result = match command.action {
-                Action::Logout => match self.save(None).await {
-                    Ok(()) => {
-                        active = None;
-                        pending = None;
-                        renewal.next = None;
-                        Ok(serde_json::json!({"ok":true}))
-                    }
-                    Err(error) => Err(error),
-                },
+                Action::Logout => {
+                    // Accepted logout revokes live access even if durable deletion
+                    // fails. Report the storage error without restoring the lease.
+                    active = None;
+                    pending = None;
+                    renewal.next = None;
+                    self.save(None)
+                        .await
+                        .map(|()| serde_json::json!({"ok":true}))
+                }
                 action => {
                     let mut cancelled = self.epoch.clone();
                     let operation = async {

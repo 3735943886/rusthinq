@@ -19,10 +19,17 @@ fn packet(id: &str, body: serde_json::Value) -> Vec<u8> {
     .unwrap()
 }
 async fn next(events: &mut broadcast::Receiver<Event>) -> Event {
-    timeout(Duration::from_secs(2), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            // Wire observation is independent of the protocol sequence under test.
+            if !matches!(event, Event::Sent(..)) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 async fn frame<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
     let size = timeout(Duration::from_secs(2), stream.read_u32())
@@ -84,6 +91,10 @@ async fn loopback_ack_command_response_and_eof() {
     let receipt = handle.send(&id, payload).unwrap();
     assert_eq!(frame(&mut client).await, payload);
     assert_eq!(receipt.wait().await, Delivery::Sent);
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::Sent(id.clone(), payload.to_vec())
+    );
     client
         .write_all(&packet(
             "device",

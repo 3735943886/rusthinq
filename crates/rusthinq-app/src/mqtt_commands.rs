@@ -57,10 +57,87 @@ fn property<'a>(prefix: &str, id: &str, topic: &'a str) -> Option<&'a str> {
         .strip_suffix("/set")?;
     (!property.is_empty() && !property.contains('/')).then_some(property)
 }
+fn counter(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+/// Reserved management routes use captured identity in their JSON envelope.
+/// Raw injection additionally requires both client opt-in and runtime permission.
+async fn control(
+    prefix: &str,
+    topic: &str,
+    payload: &str,
+    app: &Handle,
+    raw_enabled: bool,
+) -> bool {
+    let Some(route) = topic.strip_prefix(&format!("{prefix}/")) else {
+        return false;
+    };
+    let parts = route.split('/').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[3] != "set" || !matches!(parts[1], "$bridge" | "$raw") {
+        return false;
+    }
+    let device = parts[0];
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(payload) else {
+        app.driver_error(device.into(), "invalid MQTT control envelope".into());
+        return true;
+    };
+    let Some(incarnation) = counter(&body["incarnation"]) else {
+        app.driver_error(device.into(), "MQTT control incarnation required".into());
+        return true;
+    };
+    let Some(current) = app.snapshot().into_iter().find(|d| {
+        d.entry.id == device && d.entry.incarnation == incarnation && d.removal.is_none()
+    }) else {
+        app.driver_error(device.into(), "stale MQTT control incarnation".into());
+        return true;
+    };
+    let result: Result<(), String> = if parts[1] == "$bridge" {
+        app.cloud_device(device.into(), incarnation, parts[2], body)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        async {
+            if !raw_enabled {
+                return Err("MQTT injection is disabled".into());
+            }
+            if body["inject_ok"] != true {
+                return Err("MQTT injection requires inject_ok".into());
+            }
+            let session = current
+                .session
+                .ok_or("MQTT injection requires online device")?;
+            if counter(&body["generation"]) != Some(session.generation) {
+                return Err("stale MQTT injection session".into());
+            }
+            let text = body["hex"]
+                .as_str()
+                .filter(|s| s.len() <= 2_000_000)
+                .ok_or("MQTT injection hex required")?;
+            let bytes =
+                rusthinq_protocol::hex::decode(text).map_err(|_| "invalid MQTT injection hex")?;
+            let to_device = match parts[2] {
+                "inject" => true,
+                "emit" => false,
+                _ => return Err("unknown MQTT raw route".into()),
+            };
+            app.adapter_inject(device.into(), session, bytes, to_device)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("MQTT injection rejected: {e:?}"))
+        }
+        .await
+    };
+    if let Err(error) = result {
+        app.driver_error(device.into(), error);
+    }
+    true
+}
 async fn connected(
     mut stream: crate::external_mqtt::Transport,
     prefix: &str,
     app: &Handle,
+    raw_enabled: bool,
 ) -> io::Result<()> {
     let filter = format!("{prefix}/#");
     let mut body = vec![0, 1];
@@ -107,29 +184,37 @@ async fn connected(
         {
             // No queue survives this connection. Capture both identities before
             // admission; the application reconciles them again before execution.
-            for (device, (session, generation, faulted)) in app.script_states() {
-                if !faulted && let Some(prop) = property(prefix, &device, &topic) {
-                    let input = serde_json::json!({"prop":prop,"value":value}).to_string();
-                    if let Err(error) = app
-                        .adapter_invoke(
-                            device.clone(),
-                            session,
-                            generation,
-                            "__command".into(),
-                            input,
-                        )
-                        .await
-                    {
-                        app.driver_error(
-                            device,
-                            format!("MQTT command admission rejected: {error:?}"),
-                        );
+            if !control(prefix, &topic, &value, app, raw_enabled).await {
+                for (device, (session, generation, faulted)) in app.script_states() {
+                    if !faulted && let Some(prop) = property(prefix, &device, &topic) {
+                        let input = serde_json::json!({"prop":prop,"value":value}).to_string();
+                        if let Err(error) = app
+                            .adapter_invoke(
+                                device.clone(),
+                                session,
+                                generation,
+                                "__command".into(),
+                                input,
+                            )
+                            .await
+                        {
+                            app.driver_error(
+                                device,
+                                format!("MQTT command admission rejected: {error:?}"),
+                            );
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
         if let Some(id) = id {
+            if acknowledged.len() >= 256
+                && !acknowledged.contains_key(&id)
+                && let Some(oldest) = acknowledged.keys().next().copied()
+            {
+                acknowledged.remove(&oldest);
+            }
             acknowledged.insert(id, fingerprint);
             stream
                 .write_all(&[0x40, 2, (id >> 8) as u8, id as u8])
@@ -141,6 +226,7 @@ pub(crate) async fn run(
     mut config: Config,
     prefix: String,
     app: impl Into<Handle>,
+    raw_enabled: bool,
     mut stop: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let app = app.into();
@@ -155,7 +241,7 @@ pub(crate) async fn run(
             if *stop.borrow() {
                 break;
             }
-            tokio::select! { biased; _ = stop.changed() => break, _ = connected(session.into_stream(), &prefix, &app) => {} }
+            tokio::select! { biased; _ = stop.changed() => break, _ = connected(session.into_stream(), &prefix, &app, raw_enabled) => {} }
         }
         tokio::select! { biased; _ = stop.changed() => break, _ = tokio::time::sleep(Duration::from_secs(delay)) => {} }
         delay = (delay * 2).min(30);
@@ -229,9 +315,40 @@ mod tests {
         )
         .await
         .unwrap();
+        let managed: Handle = app.clone().into();
+        let mut rejected = app.subscribe();
+        for (raw_enabled, consent, generation, expected) in [
+            (
+                false,
+                true,
+                session.generation,
+                "MQTT injection is disabled",
+            ),
+            (
+                true,
+                false,
+                session.generation,
+                "MQTT injection requires inject_ok",
+            ),
+            (
+                true,
+                true,
+                session.generation + 1,
+                "stale MQTT injection session",
+            ),
+        ] {
+            let body = serde_json::json!({"incarnation":session.incarnation.to_string(),"generation":generation.to_string(),"hex":"00","inject_ok":consent}).to_string();
+            assert!(control("lg", "lg/d/$raw/inject/set", &body, &managed, raw_enabled).await);
+            let event = rejected.recv().await.unwrap();
+            assert!(
+                matches!(event, crate::runtime::Event::Rejected { reason, .. } if reason == expected)
+            );
+        }
         let (subscriber, mut broker) = tokio::io::duplex(8192);
         let route =
-            tokio::spawn(async move { connected(Box::new(subscriber), "lg", &app.into()).await });
+            tokio::spawn(
+                async move { connected(Box::new(subscriber), "lg", &app.into(), false).await },
+            );
         assert_eq!(packet(&mut broker).await.unwrap()[0], 0x82);
         broker.write_all(&[0x90, 3, 0, 1, 1]).await.unwrap();
         let mut body = vec![0, 14];

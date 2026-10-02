@@ -79,6 +79,36 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         std::str::from_utf8(&bytes).map_err(|_| invalid("configuration must be UTF-8"))?,
     )
     .map_err(|_| invalid("invalid legacy TOML"))?;
+    for key in ["hostname", "ca_key_file", "ca_cert_file"] {
+        if legacy
+            .get(key)
+            .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+        {
+            return Err(invalid("invalid legacy configuration string"));
+        }
+    }
+    for section in ["mqtt", "scripting", "bridge", "gui"] {
+        if legacy.get(section).is_some_and(|v| !v.is_table()) {
+            return Err(invalid("invalid legacy configuration section"));
+        }
+    }
+    for key in ["rusthinq_prefix", "state_file"] {
+        if legacy
+            .get("mqtt")
+            .and_then(|v| v.get(key))
+            .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+        {
+            return Err(invalid("invalid legacy MQTT migration string"));
+        }
+    }
+    if let Some(script) = legacy.get("scripting")
+        && (script.get("watch").is_some_and(|v| v.as_bool().is_none())
+            || script
+                .get("il_prefix")
+                .is_some_and(|v| v.as_str().is_none_or(str::is_empty)))
+    {
+        return Err(invalid("invalid legacy scripting settings"));
+    }
     for key in [
         "custom_root_cert_file",
         "http_port",
@@ -127,6 +157,40 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         .prefix(".rusthinq-migrate-")
         .tempdir_in(parent)?;
     write(&stage.path().join("config.0.1.toml"), &bytes)?;
+    let retained_path = absolute(
+        base,
+        legacy
+            .get("mqtt")
+            .and_then(|m| m.get("state_file"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("mqtt_state.json"),
+    );
+    let retained_topics = match read(&retained_path) {
+        Ok(bytes) => {
+            let inventory = legacy_retained(&bytes, prefix)?;
+            write(&stage.path().join("mqtt-state.0.1.json"), &bytes)?;
+            write(
+                &stage.path().join("retained-import.json"),
+                &serde_json::to_vec_pretty(&inventory).map_err(io::Error::other)?,
+            )?;
+            inventory["pending"].as_array().map_or(0, Vec::len)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let migrated_devices = match read(&base.join("known_devices.json")) {
+        Ok(bytes) => {
+            let ledger = legacy_devices(&bytes)?;
+            write(&stage.path().join("known-devices.0.1.json"), &bytes)?;
+            write(
+                &stage.path().join("devices.json"),
+                &serde_json::to_vec_pretty(&ledger).map_err(io::Error::other)?,
+            )?;
+            ledger["entries"].as_array().map_or(0, Vec::len)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
     let mut archived = Vec::new();
     let mut warnings = vec![
         "Review external MQTT host, credentials, retained inventory and raw ACLs before enabling the adapter.",
@@ -198,7 +262,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .map_err(io::Error::other)?
             .as_bytes(),
     )?;
-    let report = json!({"schema":1,"source":source,"archivedCloudFiles":archived,"requiresReview":true,"warnings":warnings});
+    let report = json!({"schema":1,"source":source,"archivedCloudFiles":archived,"retainedTopics":retained_topics,"migratedDevices":migrated_devices,"requiresReview":true,"warnings":warnings});
     write(
         &stage.path().join("migration.json"),
         serde_json::to_vec_pretty(&report).unwrap().as_slice(),
@@ -211,4 +275,133 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
     fs::rename(stage.path(), destination)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(report)
+}
+
+/// Convert both 0.1 retained-state formats into a schema-2 inventory. Legacy
+/// ownership never impersonates a new device incarnation. No deletion is requested.
+pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
+    if bytes.len() > 1_048_576
+        || prefix.is_empty()
+        || prefix.len() > 256
+        || prefix.ends_with('/')
+        || prefix.contains(['+', '#'])
+        || prefix.chars().any(char::is_control)
+    {
+        return Err(invalid("invalid retained migration input"));
+    }
+    let document: Value =
+        serde_json::from_slice(bytes).map_err(|_| invalid("invalid legacy retained JSON"))?;
+    let devices = document
+        .as_object()
+        .filter(|d| d.len() <= 4096)
+        .ok_or_else(|| invalid("invalid legacy retained device inventory"))?;
+    let mut topics = std::collections::BTreeMap::new();
+    for (device, state) in devices {
+        if device.is_empty()
+            || device.len() > 256
+            || device.contains(['/', '+', '#'])
+            || device.chars().any(char::is_control)
+        {
+            return Err(invalid("invalid legacy retained device id"));
+        }
+        let properties = if state.is_array() {
+            state.as_array()
+        } else {
+            let object = state
+                .as_object()
+                .ok_or_else(|| invalid("invalid legacy retained device state"))?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "properties" | "last_seen_unix"))
+                || object
+                    .get("last_seen_unix")
+                    .is_some_and(|v| v.as_i64().is_none())
+            {
+                return Err(invalid("invalid legacy retained device metadata"));
+            }
+            state["properties"].as_array()
+        }
+        .ok_or_else(|| invalid("legacy retained properties missing"))?;
+        if properties.len() > 16384 {
+            return Err(invalid("legacy retained properties exceeded"));
+        }
+        for property in properties {
+            let property = property
+                .as_str()
+                .filter(|p| {
+                    !p.is_empty() && !p.contains(['+', '#']) && !p.chars().any(char::is_control)
+                })
+                .ok_or_else(|| invalid("invalid legacy retained property"))?;
+            let topic = format!("{prefix}/{device}/{property}");
+            if topic.len() > 1024 {
+                return Err(invalid("legacy retained topic exceeded"));
+            }
+            topics.insert(topic, format!("legacy/0.1:{device}"));
+            if topics.len() > 16384 {
+                return Err(invalid("legacy retained inventory exceeded"));
+            }
+        }
+    }
+    Ok(
+        json!({"version":2,"next":0,"pending":topics.into_iter().map(|(topic,owner)|json!({"topic":topic,"owner":owner})).collect::<Vec<_>>(),"deleting":[]}),
+    )
+}
+
+/// Assign fresh, deterministic incarnation identities to archived 0.1 devices.
+/// No connection or session generation is fabricated; all start offline.
+pub fn legacy_devices(bytes: &[u8]) -> io::Result<Value> {
+    if bytes.len() > 1_048_576 {
+        return Err(invalid("legacy device ledger exceeded"));
+    }
+    let document: Value =
+        serde_json::from_slice(bytes).map_err(|_| invalid("invalid legacy device ledger"))?;
+    let devices = document
+        .as_object()
+        .filter(|d| d.len() <= 4096)
+        .ok_or_else(|| invalid("invalid legacy device inventory"))?;
+    let mut entries = Vec::new();
+    let mut metadata = serde_json::Map::new();
+    for (index, (id, state)) in devices.iter().enumerate() {
+        if id.is_empty()
+            || id.len() > 256
+            || id.contains(['/', '+', '#'])
+            || id.chars().any(char::is_control)
+            || !state.is_object()
+        {
+            return Err(invalid("invalid legacy device identity"));
+        }
+        let incarnation = index as u64 + 1;
+        entries.push(json!({"id":id,"incarnation":incarnation,"last_generation":0}));
+        let model = state["modelName"]
+            .as_str()
+            .ok_or_else(|| invalid("legacy model name missing"))?;
+        let platform = state["platform"]
+            .as_str()
+            .ok_or_else(|| invalid("legacy platform missing"))?;
+        let device_type = match state.get("deviceType") {
+            None | Some(Value::Null) => "",
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| invalid("invalid legacy device type"))?,
+        };
+        if model.len() > 256
+            || model.chars().any(char::is_control)
+            || device_type.len() > 128
+            || device_type.chars().any(char::is_control)
+            || state
+                .get("last_seen_unix")
+                .is_some_and(|v| v.as_i64().is_none())
+        {
+            return Err(invalid("invalid legacy device metadata"));
+        }
+        if !matches!(platform, "" | "thinq1" | "thinq2") {
+            return Err(invalid("unknown legacy device platform"));
+        }
+        if !model.is_empty() && !platform.is_empty() {
+            metadata.insert(id.clone(),json!({"incarnation":incarnation,"model_name":model,"device_type":device_type,"thinq2":platform=="thinq2"}));
+        }
+    }
+    Ok(
+        json!({"version":2,"revision":0,"next_incarnation":entries.len()+1,"generation_floor":0,"entries":entries,"metadata":metadata}),
+    )
 }

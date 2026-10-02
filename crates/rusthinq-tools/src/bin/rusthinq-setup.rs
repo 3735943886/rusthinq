@@ -489,16 +489,27 @@ async fn whisen_request(
 ) -> Result<String> {
     let mut stream = connect_tls(host, whisen::WHISEN_PORT).await?;
     println!("Request: POST {path}");
-    stream
-        .write_all(whisen::request(path, body, headers).as_bytes())
-        .await?;
+    timeout(
+        Duration::from_secs(10),
+        stream.write_all(whisen::request(path, body, headers).as_bytes()),
+    )
+    .await
+    .context("SoftAP write timed out")??;
     let mut reply = Vec::new();
     timeout(Duration::from_secs(15), async {
         let mut buf = [0u8; 4096];
         loop {
             match stream.read(&mut buf).await {
                 Ok(0) => return Ok(()),
-                Ok(n) => reply.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                Ok(n) => {
+                    if reply.len() + n > 1_048_576 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "SoftAP response exceeded",
+                        ));
+                    }
+                    reply.extend_from_slice(&buf[..n]);
+                }
                 // The module may drop the connection without a TLS close_notify; what
                 // arrived before that is the reply.
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),

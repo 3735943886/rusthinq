@@ -184,6 +184,7 @@ async fn matching_certificates_and_thinq1_ack_over_real_tls() {
             serde_json::from_slice::<serde_json::Value>(&ack).unwrap()["Body"]["Return"],
             "OK"
         );
+        assert!(matches!(events.recv().await.unwrap(), Event::Sent(_, bytes) if bytes == ack));
         assert!(matches!(events.recv().await.unwrap(), Event::Data(_, bytes) if bytes == payload));
         // Next iteration should observe only its own Up/Data.
         drop(stream);

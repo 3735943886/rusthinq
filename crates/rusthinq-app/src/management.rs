@@ -96,6 +96,7 @@ fn build(app: App) -> Router {
     let mut routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/cloud/devices", get(cloud_devices))
+        .route("/api/cloud/inventory", get(cloud_inventory))
         .route("/api/devices/{id}/bridge/{action}", post(cloud_device))
         .route("/api/cloud", get(cloud_status))
         .route("/api/cloud/login", post(cloud_login))
@@ -293,7 +294,10 @@ fn snapshot(handle: &Handle) -> Value {
         let bridge = cloud["devices"].as_array().and_then(|ds| {
             ds.iter().find(|d| {
                 d["device"] == device.entry.id
-                    && d["incarnation"].as_u64() == Some(device.entry.incarnation)
+                    && d["incarnation"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        == Some(device.entry.incarnation)
             })
         });
         devices.insert(
@@ -690,6 +694,9 @@ async fn write(socket: &mut WebSocket, value: Value) -> bool {
 }
 
 /// Own HTTP tasks and drain upgraded sockets through their stop receiver/permits.
+async fn cloud_inventory(State(app): State<App>) -> Response {
+    cloud_result(app.handle.cloud_inventory().await)
+}
 async fn cloud_devices(State(app): State<App>) -> Json<Value> {
     Json(app.handle.cloud_devices())
 }

@@ -60,9 +60,27 @@ fn migration_stages_preserves_secrets_and_refuses_unsupported_cutover() {
     std::fs::write(&source, original).unwrap();
     let credential = "{\"refreshToken\":\"private-secret\",\"env\":{\"countryCode\":\"KR\"}}";
     std::fs::write(state.join("oauth2.json"), credential).unwrap();
+    std::fs::write(dir.path().join("mqtt_state.json"), br#"{"d":["power"]}"#).unwrap();
+    std::fs::write(
+        dir.path().join("known_devices.json"),
+        br#"{"d":{"modelId":"m","modelName":"D140110","platform":"thinq1","last_seen_unix":123}}"#,
+    )
+    .unwrap();
     let dest = dir.path().join("new");
     let report = rusthinq_tools::migration::migrate(&source, &dest).unwrap();
     assert_eq!(report["requiresReview"], true);
+    assert_eq!(report["retainedTopics"], 1);
+    assert_eq!(report["migratedDevices"], 1);
+    let imported =
+        rusthinq_app::lifecycle_storage::Storage::open(&dest.join("devices.json"), 4096).unwrap();
+    assert_eq!(imported.state().metadata["d"].model_name, "D140110");
+    let retained = std::fs::read(dest.join("retained-import.json")).unwrap();
+    assert!(
+        rusthinq_server::retained::Cleanup::restore(16384, &retained)
+            .unwrap()
+            .requested()
+            .is_empty()
+    );
     assert!(!report.to_string().contains("private-secret"));
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
     assert_eq!(
@@ -92,4 +110,78 @@ fn migration_stages_preserves_secrets_and_refuses_unsupported_cutover() {
     .unwrap();
     assert!(rusthinq_tools::migration::migrate(&source, &dir.path().join("bad")).is_err());
     assert!(!dir.path().join("bad").exists());
+}
+
+#[test]
+fn legacy_retained_inventory_preserves_exact_topics_and_requires_explicit_cleanup() {
+    use rusthinq_server::retained::Cleanup;
+    let old = br#"{"d":["temperature","power"],"other":["power"]}"#;
+    let current=br#"{"d":{"properties":["power","temperature"],"last_seen_unix":123},"other":{"properties":["power"],"last_seen_unix":0}}"#;
+    let plan = rusthinq_tools::migration::legacy_retained(old, "home/lg").unwrap();
+    assert_eq!(
+        plan,
+        rusthinq_tools::migration::legacy_retained(current, "home/lg").unwrap()
+    );
+    let bytes = serde_json::to_vec(&plan).unwrap();
+    let mut ledger = Cleanup::restore(16384, &bytes).unwrap();
+    assert_eq!(ledger.pending().len(), 3);
+    assert!(ledger.requested().is_empty());
+    assert_eq!(ledger.pending()[0].topic, "home/lg/d/power");
+    assert!(
+        ledger
+            .pending()
+            .iter()
+            .all(|item| item.owner.starts_with("legacy/0.1:"))
+    );
+    ledger.request_delete(&ledger.pending()).unwrap();
+    let mut restarted = Cleanup::restore(16384, &ledger.checkpoint()).unwrap();
+    assert_eq!(restarted.requested().len(), 3);
+    let attempt = restarted.begin("home/lg/d/power").unwrap();
+    assert!(restarted.complete(&attempt, false));
+    assert_eq!(restarted.pending().len(), 3);
+    assert_eq!(restarted.requested().len(), 3);
+    let attempt = restarted.begin("home/lg/d/power").unwrap();
+    assert!(restarted.complete(&attempt, true));
+    assert_eq!(restarted.pending().len(), 2);
+    assert!(rusthinq_tools::migration::legacy_retained(br##"{"d":["#"]}"##, "home/lg").is_err());
+    assert!(rusthinq_tools::migration::legacy_retained(old, "home/+").is_err());
+}
+
+#[test]
+fn legacy_known_devices_open_in_production_storage_and_survive_restart() {
+    use rusthinq_app::lifecycle_storage::Storage;
+    let legacy=br#"{"d":{"modelId":"m","modelName":"D140110","deviceType":"201","platform":"thinq1","last_seen_unix":123},"orphan":{"modelId":"","modelName":"","platform":"","last_seen_unix":0}}"#;
+    let ledger = rusthinq_tools::migration::legacy_devices(legacy).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let mut store = Storage::open(&path, 4096).unwrap();
+    assert_eq!(store.state().ledger.entries.len(), 2);
+    assert_eq!(store.state().metadata["d"].model_name, "D140110");
+    assert!(!store.state().metadata["d"].thinq2);
+    assert!(!store.state().metadata.contains_key("orphan"));
+    let block = store.reserve_generations(16).unwrap();
+    assert_eq!(block.floor, 0);
+    drop(store);
+    let mut restarted = Storage::open(&path, 4096).unwrap();
+    assert_eq!(restarted.state().ledger.entries, store_entries(&ledger));
+    assert_eq!(restarted.reserve_generations(16).unwrap().floor, 16);
+    assert!(
+        rusthinq_tools::migration::legacy_devices(
+            br#"{"d":{"modelName":"x","platform":"unknown"}}"#
+        )
+        .is_err()
+    );
+}
+fn store_entries(value: &serde_json::Value) -> Vec<rusthinq_lifecycle::Entry> {
+    value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| rusthinq_lifecycle::Entry {
+            id: e["id"].as_str().unwrap().into(),
+            incarnation: e["incarnation"].as_u64().unwrap(),
+            last_generation: 0,
+        })
+        .collect()
 }

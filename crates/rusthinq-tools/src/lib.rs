@@ -367,3 +367,5 @@ pub mod mcp;
 pub mod softap;
 
 pub mod migration;
+
+pub mod replay;

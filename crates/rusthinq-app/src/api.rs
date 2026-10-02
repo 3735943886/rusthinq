@@ -323,7 +323,19 @@ impl AppHandle {
         #[cfg(feature = "bridge")]
         {
             match self.0.cloud_devices() {
-                Some(handle) => json!({"enabled":true,"devices":handle.snapshot()}),
+                Some(handle) => {
+                    let devices = handle
+                        .snapshot()
+                        .into_iter()
+                        .map(|status| {
+                            let mut value = json!(status);
+                            value["incarnation"] = json!(status.incarnation.to_string());
+                            value["attempt"] = json!(status.attempt.to_string());
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    json!({"enabled":true,"devices":devices})
+                }
                 None => json!({"enabled":false,"devices":[]}),
             }
         }
@@ -403,6 +415,21 @@ impl AppHandle {
         #[cfg(not(feature = "bridge"))]
         {
             let _ = (id, incarnation, action, body);
+            Err(CloudError::Unavailable)
+        }
+    }
+    pub async fn cloud_inventory(&self) -> Result<Value, CloudError> {
+        #[cfg(feature = "bridge")]
+        {
+            self.0
+                .cloud_account()
+                .ok_or(CloudError::Unavailable)?
+                .list_devices()
+                .await
+                .map_err(Into::into)
+        }
+        #[cfg(not(feature = "bridge"))]
+        {
             Err(CloudError::Unavailable)
         }
     }
