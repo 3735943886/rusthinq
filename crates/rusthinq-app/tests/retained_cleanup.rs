@@ -57,3 +57,33 @@ fn save_failure_blocks_send_tokens_and_preserves_pending_memory() {
     drop(ledger);
     assert_eq!(Ledger::open(&path, 4).unwrap().pending(), vec![deletion()]);
 }
+
+#[test]
+fn batch_delete_intent_survives_restart_before_first_send() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cleanup.json");
+    let batch: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|topic| Tombstone {
+            owner: "still-live".into(),
+            topic: topic.into(),
+        })
+        .collect();
+    let preserved = Tombstone {
+        owner: "other".into(),
+        topic: "c".into(),
+    };
+    let mut ledger = Ledger::open(&path, 4).unwrap();
+    ledger.enqueue(&batch).unwrap();
+    ledger.enqueue(std::slice::from_ref(&preserved)).unwrap();
+    ledger.request_delete(&batch).unwrap();
+    drop(ledger);
+    let mut ledger = Ledger::open(&path, 4).unwrap();
+    assert_eq!(ledger.requested(), batch);
+    let attempt = ledger.begin("a").unwrap();
+    ledger.complete(&attempt, true).unwrap();
+    drop(ledger);
+    let ledger = Ledger::open(&path, 4).unwrap();
+    assert_eq!(ledger.requested(), vec![batch[1].clone()]);
+    assert!(ledger.pending().contains(&preserved));
+}

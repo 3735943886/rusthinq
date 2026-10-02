@@ -13,7 +13,16 @@ rusthinq-bridge = { path = "../rusthinq-bridge" }
 rusthinq-scripting = { path = "../rusthinq-scripting" }
 tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
-
-[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+subtle = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 openssl = "0.10"
 tokio-openssl = "0.6"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"

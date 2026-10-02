@@ -45,6 +45,10 @@ impl Compiled {
                     let ast = self.engine.compile(&source.source).map_err(|error| {
                         Error::Compile(format!("module {}: {error}", source.name))
                     })?;
+                    let ast = self
+                        .support_ast
+                        .as_ref()
+                        .map_or(ast.clone(), |support| ast.merge(support));
                     let module = Module::eval_ast_as_new(Scope::new(), &ast, &self.engine)
                         .map_err(|error| {
                             Error::Compile(format!("module {}: {error}", source.name))

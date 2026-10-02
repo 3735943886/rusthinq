@@ -17,11 +17,23 @@ pub struct Session<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// Caller supplies a connected, authenticated transport (TLS if required).
     /// This connection is exclusive: no subscriptions or other in-flight publishers.
-    pub async fn connect(mut stream: S, client: &str, deadline: Duration) -> io::Result<Self> {
+    pub async fn connect(stream: S, client: &str, deadline: Duration) -> io::Result<Self> {
+        Self::connect_authenticated(stream, client, deadline, None, None).await
+    }
+    pub async fn connect_authenticated(
+        mut stream: S,
+        client: &str,
+        deadline: Duration,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> io::Result<Self> {
         if deadline.is_zero()
             || client.is_empty()
             || client.len() > 1024
             || client.chars().any(char::is_control)
+            || username.is_some_and(|name| name.len() > 65535 || name.contains('\0'))
+            || password.is_some_and(|password| password.len() > 65535)
+            || password.is_some() && username.is_none()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -29,9 +41,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             ));
         }
         let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 0];
+        if username.is_some() {
+            body[7] |= 0x80;
+        }
+        if password.is_some() {
+            body[7] |= 0x40;
+        }
         body.extend_from_slice(&(client.len() as u16).to_be_bytes());
         body.extend_from_slice(client.as_bytes());
-        let packet = mqtt::frame(0x10, &body, 2048).map_err(|_| invalid("CONNECT exceeded"))?;
+        for field in [username, password].into_iter().flatten() {
+            body.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            body.extend_from_slice(field.as_bytes());
+        }
+        let packet = mqtt::frame(0x10, &body, 134144).map_err(|_| invalid("CONNECT exceeded"))?;
         timeout(deadline, async {
             stream.write_all(&packet).await?;
             stream.flush().await?;
@@ -55,6 +77,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         self.retained_exchange(&deletion.topic, &[]).await
     }
     async fn retained_exchange(&mut self, topic: &str, payload: &[u8]) -> io::Result<()> {
+        self.exchange(topic, payload, true).await
+    }
+    /// QoS1 transient output shares this exclusive connection's PUBACK owner.
+    pub async fn publish_transient(&mut self, topic: &str, payload: &[u8]) -> io::Result<()> {
+        let _ = mqtt::publish(topic, payload, 1_052_672)
+            .map_err(|_| invalid("invalid transient publication"))?;
+        self.exchange(topic, payload, false).await
+    }
+    pub async fn ping(&mut self) -> io::Result<()> {
+        if !self.usable {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "session requires reconnect",
+            ));
+        }
+        self.usable = false;
+        timeout(self.deadline, async {
+            self.stream.write_all(&[0xc0, 0]).await?;
+            self.stream.flush().await?;
+            let mut pong = [0; 2];
+            self.stream.read_exact(&mut pong).await?;
+            if pong != [0xd0, 0] {
+                return Err(invalid("unexpected PINGRESP"));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| timed_out())??;
+        self.usable = true;
+        Ok(())
+    }
+    async fn exchange(&mut self, topic: &str, payload: &[u8], retain: bool) -> io::Result<()> {
         if !self.usable {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -73,8 +127,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         body.extend_from_slice(topic.as_bytes());
         body.extend_from_slice(&id.to_be_bytes());
         body.extend_from_slice(payload);
-        let frame =
-            mqtt::frame(0x33, &body, 1_052_672).map_err(|_| invalid("retained packet exceeded"))?;
+        let frame = mqtt::frame(if retain { 0x33 } else { 0x32 }, &body, 1_052_672)
+            .map_err(|_| invalid("MQTT packet exceeded"))?;
         timeout(self.deadline, async {
             self.stream.write_all(&frame).await?;
             self.stream.flush().await?;
@@ -113,8 +167,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         })
         .await
         .map_err(io::Error::other)??;
-        self.retained_exchange(&deletion.topic, payload).await?;
+        self.publish_registered_retained(&ledger, &deletion.owner, &deletion.topic, payload)
+            .await?;
         Ok(ledger)
+    }
+    /// Reuses already durable inventory, without another filesystem gap before send.
+    pub async fn publish_registered_retained(
+        &mut self,
+        ledger: &Ledger,
+        owner: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        if payload.is_empty()
+            || payload.len() > 1_048_576
+            || ledger.requires_reopen()
+            || !ledger
+                .pending()
+                .iter()
+                .any(|item| item.owner == owner && item.topic == topic)
+            || ledger.requested().iter().any(|item| item.topic == topic)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retained publication requires live durable ownership",
+            ));
+        }
+        self.retained_exchange(topic, payload).await
     }
 
     /// Clean only this owner's topics; preserve other device/adapter inventories.
@@ -127,14 +206,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             .pending()
             .into_iter()
             .filter(|item| item.owner == owner)
-            .map(|item| item.topic)
             .collect();
+        ledger = Self::request_deletions(ledger, topics.clone()).await?;
         let mut completed = 0;
         for topic in topics {
-            ledger = self.delete_one(ledger, topic).await?;
+            ledger = self.delete_one(ledger, topic.topic).await?;
             completed += 1;
         }
         Ok((ledger, completed))
+    }
+    /// Persist the entire batch before sending its first tombstone.
+    pub async fn request_deletions(
+        mut ledger: Ledger,
+        topics: Vec<rusthinq_server::retained::Tombstone>,
+    ) -> io::Result<Ledger> {
+        if topics.is_empty() {
+            return Ok(ledger);
+        }
+        tokio::task::spawn_blocking(move || {
+            ledger.request_delete(&topics)?;
+            Ok(ledger)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
     /// Owns the ledger during the operation. On error drop/reopen it from disk;
     /// durable work survives. Blocking commits run off protocol I/O tasks.
@@ -163,6 +257,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// while the failed and unsent topics remain recoverable. No retry task is spawned.
     pub async fn drain(&mut self, mut ledger: Ledger) -> io::Result<(Ledger, usize)> {
         let pending = ledger.pending();
+        ledger = Self::request_deletions(ledger, pending.clone()).await?;
         let mut completed = 0;
         for deletion in pending {
             ledger = self.delete_one(ledger, deletion.topic).await?;

@@ -115,6 +115,14 @@ impl Ledger {
     pub fn pending(&self) -> Vec<Tombstone> {
         self.cleanup.pending()
     }
+    pub fn request_delete(&mut self, deletions: &[Tombstone]) -> io::Result<()> {
+        let mut candidate = self.cleanup.clone();
+        candidate.request_delete(deletions).map_err(policy)?;
+        self.commit(candidate)
+    }
+    pub fn requested(&self) -> Vec<Tombstone> {
+        self.cleanup.requested()
+    }
     pub fn requires_reopen(&self) -> bool {
         self.uncertain
     }

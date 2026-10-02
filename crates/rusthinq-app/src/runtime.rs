@@ -17,6 +17,20 @@ use tokio::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    Injected {
+        session: SessionId,
+        data: Vec<u8>,
+        to_device: bool,
+    },
+    ScriptOutput {
+        context: crate::scripts::Context,
+        payload: String,
+    },
+    ScriptExecuted {
+        sequence: u64,
+        context: crate::scripts::Context,
+        error: Option<String>,
+    },
     ScriptDelivery {
         context: crate::scripts::Context,
         delivery: rusthinq_server::Delivery,
@@ -49,22 +63,98 @@ pub enum CleanupStatus {
 }
 type CleanupState = watch::Receiver<(Vec<Device>, bool)>;
 type CleanupStart = Box<dyn FnOnce(CleanupState) -> JoinHandle<io::Result<()>> + Send>;
+struct ApplicationSink(
+    broadcast::Sender<Event>,
+    Option<crate::external_mqtt::Handle>,
+);
+impl crate::scripts::PublishSink for ApplicationSink {
+    fn try_publish(
+        &self,
+        context: &crate::scripts::Context,
+        payload: String,
+    ) -> Result<(), String> {
+        if let Some(external) = &self.1 {
+            external.try_publish(context, payload.clone())?;
+        }
+        let _ = self.0.send(Event::ScriptOutput {
+            context: context.clone(),
+            payload,
+        });
+        Ok(())
+    }
+}
 struct AttachCleanup {
     start: CleanupStart,
     result: oneshot::Sender<io::Result<()>>,
 }
 struct Shared {
+    external_mqtt: Mutex<Option<crate::external_mqtt::Handle>>,
+    durable_devices: Mutex<Vec<rusthinq_lifecycle::Entry>>,
+    message_id: std::sync::atomic::AtomicU64,
+    driver_models: Mutex<BTreeMap<String, (SessionKey, String, bool)>>,
+    script_states: Mutex<BTreeMap<String, (SessionKey, u64, bool)>>,
     scripts: mpsc::Sender<ScriptCommand>,
     metadata: Mutex<BTreeMap<String, rusthinq_server::thinq1_http::Metadata>>,
     devices: Mutex<Vec<Device>>,
     events: broadcast::Sender<Event>,
-    commands: mpsc::Sender<String>,
+    commands: mpsc::Sender<ManagementCommand>,
     attach: mpsc::Sender<AttachCleanup>,
     cleanup_status: watch::Sender<CleanupStatus>,
 }
 #[derive(Clone)]
 pub struct Handle(Arc<Shared>);
 impl Handle {
+    pub fn external_mqtt(&self) -> Option<crate::external_mqtt::Handle> {
+        self.0
+            .external_mqtt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn durable_devices(&self) -> Vec<rusthinq_lifecycle::Entry> {
+        self.0
+            .durable_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub async fn inject(
+        &self,
+        id: String,
+        session: SessionKey,
+        data: Vec<u8>,
+        to_device: bool,
+    ) -> Result<Option<rusthinq_server::Receipt>, rusthinq_server::Reject> {
+        if data.len() > 1_000_000 {
+            return Err(rusthinq_server::Reject::PayloadExceeded);
+        }
+        let (result, received) = oneshot::channel();
+        self.management(ManagementCommand::Inject {
+            id,
+            session,
+            data,
+            to_device,
+            result,
+        })?;
+        received
+            .await
+            .unwrap_or(Err(rusthinq_server::Reject::Stopped))
+    }
+    pub fn driver_models(&self) -> BTreeMap<String, (SessionKey, String, bool)> {
+        self.0
+            .driver_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn script_states(&self) -> BTreeMap<String, (SessionKey, u64, bool)> {
+        self.0
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
     /// Compile before admission; the captured incarnation/session must still be current.
     pub async fn attach_script(
         &self,
@@ -74,13 +164,17 @@ impl Handle {
         config: rusthinq_scripting::worker::Config,
         callbacks: crate::scripts::Callbacks,
     ) -> Result<(), rusthinq_scripting::Error> {
-        if [&callbacks.response, &callbacks.data, &callbacks.ready]
-            .iter()
-            .any(|name| {
-                name.as_ref()
-                    .is_some_and(|name| name.is_empty() || name.len() > 256)
-            })
-        {
+        if [
+            &callbacks.response,
+            &callbacks.data,
+            &callbacks.ready,
+            &callbacks.timer,
+        ]
+        .iter()
+        .any(|name| {
+            name.as_ref()
+                .is_some_and(|name| name.is_empty() || name.len() > 256)
+        }) {
             return Err(rusthinq_scripting::Error::InvalidConfig);
         }
         let (result, received) = oneshot::channel();
@@ -110,6 +204,37 @@ impl Handle {
             .values()
             .cloned()
             .collect()
+    }
+    /// Returns ordered execution admission; ScriptExecuted reports the eventual outcome.
+    pub async fn invoke_script(
+        &self,
+        device: String,
+        session: SessionKey,
+        generation: u64,
+        function: String,
+        input: String,
+    ) -> Result<u64, rusthinq_scripting::Error> {
+        if input.len() > 1_000_000 || function.is_empty() || function.len() > 256 {
+            return Err(rusthinq_scripting::Error::InputExceeded);
+        }
+        let (result, received) = oneshot::channel();
+        self.0
+            .scripts
+            .try_send(ScriptCommand::Invoke {
+                device,
+                session,
+                generation,
+                function,
+                input,
+                result,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => rusthinq_scripting::Error::Busy,
+                mpsc::error::TrySendError::Closed(_) => rusthinq_scripting::Error::Stopped,
+            })?;
+        received
+            .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?
     }
     /// Supply a successfully compiled replacement; admission fences session and generation.
     /// Callback names/encoding are kept. A lost reply must not trigger automatic retry.
@@ -167,7 +292,64 @@ impl Handle {
     }
     /// Request removal; configured bridge registrations are deregistered first.
     pub fn forget(&self, id: String) -> Result<(), mpsc::error::TrySendError<String>> {
-        self.0.commands.try_send(id)
+        self.0
+            .commands
+            .try_send(ManagementCommand::Forget(id))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(ManagementCommand::Forget(id)) => {
+                    mpsc::error::TrySendError::Full(id)
+                }
+                mpsc::error::TrySendError::Closed(ManagementCommand::Forget(id)) => {
+                    mpsc::error::TrySendError::Closed(id)
+                }
+                _ => unreachable!("submitted forget command"),
+            })
+    }
+    /// Admission only; durable removal success/failure is observed in lifecycle events.
+    pub async fn forget_scoped(
+        &self,
+        id: String,
+        incarnation: u64,
+    ) -> Result<(), rusthinq_server::Reject> {
+        let (result, received) = oneshot::channel();
+        self.management(ManagementCommand::ForgetScoped {
+            id,
+            incarnation,
+            result,
+        })?;
+        received
+            .await
+            .unwrap_or(Err(rusthinq_server::Reject::Stopped))
+    }
+    /// Raw JSON transport send, fenced again by the lifecycle actor and L3 registry.
+    pub async fn send(
+        &self,
+        id: String,
+        session: SessionKey,
+        payload: Vec<u8>,
+    ) -> Result<rusthinq_server::Receipt, rusthinq_server::Reject> {
+        if payload.len() > 1_000_000 {
+            return Err(rusthinq_server::Reject::PayloadExceeded);
+        }
+        let (result, received) = oneshot::channel();
+        self.management(ManagementCommand::Send {
+            id,
+            session,
+            payload,
+            result,
+        })?;
+        received
+            .await
+            .unwrap_or(Err(rusthinq_server::Reject::Stopped))
+    }
+    fn management(&self, command: ManagementCommand) -> Result<(), rusthinq_server::Reject> {
+        self.0
+            .commands
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => rusthinq_server::Reject::Busy,
+                mpsc::error::TrySendError::Closed(_) => rusthinq_server::Reject::Stopped,
+            })
     }
     /// Subscribe before snapshot; receivers must handle Lagged and resnapshot.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -179,6 +361,43 @@ impl Handle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+}
+enum ManagementCommand {
+    Inject {
+        id: String,
+        session: SessionKey,
+        data: Vec<u8>,
+        to_device: bool,
+        result: oneshot::Sender<Result<Option<rusthinq_server::Receipt>, rusthinq_server::Reject>>,
+    },
+    Forget(String),
+    ForgetScoped {
+        id: String,
+        incarnation: u64,
+        result: oneshot::Sender<Result<(), rusthinq_server::Reject>>,
+    },
+    Send {
+        id: String,
+        session: SessionKey,
+        payload: Vec<u8>,
+        result: oneshot::Sender<Result<rusthinq_server::Receipt, rusthinq_server::Reject>>,
+    },
+}
+impl ManagementCommand {
+    fn cancel(self) {
+        match self {
+            Self::Forget(_) => {}
+            Self::ForgetScoped { result, .. } => {
+                let _ = result.send(Err(rusthinq_server::Reject::Stopped));
+            }
+            Self::Send { result, .. } => {
+                let _ = result.send(Err(rusthinq_server::Reject::Stopped));
+            }
+            Self::Inject { result, .. } => {
+                let _ = result.send(Err(rusthinq_server::Reject::Stopped));
+            }
+        }
     }
 }
 enum WriteResult {
@@ -203,6 +422,14 @@ struct ReloadScript {
 enum ScriptCommand {
     Attach(Box<AttachScript>),
     Reload(Box<ReloadScript>),
+    Invoke {
+        device: String,
+        session: SessionKey,
+        generation: u64,
+        function: String,
+        input: String,
+        result: oneshot::Sender<Result<u64, rusthinq_scripting::Error>>,
+    },
 }
 impl ScriptCommand {
     fn cancel(self) {
@@ -212,6 +439,9 @@ impl ScriptCommand {
             }
             Self::Reload(request) => {
                 let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+            }
+            Self::Invoke { result, .. } => {
+                let _ = result.send(Err(rusthinq_scripting::Error::Stopped));
             }
         }
     }
@@ -227,6 +457,21 @@ enum TransportHandle {
     },
 }
 impl TransportHandle {
+    fn protocol(
+        &self,
+        id: &SessionId,
+    ) -> Result<rusthinq_server::Protocol, rusthinq_server::Reject> {
+        match self {
+            Self::ThinQ1(server) | Self::Mixed { server, .. } => server.protocol(id),
+            Self::ThinQ2(broker) => {
+                if broker.snapshot().contains(id) {
+                    Ok(rusthinq_server::Protocol::ThinQ2)
+                } else {
+                    Err(rusthinq_server::Reject::StaleSession)
+                }
+            }
+        }
+    }
     fn send(
         &self,
         session: &SessionId,
@@ -283,6 +528,16 @@ impl TransportHandle {
     }
 }
 pub struct Runtime {
+    drivers: Option<crate::drivers::Config>,
+    driver_preparation: JoinSet<(
+        String,
+        SessionKey,
+        String,
+        Result<rusthinq_scripting::Compiled, rusthinq_scripting::Error>,
+    )>,
+    driver_attempts: BTreeMap<String, (SessionKey, String)>,
+    driver_buffers: BTreeMap<String, (SessionKey, VecDeque<Vec<u8>>)>,
+    script_timers: BTreeMap<(String, String), (crate::scripts::Context, Instant)>,
     script_attach: mpsc::Receiver<ScriptCommand>,
     script_callbacks: BTreeMap<String, crate::scripts::Callbacks>,
     script_results: JoinSet<(
@@ -312,7 +567,7 @@ pub struct Runtime {
     capacity: usize,
     epoch: Instant,
     deadline: Option<Duration>,
-    commands: mpsc::Receiver<String>,
+    commands: mpsc::Receiver<ManagementCommand>,
     closes: JoinSet<Input>,
     cleanup: Option<JoinHandle<io::Result<()>>>,
     cleanup_state: watch::Sender<(Vec<Device>, bool)>,
@@ -403,6 +658,18 @@ impl Runtime {
         let (attach, attachments) = mpsc::channel(1);
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
         let shared = Arc::new(Shared {
+            durable_devices: Mutex::new(storage.state().ledger.entries.clone()),
+            message_id: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_millis()
+                    .try_into()
+                    .map_err(io::Error::other)?,
+            ),
+            driver_models: Mutex::new(BTreeMap::new()),
+            external_mqtt: Mutex::new(None),
+            script_states: Mutex::new(BTreeMap::new()),
             scripts: script_sender,
             metadata: Mutex::new(BTreeMap::new()),
             devices: Mutex::new(model.devices()),
@@ -412,6 +679,11 @@ impl Runtime {
             cleanup_status,
         });
         Ok(Self {
+            drivers: None,
+            driver_preparation: JoinSet::new(),
+            driver_attempts: BTreeMap::new(),
+            driver_buffers: BTreeMap::new(),
+            script_timers: BTreeMap::new(),
             script_attach,
             script_callbacks: BTreeMap::new(),
             script_results: JoinSet::new(),
@@ -460,6 +732,31 @@ impl Runtime {
         self.script_sink = Some(sink);
         self
     }
+    pub fn with_external_mqtt(mut self, handle: crate::external_mqtt::Handle) -> Self {
+        *self
+            .shared
+            .external_mqtt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
+        self.script_sink = Some(Arc::new(ApplicationSink(
+            self.shared.events.clone(),
+            Some(handle),
+        )));
+        self
+    }
+    pub fn with_drivers(mut self, config: crate::drivers::Config) -> io::Result<Self> {
+        if self.scripts.is_none() {
+            self.scripts = Some(
+                crate::scripts::Owner::new(self.capacity)
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?,
+            );
+        }
+        if self.script_sink.is_none() {
+            self.script_sink = Some(Arc::new(ApplicationSink(self.shared.events.clone(), None)));
+        }
+        self.drivers = Some(config);
+        Ok(self)
+    }
     /// Share the exact relay used by the TLS front door. Only completed current
     /// provisioning contributes local proof; pending device packets never do.
     pub fn with_firmware(mut self, relay: rusthinq_bridge::passthrough::Relay) -> Self {
@@ -474,7 +771,7 @@ impl Runtime {
         self.metadata = Some(receiver);
         self
     }
-    fn observe_metadata(&self, metadata: rusthinq_server::thinq1_http::Metadata) {
+    fn observe_metadata(&mut self, metadata: rusthinq_server::thinq1_http::Metadata) {
         let mut entries = self
             .shared
             .metadata
@@ -490,7 +787,140 @@ impl Runtime {
         }
         entries.insert(metadata.device_id.clone(), metadata.clone());
         drop(entries);
+        let id = metadata.device_id.clone();
+        if let Some(session) = self
+            .model
+            .devices()
+            .iter()
+            .find(|d| d.entry.id == id)
+            .and_then(|d| d.session)
+        {
+            self.shared
+                .driver_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.clone(), (session, metadata.model_name.clone(), false));
+        }
         self.emit(Event::Metadata(metadata));
+        self.prepare_driver(&id);
+    }
+    fn prepare_driver(&mut self, id: &str) {
+        let Some(config) = self.drivers.as_ref() else {
+            return;
+        };
+        if self.driver_preparation.len() >= 2
+            || self
+                .scripts
+                .as_ref()
+                .and_then(|owner| owner.generation(id))
+                .is_some()
+        {
+            return;
+        }
+        let Some(device) = self
+            .model
+            .devices()
+            .into_iter()
+            .find(|d| d.entry.id == id && d.online && d.removal.is_none())
+        else {
+            return;
+        };
+        let Some(session) = device.session else {
+            return;
+        };
+        let model = self
+            .shared
+            .driver_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .filter(|(current, _, _)| *current == session)
+            .map(|(_, model, t2)| (model.clone(), *t2));
+        let (model, thinq2) = if let Some((model, thinq2)) = model {
+            (model, thinq2)
+        } else if let Some(model) = config.bindings.get(id) {
+            let thinq2 = match &self.server {
+                TransportHandle::ThinQ1(_) => false,
+                TransportHandle::ThinQ2(_) => true,
+                TransportHandle::Mixed { server, .. } => {
+                    server.protocol(&SessionId {
+                        device: id.into(),
+                        generation: session.generation,
+                    }) == Ok(rusthinq_server::Protocol::ThinQ2)
+                }
+            };
+            (model.clone(), thinq2)
+        } else {
+            return;
+        };
+        if self.driver_attempts.get(id) == Some(&(session, model.clone())) {
+            return;
+        }
+        self.driver_attempts
+            .insert(id.into(), (session, model.clone()));
+        self.shared
+            .driver_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.into(), (session, model.clone(), thinq2));
+        let config = config.clone();
+        let id = id.to_string();
+        self.driver_preparation.spawn_blocking(move || {
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                config.prepare(&id, &model, thinq2, true)
+            }))
+            .unwrap_or_else(|_| {
+                Err(rusthinq_scripting::Error::Compile(
+                    "driver preparation panic".into(),
+                ))
+            });
+            (id, session, model, prepared)
+        });
+    }
+    fn buffer_driver(&mut self, id: &SessionId, data: &[u8]) {
+        if self.drivers.is_none()
+            || self
+                .scripts
+                .as_ref()
+                .and_then(|owner| owner.generation(&id.device))
+                .is_some()
+        {
+            return;
+        }
+        let Some(session) = self
+            .model
+            .devices()
+            .iter()
+            .find(|d| d.entry.id == id.device)
+            .and_then(|d| d.session)
+        else {
+            return;
+        };
+        let total: usize = self
+            .driver_buffers
+            .values()
+            .flat_map(|(_, queue)| queue.iter())
+            .map(Vec::len)
+            .sum();
+        if data.len() > 65536 || total.saturating_add(data.len()) > 1_048_576 {
+            self.script_rejected(
+                id.device.clone(),
+                "driver input preparation budget exceeded",
+            );
+            return;
+        }
+        let buffered = self
+            .driver_buffers
+            .entry(id.device.clone())
+            .or_insert_with(|| (session, VecDeque::new()));
+        if buffered.0 != session {
+            *buffered = (session, VecDeque::new());
+        }
+        if buffered.1.len() >= 16 {
+            self.script_rejected(id.device.clone(), "driver input preparation queue exceeded");
+            return;
+        }
+        buffered.1.push_back(data.to_vec());
     }
     /// Refill a reserved ThinQ1 generation budget on the serialized storage worker.
     pub fn with_generation_refill(mut self, count: u64, low_water: u64) -> io::Result<Self> {
@@ -687,6 +1117,73 @@ impl Runtime {
             Err(error) => self.script_rejected(id.device.clone(), error),
         }
     }
+    fn invoke_script(
+        &mut self,
+        device: String,
+        generation: u64,
+        function: String,
+        input: String,
+    ) -> Result<u64, rusthinq_scripting::Error> {
+        let owner = self
+            .scripts
+            .as_mut()
+            .ok_or(rusthinq_scripting::Error::InvalidConfig)?;
+        if self.script_results.len() + self.script_buffer.len() >= self.script_limit {
+            return Err(rusthinq_scripting::Error::Busy);
+        }
+        let sequence = self
+            .script_sequence
+            .checked_add(1)
+            .ok_or(rusthinq_scripting::Error::GenerationExhausted)?;
+        let call = owner.invoke(&self.model.devices(), &device, generation, function, input)?;
+        self.script_sequence = sequence;
+        self.script_order
+            .entry(device.clone())
+            .or_default()
+            .push_back(sequence);
+        self.script_results
+            .spawn(async move { (sequence, device, call.wait().await) });
+        Ok(sequence)
+    }
+    fn fire_timers(&mut self) {
+        let due: Vec<_> = self
+            .script_timers
+            .iter()
+            .filter(|(_, (_, deadline))| *deadline <= Instant::now())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (device, name) in due {
+            let (context, _) = self
+                .script_timers
+                .remove(&(device.clone(), name.clone()))
+                .expect("due timer");
+            if !self.model.devices().iter().any(|d| {
+                d.entry.id == device
+                    && d.session == Some(context.session)
+                    && d.online
+                    && d.removal.is_none()
+            }) {
+                continue;
+            }
+            if self
+                .scripts
+                .as_ref()
+                .and_then(|owner| owner.generation(&device))
+                != Some(context.generation)
+            {
+                continue;
+            }
+            if let Some(function) = self
+                .script_callbacks
+                .get(&device)
+                .and_then(|c| c.timer.clone())
+                && let Err(error) =
+                    self.invoke_script(device.clone(), context.generation, function, name)
+            {
+                self.script_rejected(device, error);
+            }
+        }
+    }
     fn script_result(
         &mut self,
         sequence: u64,
@@ -710,7 +1207,7 @@ impl Runtime {
                 .expect("callback queue")
                 .pop_front();
             if dispatch {
-                self.script_complete(id, completion);
+                self.script_complete(next, id, completion);
             } else {
                 self.script_rejected(id, rusthinq_scripting::Error::Stopped);
             }
@@ -725,6 +1222,7 @@ impl Runtime {
     }
     fn script_complete(
         &mut self,
+        sequence: u64,
         device: String,
         completion: Result<crate::scripts::Completion, rusthinq_scripting::Error>,
     ) {
@@ -748,6 +1246,19 @@ impl Runtime {
                 return;
             }
         };
+        self.emit(Event::ScriptExecuted {
+            sequence,
+            context: context.clone(),
+            error: outcome.error.as_ref().map(|e| format!("{e:?}")),
+        });
+        self.shared
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                device.clone(),
+                (context.session, context.generation, outcome.error.is_some()),
+            );
         for output in outcome.outputs {
             let result = match output {
                 rusthinq_scripting::Output::Publish(payload) => self
@@ -776,6 +1287,38 @@ impl Runtime {
                         }
                     }
                 }
+                rusthinq_scripting::Output::Timer { name, after_ms } => {
+                    let key = (device.clone(), name);
+                    if let Some(after_ms) = after_ms {
+                        if self
+                            .script_callbacks
+                            .get(&device)
+                            .and_then(|c| c.timer.as_ref())
+                            .is_none()
+                        {
+                            Err("timer callback disabled".into())
+                        } else if !self.script_timers.contains_key(&key)
+                            && self
+                                .script_timers
+                                .keys()
+                                .filter(|(id, _)| id == &device)
+                                .count()
+                                >= 64
+                        {
+                            Err("timer capacity exceeded".into())
+                        } else if let Some(deadline) =
+                            Instant::now().checked_add(Duration::from_millis(after_ms))
+                        {
+                            self.script_timers.insert(key, (context.clone(), deadline));
+                            Ok(())
+                        } else {
+                            Err("timer deadline exceeded".into())
+                        }
+                    } else {
+                        self.script_timers.remove(&key);
+                        Ok(())
+                    }
+                }
             };
             if let Err(reason) = result {
                 self.script_rejected(device.clone(), reason);
@@ -792,6 +1335,39 @@ impl Runtime {
         if let Some(scripts) = &mut self.scripts {
             scripts.reconcile(&self.model.devices());
         }
+        let devices = self.model.devices();
+        self.script_timers.retain(|_, (context, _)| {
+            devices.iter().any(|device| {
+                device.entry.id == context.device
+                    && device.session == Some(context.session)
+                    && device.online
+                    && device.removal.is_none()
+            })
+        });
+        self.driver_buffers.retain(|id, (session, _)| {
+            devices
+                .iter()
+                .any(|d| d.entry.id == *id && d.session == Some(*session) && d.removal.is_none())
+        });
+        self.driver_attempts.retain(|id, (session, _)| {
+            devices
+                .iter()
+                .any(|d| d.entry.id == *id && d.session == Some(*session) && d.removal.is_none())
+        });
+        self.shared
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, (session, _, _)| {
+                devices.iter().any(|d| {
+                    d.entry.id == *id && d.session == Some(*session) && d.removal.is_none()
+                })
+            });
+        self.shared
+            .driver_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| devices.iter().any(|d| d.entry.id == *id));
         self.script_callbacks.retain(|id, _| {
             self.model.devices().iter().any(|device| {
                 &device.entry.id == id && device.session.is_some() && device.removal.is_none()
@@ -950,9 +1526,28 @@ impl Runtime {
             return;
         }
         self.input(Input::SessionUp {
-            id: id.device,
+            id: id.device.clone(),
             generation: id.generation,
         });
+        if let Some(metadata) = self
+            .handle()
+            .metadata_snapshot()
+            .into_iter()
+            .find(|metadata| metadata.device_id == id.device)
+            && let Some(session) = self
+                .model
+                .devices()
+                .iter()
+                .find(|d| d.entry.id == id.device)
+                .and_then(|d| d.session)
+        {
+            self.shared
+                .driver_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.device.clone(), (session, metadata.model_name, false));
+        }
+        self.prepare_driver(&id.device);
     }
     fn down(&mut self, id: SessionId) {
         if let Some(device) = self
@@ -1014,6 +1609,9 @@ impl Runtime {
                 }
             }
             if stopping && self.write.is_none() && self.closes.is_empty() {
+                while let Some(result) = self.driver_preparation.join_next().await {
+                    let _ = result.map_err(io::Error::other)?;
+                }
                 if let Some(scripts) = self.scripts.take()
                     && let Err(error) = scripts.shutdown().await
                 {
@@ -1023,6 +1621,10 @@ impl Runtime {
                     });
                 }
                 self.script_attach.close();
+                self.commands.close();
+                while let Ok(command) = self.commands.try_recv() {
+                    command.cancel();
+                }
                 while let Ok(request) = self.script_attach.try_recv() {
                     request.cancel();
                 }
@@ -1045,9 +1647,41 @@ impl Runtime {
                     return Ok(());
                 }
             }
-            let deadline = self.deadline.map(|value| self.epoch + value);
+            let deadline = self
+                .deadline
+                .map(|value| self.epoch + value)
+                .into_iter()
+                .chain(self.script_timers.values().map(|(_, deadline)| *deadline))
+                .min();
             tokio::select! {
                 biased;
+                Some(result)=self.driver_preparation.join_next(), if !self.driver_preparation.is_empty() && !stopping=>{
+                    let (id,session,model,prepared)=result.map_err(io::Error::other)?;
+                    self.reconcile();
+                    let current=self.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none()) && self.driver_attempts.get(&id)==Some(&(session,model));
+                    if current {
+                        let result=match prepared {
+                            Err(error)=>Err(error),
+                            Ok(mut compiled)=>{
+                                compiled.set_consumer_enabled(self.script_sink.is_some());
+                                let reaped=self.scripts.as_mut().expect("driver owner").reap().await;
+                                self.reconcile();
+                                let current=self.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none());
+                                if current && !*stop.borrow() {reaped.and_then(|()|self.scripts.as_mut().expect("driver owner").attach(&self.model.devices(),id.clone(),session,compiled,rusthinq_scripting::worker::Config {capacity:16,input_bytes:131072,source_bytes:524288}))} else {Err(rusthinq_scripting::Error::Stale)}
+                            }
+                        };
+                        if let Err(error)=result {self.script_rejected(id.clone(),error);}
+                        else {
+                            self.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),data_encoding:crate::scripts::DataEncoding::Hex});
+                            self.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(id.clone(),(session,1,false));
+                            if let Err(error)=self.invoke_script(id.clone(),1,"__init".into(),String::new()) {self.script_rejected(id.clone(),error);}
+                            if let Some((buffer_session,queue))=self.driver_buffers.remove(&id) && buffer_session==session {
+                                for data in queue {if let Err(error)=self.invoke_script(id.clone(),1,"__data".into(),rusthinq_protocol::hex::encode(data)) {self.script_rejected(id.clone(),error);break;}}
+                            }
+                        }
+                    }
+                    for device in self.model.devices() {self.prepare_driver(&device.entry.id);}
+                },
                 Some(result) = self.script_deliveries.join_next(), if !self.script_deliveries.is_empty() => {
                     let (context, delivery) = result.map_err(io::Error::other)?;
                     self.emit(Event::ScriptDelivery {context, delivery});
@@ -1057,6 +1691,14 @@ impl Runtime {
                     self.script_result(sequence, device, completion, !stopping && !*stop.borrow() && stop.has_changed().is_ok());
                 }
                 Some(command) = self.script_attach.recv(), if !stopping => match command {
+                ScriptCommand::Invoke {device,session,generation,function,input,result}=>{
+                    if !result.is_closed() {
+                        self.reconcile();
+                        let current=self.model.devices().iter().any(|d|d.entry.id==device && d.session==Some(session) && d.online && d.removal.is_none());
+                        let outcome=if current {self.invoke_script(device,generation,function,input)} else {Err(rusthinq_scripting::Error::Stale)};
+                        let _=result.send(outcome);
+                    }
+                },
                 ScriptCommand::Attach(request) => {
                     let mut request = *request;
                     if !request.result.is_closed() {
@@ -1070,7 +1712,7 @@ impl Runtime {
                         let result = if *stop.borrow() || stop.has_changed().is_err() {
                             Err(rusthinq_scripting::Error::Stopped)
                         } else {reaped.and_then(|()| self.scripts.as_mut().expect("script owner").attach(&self.model.devices(), request.device.clone(), request.session, request.compiled, request.config))};
-                        if result.is_ok() {self.script_callbacks.insert(request.device, request.callbacks);}
+                        if result.is_ok() {self.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(request.device.clone(),(request.session,1,false));self.script_timers.retain(|(id,_),_|id!=&request.device);self.script_callbacks.insert(request.device, request.callbacks);}
                         let _ = request.result.send(result);
                     }
                 },
@@ -1093,6 +1735,7 @@ impl Runtime {
                             device.entry.id == request.device && device.session == Some(request.session) && device.removal.is_none());
                         let result = if *stop.borrow() || stop.has_changed().is_err() {Err(rusthinq_scripting::Error::Stopped)}
                             else if !current {Err(rusthinq_scripting::Error::Stale)} else {result};
+                        if let Ok(generation)=result {self.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(request.device.clone(),(request.session,generation,false));self.script_timers.retain(|(id,_),_|id!=&request.device);}
                         let _ = request.result.send(result);
                     }
                 },
@@ -1126,6 +1769,7 @@ impl Runtime {
                 result = async {self.write.as_mut().expect("write present").await}, if self.write.is_some() => {
                     self.write = None;
                     let (storage,result) = result.map_err(io::Error::other)?;
+                    *self.shared.durable_devices.lock().unwrap_or_else(|e|e.into_inner())=storage.state().ledger.entries.clone();
                     self.storage = Some(storage);
                     match result {
                         WriteResult::Lifecycle(input) => self.input(input),
@@ -1144,8 +1788,50 @@ impl Runtime {
                 result = self.closes.join_next(), if !self.closes.is_empty() => {
                     self.input(result.expect("close task present").map_err(io::Error::other)?);
                 }
-                Some(id) = self.commands.recv(), if !stopping => {
-                    self.forget(id);
+                Some(command) = self.commands.recv(), if !stopping => {
+                    self.reconcile();
+                    match command {
+                        ManagementCommand::Forget(id) => self.forget(id),
+                        ManagementCommand::ForgetScoped {id, incarnation, result} => {
+                            if !result.is_closed() {
+                                if self.model.devices().iter().any(|device| device.entry.id == id && device.entry.incarnation == incarnation) {
+                                    self.forget(id);
+                                    let _ = result.send(Ok(()));
+                                } else {let _ = result.send(Err(rusthinq_server::Reject::StaleSession));}
+                            }
+                        }
+                        ManagementCommand::Send {id, session, payload, result} => {
+                            if !result.is_closed() {
+                                let current = self.model.devices().iter().any(|device| device.entry.id == id && device.session == Some(session) && device.online && device.removal.is_none());
+                                let sent = if current {self.server.send(&SessionId {device:id,generation:session.generation}, &payload)} else {Err(rusthinq_server::Reject::StaleSession)};
+                                let _ = result.send(sent);
+                            }
+                        }
+                        ManagementCommand::Inject {id,session,data,to_device,result}=>{
+                            if !result.is_closed() {
+                                let target=SessionId {device:id.clone(),generation:session.generation};
+                                let current=self.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none()) && self.server.snapshot().contains(&target);
+                                let outcome=if !current {Err(rusthinq_server::Reject::StaleSession)} else {
+                                    match self.server.protocol(&target) {
+                                        Err(error)=>Err(error),
+                                        Ok(protocol)=>{
+                                            if to_device {
+                                                let payload=if protocol==rusthinq_server::Protocol::ThinQ2 {
+                                                    self.shared.message_id.fetch_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|id|id.checked_add(1)).map(|mid|serde_json::json!({"did":id,"mid":mid,"cmd":"packet","type":1,"data":rusthinq_protocol::hex::encode_upper(&data)}).to_string().into_bytes()).map_err(|_|rusthinq_server::Reject::Stopped)
+                                                } else {Ok(data.clone())};
+                                                payload.and_then(|payload|self.server.send(&target,&payload)).map(Some)
+                                            } else {
+                                                let input=if protocol==rusthinq_server::Protocol::ThinQ1 {use base64::Engine;serde_json::json!({"Header":{"x-lgedm-deviceId":id},"Body":{"Cmd":"Mon","Format":"B64","Data":base64::engine::general_purpose::STANDARD.encode(&data)}}).to_string().into_bytes()} else {data.clone()};
+                                                self.script_transport(&TransportEvent::Data(target.clone(),input));Ok(None)
+                                            }
+                                        }
+                                    }
+                                };
+                                if outcome.is_ok() {self.emit(Event::Injected {session:target,data,to_device});}
+                                let _=result.send(outcome);
+                            }
+                        }
+                    }
                 }
                 metadata = async {self.metadata.as_mut().expect("metadata source").recv().await}, if !stopping && self.metadata.is_some() => {
                     match metadata {Some(metadata)=>self.observe_metadata(metadata),None=>self.metadata=None}
@@ -1171,6 +1857,13 @@ impl Runtime {
                                 self.emit(Event::Rejected {device:id.device.clone(), reason:format!("local endpoint protection: {error}")});
                             }
                             self.script_transport(&event);
+                            if let TransportEvent::Ready(id,deploy)=&event
+                                && let Some(session)=self.model.devices().iter().find(|d|d.entry.id==id.device).and_then(|d|d.session)
+                                && let Some(model)=deploy["kind"].as_str() {
+                                self.shared.driver_models.lock().unwrap_or_else(|e|e.into_inner()).insert(id.device.clone(),(session,model.to_string(),true));
+                                self.prepare_driver(&id.device);
+                            }
+                            if let TransportEvent::Data(id,data)=&event {self.buffer_driver(id,data);}
                             self.emit(Event::Transport(event));
                         }
                     },
@@ -1182,7 +1875,7 @@ impl Runtime {
                 },
                 _ = async {
                     match deadline {Some(deadline) => tokio::time::sleep_until(deadline).await,None => std::future::pending().await}
-                }, if !stopping => self.input(Input::Tick),
+                }, if !stopping => {self.input(Input::Tick);self.fire_timers();},
             }
         }
     }

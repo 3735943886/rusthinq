@@ -52,6 +52,7 @@ pub struct Callbacks {
     pub response: Option<String>,
     pub data: Option<String>,
     pub ready: Option<String>,
+    pub timer: Option<String>,
     pub data_encoding: DataEncoding,
 }
 #[derive(Clone, Debug, Default)]

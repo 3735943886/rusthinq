@@ -5,4 +5,8 @@ pub mod thinq1;
 pub mod thinq2;
 
 pub mod client_hello;
+pub mod crc16;
+pub mod hex;
 pub mod mqtt;
+pub mod tlv;
+pub mod tlv_catalog;

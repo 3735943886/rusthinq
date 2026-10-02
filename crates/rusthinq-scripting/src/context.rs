@@ -13,20 +13,35 @@ pub struct Config {
     pub state_keys: usize,
     /// Logical value/key budget; excludes allocator overhead.
     pub state_bytes: usize,
+    pub model_name: String,
+    pub sw_version: String,
+    pub topic_prefix: String,
+    pub il_prefix: Option<String>,
+    pub thinq2: bool,
+    pub driver_api: bool,
+    pub message_seed: i64,
 }
 impl Config {
     pub fn new(device: String, model: String) -> Self {
         Self {
             device,
+            model_name: model.clone(),
             model,
             state_keys: 64,
             state_bytes: 65536,
+            sw_version: String::new(),
+            topic_prefix: "rusthinq".into(),
+            il_prefix: None,
+            thinq2: false,
+            driver_api: false,
+            message_seed: 0,
         }
     }
 }
 struct State {
     values: BTreeMap<String, (Dynamic, usize)>,
     bytes: usize,
+    next_id: i64,
 }
 #[derive(Clone)]
 pub(crate) struct Context {
@@ -41,19 +56,71 @@ impl Context {
             || config.state_keys == 0
             || config.state_keys > 1024
             || config.state_bytes == 0
+            || config.topic_prefix.is_empty()
+            || config.topic_prefix.len() > 256
+            || config.topic_prefix.contains(['#', '+', '\0'])
+            || config
+                .il_prefix
+                .as_ref()
+                .is_some_and(|p| p.is_empty() || p.len() > 256 || p.contains(['#', '+', '\0']))
+            || config.model_name.len() > string_bytes
+            || config.sw_version.len() > string_bytes
+            || config.message_seed < 0
         {
             return Err(Error::InvalidConfig);
         }
+        let next_id = config.message_seed;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(Mutex::new(State {
                 values: BTreeMap::new(),
                 bytes: 0,
+                next_id,
             })),
         })
     }
     pub(crate) fn device(&self) -> &str {
         &self.config.device
+    }
+    pub(crate) fn driver_api(&self) -> bool {
+        self.config.driver_api
+    }
+    pub(crate) fn wire(
+        &self,
+        cmd: &str,
+        msg_type: i64,
+        data: serde_json::Value,
+    ) -> Result<String, Box<EvalAltResult>> {
+        if !self.config.thinq2 {
+            return Err("ThinQ2 send requested on ThinQ1".into());
+        }
+        let mid = self.message_id()?;
+        Ok(serde_json::json!({"did":self.config.device,"mid":mid,"cmd":cmd,"type":msg_type,"data":data}).to_string())
+    }
+    fn message_id(&self) -> Result<i64, Box<EvalAltResult>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or("message identifier exhausted")?;
+        Ok(state.next_id)
+    }
+    pub(crate) fn json(&self, text: String) -> Result<String, Box<EvalAltResult>> {
+        if !self.config.driver_api {
+            return Ok(text);
+        }
+        if self.config.thinq2 {
+            return Err("ThinQ1 send requested on ThinQ2".into());
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let object = body
+            .as_object_mut()
+            .ok_or("ThinQ1 body must be an object")?;
+        object.insert("CmdWId".into(), format!("n-{}", self.message_id()?).into());
+        Ok(
+            serde_json::json!({"Header":{"x-lgedm-deviceId":self.config.device},"Body":body})
+                .to_string(),
+        )
     }
     fn set(&mut self, key: String, value: Dynamic) -> Result<(), Box<EvalAltResult>> {
         if key.is_empty() {
@@ -124,6 +191,24 @@ pub(crate) fn install(engine: &mut Engine) {
     engine.register_type_with_name::<Context>("DeviceContext");
     engine.register_fn("id", |ctx: &mut Context| ctx.config.device.clone());
     engine.register_fn("model_id", |ctx: &mut Context| ctx.config.model.clone());
+    engine.register_fn("model_name", |ctx: &mut Context| {
+        ctx.config.model_name.clone()
+    });
+    engine.register_fn("sw_version", |ctx: &mut Context| {
+        ctx.config.sw_version.clone()
+    });
+    engine.register_fn("device_topic", |ctx: &mut Context| {
+        format!("{}/{}", ctx.config.topic_prefix, ctx.config.device)
+    });
+    engine.register_fn("il_topic", |ctx: &mut Context| {
+        ctx.config
+            .il_prefix
+            .as_ref()
+            .map_or(String::new(), |prefix| {
+                format!("{prefix}/{}", ctx.config.device)
+            })
+    });
+    engine.register_fn("is_thinq2", |ctx: &mut Context| ctx.config.thinq2);
     engine.register_fn("state_set", Context::set);
     engine.register_fn("state_get", |ctx: &mut Context, key: String| {
         ctx.state

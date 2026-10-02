@@ -1,4 +1,5 @@
 //! L5 bounded, IL-agnostic Rhai execution. The caller owns worker scheduling and sinks.
+mod codecs;
 pub mod context;
 pub mod modules;
 pub mod worker;
@@ -31,6 +32,7 @@ impl Default for Limits {
 pub enum Output {
     Publish(String),
     Send(String),
+    Timer { name: String, after_ms: Option<u64> },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -59,6 +61,14 @@ struct Buffer {
     consumer: bool,
 }
 impl Buffer {
+    fn timer(&mut self, name: String, after_ms: Option<u64>) -> Result<(), Box<EvalAltResult>> {
+        if name.is_empty() || name.len() > 256 {
+            return Err("invalid timer name".into());
+        }
+        self.emit(format!("timer:{name}:{after_ms:?}"), false)?;
+        *self.outputs.last_mut().expect("admitted timer") = Output::Timer { name, after_ms };
+        Ok(())
+    }
     fn emit(&mut self, value: String, publish: bool) -> Result<(), Box<EvalAltResult>> {
         if self.preparing {
             return Err("module initialization output forbidden".into());
@@ -86,6 +96,7 @@ impl Buffer {
     }
 }
 pub struct Compiled {
+    support_ast: Option<AST>,
     invocation_ast: Option<AST>,
     source_bytes: usize,
     modules_loaded: bool,
@@ -106,7 +117,8 @@ impl Compiled {
         let ctx = context::Context::new(config, limits.string_bytes)?;
         let mut compiled = Self::new(source, limits, consumer_enabled)?;
         context::install(&mut compiled.engine);
-        for (name, publish) in [("publish", true), ("send", false), ("send_json", false)] {
+        codecs::install(&mut compiled.engine);
+        for (name, publish) in [("publish", true), ("send", false)] {
             let buffer = compiled.buffer.clone();
             compiled.engine.register_fn(
                 name,
@@ -120,11 +132,141 @@ impl Compiled {
                 },
             );
         }
+        let buffer = compiled.buffer.clone();
+        compiled.engine.register_fn(
+            "send_json",
+            move |ctx: &mut context::Context, text: String| -> Result<(), Box<EvalAltResult>> {
+                let text = ctx.json(text)?;
+                buffer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .emit(text, false)
+            },
+        );
+        if ctx.driver_api() {
+            let buffer = compiled.buffer.clone();
+            compiled.engine.register_fn(
+                "send_raw",
+                move |ctx: &mut context::Context,
+                      bytes: rhai::Blob|
+                      -> Result<(), Box<EvalAltResult>> {
+                    let text = ctx.wire(
+                        "packet",
+                        1,
+                        rusthinq_protocol::hex::encode_upper(bytes).into(),
+                    )?;
+                    buffer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .emit(text, false)
+                },
+            );
+            let buffer = compiled.buffer.clone();
+            compiled.engine.register_fn(
+                "send_clip",
+                move |ctx: &mut context::Context,
+                      cmd: String,
+                      msg_type: i64,
+                      text: String|
+                      -> Result<(), Box<EvalAltResult>> {
+                    let data: serde_json::Value =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    let text = ctx.wire(&cmd, msg_type, data)?;
+                    buffer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .emit(text, false)
+                },
+            );
+        }
+        for cancel in [false, true] {
+            let buffer = compiled.buffer.clone();
+            if cancel {
+                compiled.engine.register_fn(
+                    "cancel_timer",
+                    move |_ctx: &mut context::Context, name: String| {
+                        buffer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .timer(name, None)
+                    },
+                );
+            } else {
+                compiled.engine.register_fn(
+                    "set_timer",
+                    move |_ctx: &mut context::Context, name: String, after_ms: i64| {
+                        buffer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .timer(name, Some(after_ms.max(0) as u64))
+                    },
+                );
+            }
+        }
         compiled.context = Some(ctx);
         Ok(compiled)
     }
+    /// Install caller-owned Rhai helpers globally (also visible inside modules).
+    /// Semantic helpers stay in scripts; initialization cannot send/publish.
+    pub fn with_support(mut self, source: &str) -> Result<Self, Error> {
+        let total = self
+            .source_bytes
+            .checked_add(source.len())
+            .filter(|n| *n <= self.limits.source_bytes)
+            .ok_or(Error::InvalidConfig)?;
+        self.buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preparing = true;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ast = self
+                .engine
+                .compile(source)
+                .map_err(|e| Error::Compile(e.to_string()))?;
+            if !ast.statements().is_empty() {
+                return Err(Error::Compile(
+                    "support source must contain only functions".into(),
+                ));
+            }
+            let module = rhai::Module::eval_ast_as_new(Scope::new(), &ast, &self.engine)
+                .map_err(|e| Error::Compile(e.to_string()))?;
+            Ok::<_, Error>((ast, module))
+        }));
+        self.buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preparing = false;
+        let (ast, module) =
+            prepared.map_err(|_| Error::Compile("support initialization panic".into()))??;
+        self.ast = self.ast.merge(&ast);
+        self.support_ast = Some(ast);
+        self.engine.register_global_module(module.into());
+        self.source_bytes = total;
+        Ok(self)
+    }
     pub fn context_device(&self) -> Option<&str> {
         self.context.as_ref().map(|ctx| ctx.device())
+    }
+    pub fn has_function(&self, name: &str, arguments: usize) -> bool {
+        self.ast
+            .iter_functions()
+            .any(|function| function.name == name && function.params.len() == arguments)
+    }
+    pub fn with_entry(mut self, source: &str) -> Result<Self, Error> {
+        self.source_bytes = self
+            .source_bytes
+            .checked_add(source.len())
+            .filter(|n| *n <= self.limits.source_bytes)
+            .ok_or(Error::InvalidConfig)?;
+        let entry = self
+            .engine
+            .compile(source)
+            .map_err(|e| Error::Compile(e.to_string()))?;
+        if !entry.statements().is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        self.ast = self.ast.merge(&entry);
+        Ok(self)
     }
     /// Configure the actual consumer before attaching this compiled generation.
     pub fn set_consumer_enabled(&mut self, enabled: bool) {
@@ -155,6 +297,7 @@ impl Compiled {
         let mut engine = Engine::new();
         engine.set_module_resolver(StaticModuleResolver::new());
         engine
+            .set_max_expr_depths(200, 100)
             .set_max_operations(limits.operations)
             .set_max_string_size(limits.string_bytes)
             .set_max_array_size(1024)
@@ -176,6 +319,7 @@ impl Compiled {
             .compile(source)
             .map_err(|error| Error::Compile(error.to_string()))?;
         Ok(Self {
+            support_ast: None,
             invocation_ast: None,
             source_bytes: source.len(),
             modules_loaded: false,

@@ -21,6 +21,9 @@ async fn main() -> io::Result<()> {
     let mut events = daemon.handle().subscribe();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     eprintln!("device endpoints: {:?}", daemon.endpoints());
+    if let Some(address) = daemon.management_endpoint() {
+        eprintln!("management endpoint: http://{address}");
+    }
     let serving = daemon.serve(stopped);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);

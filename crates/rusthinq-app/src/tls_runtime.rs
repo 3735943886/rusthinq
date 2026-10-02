@@ -58,6 +58,14 @@ impl Service {
         self.runtime = self.runtime.with_script_sink(sink);
         self
     }
+    pub fn with_external_mqtt(mut self, handle: crate::external_mqtt::Handle) -> Self {
+        self.runtime = self.runtime.with_external_mqtt(handle);
+        self
+    }
+    pub fn with_drivers(mut self, config: crate::drivers::Config) -> io::Result<Self> {
+        self.runtime = self.runtime.with_drivers(config)?;
+        Ok(self)
+    }
     /// Add bounded L3 HTTPS services (e.g. ThinQ1 metadata or provisioning).
     pub fn with_local_service(
         mut self,

@@ -21,6 +21,168 @@ use tokio::{
 struct ScriptSink(mpsc::Sender<(Context, String)>);
 
 #[tokio::test]
+async fn completed_provisioning_auto_loads_real_driver_without_external_mqtt() {
+    auto_driver(false).await;
+}
+#[tokio::test]
+async fn real_driver_external_publications_have_durable_inventory_and_delete_routes() {
+    auto_driver(true).await;
+}
+async fn auto_driver(external: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let mut runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
+        .unwrap()
+        .with_drivers(rusthinq_app::drivers::Config {
+            directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/drivers"),
+            topic_prefix: "rusthinq".into(),
+            il_prefix: Some("ildevice".into()),
+            bindings: Default::default(),
+        })
+        .unwrap();
+    let external_stop = watch::channel(false);
+    let mut adapter_task = None;
+    let mut remote_task = None;
+    let mut confirmed = None;
+    if external {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inventory = directory.path().join("retained.json");
+        let (sink, adapter) =
+            rusthinq_app::external_mqtt::new(rusthinq_app::external_mqtt::Config {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                tls: false,
+                ca: None,
+                client: "real-driver".into(),
+                username: None,
+                password: None,
+                inventory: inventory.clone(),
+            })
+            .unwrap();
+        runtime = runtime.with_external_mqtt(sink.clone());
+        adapter_task = Some(tokio::spawn(
+            adapter.run(runtime.handle(), external_stop.1.clone()),
+        ));
+        let (sent, received) = tokio::sync::oneshot::channel();
+        confirmed = Some((received, sink));
+        remote_task = Some(tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            async fn frame(peer: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+                let header = peer.read_u8().await?;
+                let mut len = 0usize;
+                let mut shift = 0;
+                loop {
+                    let byte = peer.read_u8().await?;
+                    len |= usize::from(byte & 127) << shift;
+                    if byte & 128 == 0 {
+                        break;
+                    }
+                    shift += 7;
+                    assert!(shift <= 21);
+                }
+                let mut bytes = vec![0; len];
+                peer.read_exact(&mut bytes).await?;
+                Ok((header, bytes))
+            }
+            assert_eq!(frame(&mut peer).await.unwrap().0, 0x10);
+            peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+            let mut publications = 0;
+            let mut sent = Some(sent);
+            while let Ok((header, body)) = frame(&mut peer).await {
+                assert_eq!(header, 0x33);
+                let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                let topic = std::str::from_utf8(&body[2..2 + length]).unwrap();
+                let saved: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&inventory).unwrap()).unwrap();
+                assert!(
+                    saved["pending"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["topic"] == topic)
+                );
+                let id = &body[2 + length..4 + length];
+                peer.write_all(&[0x40, 2, id[0], id[1]]).await.unwrap();
+                if body.len() > 4 + length {
+                    publications += 1;
+                }
+                if publications == 2
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
+                }
+            }
+            publications
+        }));
+    }
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let running = broker.clone();
+    let device = tokio::spawn(async move { running.run(stream).await.unwrap() });
+    connect(&mut peer).await;
+    publish(
+        &mut peer,
+        "clip/provisioning/devices/d",
+        json!({"did":"d","cmd":"deploy","kind":"D140110","data":{}}),
+    )
+    .await;
+    packet(&mut peer).await;
+    publish(
+        &mut peer,
+        "clip/message/devices/d",
+        json!({"did":"d","cmd":"completeProvisioning_ack"}),
+    )
+    .await;
+    until(&mut events,|event|matches!(event,Event::ScriptOutput {payload,context:Context {generation:1,..}} if serde_json::from_str::<serde_json::Value>(payload).unwrap()["topic"]=="ildevice/d")).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    if !external {
+        handle
+            .invoke_script(
+                "d".into(),
+                session,
+                1,
+                "__command".into(),
+                json!({"prop":"unknown","value":"x"}).to_string(),
+            )
+            .await
+            .unwrap();
+        until(&mut events,|event|matches!(event,Event::ScriptOutput {payload,..} if serde_json::from_str::<serde_json::Value>(payload).unwrap()["topic"]=="rusthinq/d/reject")).await;
+    }
+    assert_eq!(handle.driver_models()["d"].1, "D140110");
+    assert_eq!(handle.script_states()["d"].1, 1);
+    if let Some((received, sink)) = confirmed {
+        timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner =
+            rusthinq_app::lifecycle_cleanup::device_owner("d", session.incarnation).unwrap();
+        assert_eq!(sink.delete_owner(owner).await.unwrap(), 2);
+        external_stop.0.send_replace(true);
+        adapter_task.unwrap().await.unwrap().unwrap();
+        assert_eq!(remote_task.unwrap().await.unwrap(), 2);
+        assert!(
+            rusthinq_app::retained_cleanup::Ledger::open(
+                &directory.path().join("retained.json"),
+                4
+            )
+            .unwrap()
+            .pending()
+            .is_empty()
+        );
+    }
+    broker.stop();
+    device.await.unwrap();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn completed_local_provisioning_protects_endpoints_from_firmware_learning() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();

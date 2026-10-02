@@ -1,5 +1,5 @@
 //! Owned retained records and explicit cleanup manifests. No network publication.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Includes the device ID plus incarnation and namespace metadata.
 pub const MAX_OWNER_BYTES: usize = 512;
@@ -176,6 +176,7 @@ pub struct Cleanup {
     capacity: usize,
     next: u64,
     pending: BTreeMap<String, (Tombstone, Option<u64>)>,
+    deleting: BTreeSet<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
@@ -191,6 +192,7 @@ impl Cleanup {
             capacity,
             next: 0,
             pending: BTreeMap::new(),
+            deleting: BTreeSet::new(),
         })
     }
     /// Atomic batch admission; replacement invalidates any older send result.
@@ -221,6 +223,7 @@ impl Cleanup {
         let (deletion, attempt) = self.pending.get_mut(topic).ok_or(Error::Invalid)?;
         let next = self.next.checked_add(1).ok_or(Error::Capacity)?;
         self.next = next;
+        self.deleting.insert(topic.into());
         *attempt = Some(next);
         Ok(Attempt {
             token: next,
@@ -241,6 +244,7 @@ impl Cleanup {
         }
         if broker_confirmed {
             self.pending.remove(&attempt.deletion.topic);
+            self.deleting.remove(&attempt.deletion.topic);
         } else if let Some((_, token)) = self.pending.get_mut(&attempt.deletion.topic) {
             *token = None;
         }
@@ -252,8 +256,36 @@ impl Cleanup {
             .map(|(deletion, _)| deletion.clone())
             .collect()
     }
+    /// Persist the complete deletion intent before sending any member of a batch.
+    pub fn request_delete(&mut self, deletions: &[Tombstone]) -> Result<(), Error> {
+        if deletions.iter().any(|deletion| {
+            self.pending
+                .get(&deletion.topic)
+                .is_none_or(|(owned, _)| owned != deletion)
+        }) {
+            return Err(Error::OwnerConflict);
+        }
+        for deletion in deletions {
+            self.deleting.insert(deletion.topic.clone());
+            self.pending
+                .get_mut(&deletion.topic)
+                .expect("validated owner")
+                .1 = None;
+        }
+        Ok(())
+    }
+    pub fn requested(&self) -> Vec<Tombstone> {
+        self.deleting
+            .iter()
+            .filter_map(|topic| {
+                self.pending
+                    .get(topic)
+                    .map(|(deletion, _)| deletion.clone())
+            })
+            .collect()
+    }
     pub fn checkpoint(&self) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({"version":1,"next":self.next,"pending":self.pending.values().map(|(deletion, _)| serde_json::json!({"owner":deletion.owner,"topic":deletion.topic})).collect::<Vec<_>>()})).expect("JSON values")
+        serde_json::to_vec(&serde_json::json!({"version":2,"next":self.next,"pending":self.pending.values().map(|(deletion, _)| serde_json::json!({"owner":deletion.owner,"topic":deletion.topic})).collect::<Vec<_>>(),"deleting":self.deleting})).expect("JSON values")
     }
     /// Reject malformed/unbounded recovery data; interrupted attempts are never restored.
     pub fn restore(capacity: usize, bytes: &[u8]) -> Result<Self, Error> {
@@ -265,7 +297,8 @@ impl Cleanup {
             return Err(Error::Capacity);
         }
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| Error::Invalid)?;
-        if value["version"].as_u64() != Some(1) {
+        let version = value["version"].as_u64();
+        if !matches!(version, Some(1 | 2)) {
             return Err(Error::Invalid);
         }
         let mut ledger = Self::new(capacity)?;
@@ -283,6 +316,18 @@ impl Cleanup {
                 return Err(Error::Invalid);
             }
             ledger.enqueue(&[deletion])?;
+        }
+        if version == Some(2) {
+            let deleting = value["deleting"].as_array().ok_or(Error::Invalid)?;
+            if deleting.len() > capacity {
+                return Err(Error::Capacity);
+            }
+            for topic in deleting {
+                let topic = topic.as_str().ok_or(Error::Invalid)?;
+                if !ledger.pending.contains_key(topic) || !ledger.deleting.insert(topic.into()) {
+                    return Err(Error::Invalid);
+                }
+            }
         }
         Ok(ledger)
     }

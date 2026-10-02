@@ -30,11 +30,35 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         ca_key: key_path,
         device_ledger: dir.path().join("devices.json"),
         legacy_tls: false,
+        management: Some(rusthinq_app::management::Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            gui: true,
+            credentials: None,
+            raw_inject: false,
+        }),
+        drivers: None,
+        external_mqtt: None,
     };
     let daemon = Daemon::prepare(config).await.unwrap();
     let (_, mqtt, http) = daemon.endpoints();
+    let management = daemon.management_endpoint().unwrap();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(daemon.serve(stopped));
+    let mut dashboard = TcpStream::connect(management).await.unwrap();
+    dashboard
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut page = Vec::new();
+    timeout(Duration::from_secs(3), dashboard.read_to_end(&mut page))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8(page)
+            .unwrap()
+            .contains("management panel")
+    );
     let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
     connector
         .cert_store_mut()
@@ -117,6 +141,9 @@ async fn bind_failure_does_not_create_lifecycle_checkpoint() {
         ca_key: dir.path().join("not-loaded-key.pem"),
         device_ledger: ledger.clone(),
         legacy_tls: false,
+        management: None,
+        drivers: None,
+        external_mqtt: None,
     };
     assert!(
         matches!(Daemon::prepare(config).await, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse)

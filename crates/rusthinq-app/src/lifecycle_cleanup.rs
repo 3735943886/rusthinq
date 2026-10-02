@@ -31,7 +31,7 @@ pub async fn recover<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(ledger)
 }
 
-fn parse_owner(owner: &str) -> Option<(&str, u64)> {
+pub(crate) fn parse_owner(owner: &str) -> Option<(&str, u64)> {
     let (length, rest) = owner.strip_prefix("device/")?.split_once(':')?;
     let length: usize = length.parse().ok()?;
     let id = rest.get(..length)?;
