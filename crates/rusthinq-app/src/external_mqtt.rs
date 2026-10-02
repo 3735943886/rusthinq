@@ -8,9 +8,12 @@ use crate::{
 };
 use openssl::ssl::{SslConnector, SslMethod};
 use rusthinq_server::retained::Tombstone;
-trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait Connection:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
-type Transport = Box<dyn Connection>;
+pub(crate) type Transport = Box<dyn Connection>;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -75,7 +78,7 @@ impl Config {
         }
         Ok(())
     }
-    async fn connect(&self) -> io::Result<Session<Transport>> {
+    pub(crate) async fn connect(&self) -> io::Result<Session<Transport>> {
         let config = self.clone();
         let connector = tokio::task::spawn_blocking(move || -> io::Result<Option<SslConnector>> {
             if !config.tls {
@@ -134,6 +137,7 @@ pub enum Status {
 }
 #[derive(Clone)]
 struct Publication {
+    retired: bool,
     context: Context,
     owner: String,
     topic: String,
@@ -165,6 +169,7 @@ struct Shared {
     transient: mpsc::Sender<Publication>,
     removals: mpsc::Sender<Removal>,
     status: watch::Sender<Status>,
+    flushed: watch::Sender<u64>,
 }
 #[derive(Clone)]
 pub struct Handle(Arc<Shared>);
@@ -188,6 +193,7 @@ pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
         transient,
         removals,
         status: watch::channel(Status::Connecting).0,
+        flushed: watch::channel(0).0,
     });
     Ok((
         Handle(shared.clone()),
@@ -200,6 +206,27 @@ pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
     ))
 }
 impl Handle {
+    /// Wait for admitted output to be confirmed or fenced away. Caller bounds the wait.
+    pub async fn flush(&self) -> io::Result<()> {
+        let mut flushed = self.0.flushed.subscribe();
+        let mut status = self.status();
+        let target = self.0.cache.lock().unwrap_or_else(|e| e.into_inner()).next;
+        loop {
+            if *flushed.borrow() >= target {
+                return Ok(());
+            }
+            if matches!(*status.borrow(), Status::Stopped) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "MQTT adapter stopped before flush",
+                ));
+            }
+            tokio::select! {
+                result=flushed.changed()=>{result.map_err(io::Error::other)?;},
+                result=status.changed()=>{result.map_err(io::Error::other)?;},
+            }
+        }
+    }
     pub fn status(&self) -> watch::Receiver<Status> {
         self.0.status.subscribe()
     }
@@ -229,8 +256,11 @@ impl Handle {
             .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.to_string()))
     }
 }
-impl PublishSink for Handle {
-    fn try_publish(&self, context: &Context, payload: String) -> Result<(), String> {
+impl Handle {
+    fn publish(&self, context: &Context, payload: String, retired: bool) -> Result<(), String> {
+        if matches!(*self.0.status.borrow(), Status::Stopped) {
+            return Err("MQTT adapter stopped".into());
+        }
         let message: Value = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
         let topic = message["topic"]
             .as_str()
@@ -258,6 +288,7 @@ impl PublishSink for Handle {
             .checked_add(1)
             .ok_or("publication sequence exhausted")?;
         let message = Publication {
+            retired,
             context: context.clone(),
             owner,
             topic: topic.clone(),
@@ -291,7 +322,25 @@ impl PublishSink for Handle {
         Ok(())
     }
 }
+impl PublishSink for Handle {
+    fn try_publish(&self, context: &Context, payload: String) -> Result<(), String> {
+        self.publish(context, payload, false)
+    }
+    fn try_publish_retired(&self, context: &Context, payload: String) -> Result<(), String> {
+        self.publish(context, payload, true)
+    }
+}
 fn valid_scope(app: &Application, message: &Publication) -> bool {
+    if message.retired {
+        return app.retired_script(&message.context.device).as_ref() == Some(&message.context)
+            && app.snapshot().iter().any(|device| {
+                device.entry.id == message.context.device
+                    && device.entry.incarnation == message.context.session.incarnation
+                    && device.entry.last_generation == message.context.session.generation
+                    && device.session.is_none()
+                    && device.removal.is_none()
+            });
+    }
     app.snapshot().iter().any(|device| {
         device.entry.id == message.context.device
             && device.session == Some(message.context.session)
@@ -431,7 +480,7 @@ impl Runtime {
                 if !current(app, &message) {
                     continue;
                 }
-                if scopes.get(&message.owner) != Some(&message.context) {
+                if !message.retired && scopes.get(&message.owner) != Some(&message.context) {
                     let old: Vec<_> = ledger
                         .pending()
                         .into_iter()
@@ -486,6 +535,16 @@ impl Runtime {
             }
             if progress {
                 continue;
+            }
+            if self.transient.is_empty() {
+                let cache = self.shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+                if cache
+                    .values
+                    .values()
+                    .all(|value| versions.get(&value.topic) == Some(&value.version))
+                {
+                    self.shared.flushed.send_replace(cache.next);
+                }
             }
             tokio::select! {
                 _=stop.changed()=>return Ok(()),

@@ -46,6 +46,9 @@ impl Completion {
 /// retained MQTT adapters must durably inventory ownership before publication.
 pub trait PublishSink: Send + Sync {
     fn try_publish(&self, context: &Context, payload: String) -> Result<(), String>;
+    fn try_publish_retired(&self, context: &Context, payload: String) -> Result<(), String> {
+        self.try_publish(context, payload)
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct Callbacks {
@@ -53,6 +56,7 @@ pub struct Callbacks {
     pub data: Option<String>,
     pub ready: Option<String>,
     pub timer: Option<String>,
+    pub shutdown: Option<String>,
     pub data_encoding: DataEncoding,
 }
 #[derive(Clone, Debug, Default)]
@@ -96,10 +100,35 @@ pub struct Owner {
     next_binding: u64,
     capacity: usize,
     workers: BTreeMap<String, Owned>,
-    retiring: Vec<Worker>,
+    retiring: Vec<(Context, Worker)>,
+    reaping: tokio::task::JoinSet<Result<(Context, Option<Outcome>), Error>>,
     stopped: bool,
 }
 impl Owner {
+    pub fn set_shutdown_callback(&self, id: &str, function: Option<String>) -> Result<(), Error> {
+        self.workers
+            .get(id)
+            .ok_or(Error::Stale)?
+            .worker
+            .handle()
+            .set_shutdown_callback(function)
+    }
+    fn retire(&mut self, id: String, owned: Owned) {
+        let generation = match *owned.worker.handle().status().borrow() {
+            rusthinq_scripting::worker::Status::Running { generation }
+            | rusthinq_scripting::worker::Status::Faulted { generation, .. }
+            | rusthinq_scripting::worker::Status::Stopped { generation } => generation,
+        };
+        owned.worker.handle().request_stop();
+        self.retiring.push((
+            Context {
+                device: id,
+                session: owned.session,
+                generation,
+            },
+            owned.worker,
+        ));
+    }
     pub fn generation(&self, id: &str) -> Option<u64> {
         self.workers
             .get(id)
@@ -121,6 +150,7 @@ impl Owner {
             capacity,
             workers: BTreeMap::new(),
             retiring: Vec::new(),
+            reaping: tokio::task::JoinSet::new(),
             stopped: false,
         })
     }
@@ -151,9 +181,7 @@ impl Owner {
         if compiled.context_device().is_some_and(|device| device != id) {
             return Err(Error::InvalidConfig);
         }
-        if self.workers.contains_key(&id)
-            || self.workers.len() + self.retiring.len() >= self.capacity
-        {
+        if self.workers.contains_key(&id) || !self.can_attach() {
             return Err(Error::Busy);
         }
         let next = self
@@ -182,8 +210,7 @@ impl Owner {
             .collect();
         for id in stale {
             let owned = self.workers.remove(&id).expect("selected worker");
-            owned.worker.handle().request_stop();
-            self.retiring.push(owned.worker);
+            self.retire(id, owned);
         }
     }
     pub fn invoke(
@@ -257,20 +284,65 @@ impl Owner {
     }
     /// Join retired workers before making their budget available to successors.
     pub async fn reap(&mut self) -> Result<(), Error> {
+        self.reap_with_outputs().await.map(|_| ())
+    }
+    pub fn can_attach(&self) -> bool {
+        self.workers.len() + self.retiring.len() + self.reaping.len() < self.capacity
+    }
+    pub fn retirement_pending(&self) -> bool {
+        !self.retiring.is_empty() || !self.reaping.is_empty()
+    }
+    pub fn has_reaping(&self) -> bool {
+        !self.reaping.is_empty()
+    }
+    pub fn start_reaping(&mut self) {
+        for (mut context, worker) in std::mem::take(&mut self.retiring) {
+            self.reaping.spawn(async move {
+                let output = worker.shutdown_with_output().await?;
+                if let Some(outcome) = &output {
+                    context.generation = outcome.generation;
+                }
+                Ok((context, output))
+            });
+        }
+    }
+    pub fn try_reap_next(&mut self) -> Option<Result<(Context, Option<Outcome>), Error>> {
+        self.reaping.try_join_next().map(|result| {
+            result
+                .map_err(|error| Error::Worker(error.to_string()))
+                .and_then(|result| result)
+        })
+    }
+    pub async fn reap_next(&mut self) -> Option<Result<(Context, Option<Outcome>), Error>> {
+        self.reaping.join_next().await.map(|result| {
+            result
+                .map_err(|error| Error::Worker(error.to_string()))
+                .and_then(|result| result)
+        })
+    }
+    pub async fn reap_with_outputs(&mut self) -> Result<Vec<(Context, Outcome)>, Error> {
+        self.start_reaping();
+        let mut outputs = Vec::new();
         let mut failure = None;
-        while let Some(worker) = self.retiring.pop() {
-            if let Err(error) = worker.shutdown().await {
-                failure.get_or_insert(error);
+        while let Some(result) = self.reap_next().await {
+            match result {
+                Ok((context, Some(outcome))) => outputs.push((context, outcome)),
+                Ok((_, None)) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(outputs), Err)
     }
-    pub async fn shutdown(mut self) -> Result<(), Error> {
+    pub async fn shutdown(self) -> Result<(), Error> {
+        self.shutdown_with_outputs().await.map(|_| ())
+    }
+    pub async fn shutdown_with_outputs(mut self) -> Result<Vec<(Context, Outcome)>, Error> {
         self.stopped = true;
-        for (_, owned) in std::mem::take(&mut self.workers) {
-            owned.worker.handle().request_stop();
-            self.retiring.push(owned.worker);
+        for (id, owned) in std::mem::take(&mut self.workers) {
+            self.retire(id, owned);
         }
-        self.reap().await
+        self.reap_with_outputs().await
     }
 }

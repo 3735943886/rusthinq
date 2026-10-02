@@ -32,6 +32,7 @@ pub struct Config {
     pub management: Option<crate::management::Config>,
     pub drivers: Option<crate::drivers::Config>,
     pub external_mqtt: Option<crate::external_mqtt::Config>,
+    pub cloud_account: Option<PathBuf>,
 }
 impl Config {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -57,6 +58,7 @@ impl Config {
                 "management",
                 "drivers",
                 "external_mqtt",
+                "cloud_account",
             ]
             .contains(&key.as_str())
             {
@@ -145,7 +147,14 @@ impl Config {
                     .as_object()
                     .ok_or_else(|| invalid("drivers must be an object"))?;
                 if fields.keys().any(|key| {
-                    !["directory", "topic_prefix", "il_prefix", "bindings"].contains(&key.as_str())
+                    ![
+                        "directory",
+                        "topic_prefix",
+                        "il_prefix",
+                        "bindings",
+                        "watch",
+                    ]
+                    .contains(&key.as_str())
                 }) {
                     return Err(invalid("unknown driver field"));
                 }
@@ -179,6 +188,12 @@ impl Config {
                     topic_prefix,
                     il_prefix,
                     bindings,
+                    watch: match drivers.get("watch") {
+                        None => false,
+                        Some(value) => value
+                            .as_bool()
+                            .ok_or_else(|| invalid("driver watch must be boolean"))?,
+                    },
                 };
                 config.validate()?;
                 Some(config)
@@ -263,6 +278,15 @@ impl Config {
             management,
             drivers,
             external_mqtt,
+            cloud_account: match value.get("cloud_account") {
+                None => None,
+                Some(value) => Some(PathBuf::from(
+                    value
+                        .as_str()
+                        .filter(|path| !path.is_empty())
+                        .ok_or_else(|| invalid("invalid cloud_account path"))?,
+                )),
+            },
         })
     }
 }
@@ -276,6 +300,9 @@ pub struct Daemon {
     firmware: rusthinq_bridge::passthrough::Relay,
     management: Option<(crate::management::Config, TcpListener)>,
     external_mqtt: Option<crate::external_mqtt::Runtime>,
+    cloud_account: Option<(crate::cloud_account::Handle, crate::cloud_account::Runtime)>,
+    driver_watch: Option<crate::drivers::Config>,
+    commands: Option<(crate::external_mqtt::Config, String)>,
 }
 impl Daemon {
     /// Binds all endpoints before durable generation reservation. No CA creation.
@@ -286,6 +313,16 @@ impl Daemon {
         if let Some(drivers) = &config.drivers {
             drivers.validate()?;
         }
+        let cloud_account = match config.cloud_account.clone() {
+            Some(path) => Some(crate::cloud_account::open(path).await?),
+            None => None,
+        };
+        let commands = config.external_mqtt.clone().zip(
+            config
+                .drivers
+                .as_ref()
+                .map(|drivers| drivers.topic_prefix.clone()),
+        );
         let external = config
             .external_mqtt
             .clone()
@@ -370,6 +407,7 @@ impl Daemon {
         .with_firmware(firmware.clone())
         .with_metadata(metadata)
         .with_local_service(http_front, http, Arc::new(https))?;
+        let driver_watch = drivers.as_ref().filter(|config| config.watch).cloned();
         if let Some(drivers) = drivers {
             service = service.with_drivers(drivers)?;
         }
@@ -388,6 +426,9 @@ impl Daemon {
             firmware,
             management,
             external_mqtt,
+            cloud_account,
+            driver_watch,
+            commands,
         })
     }
     pub fn firmware(&self) -> rusthinq_bridge::passthrough::Relay {
@@ -407,33 +448,93 @@ impl Daemon {
     pub async fn serve(self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
         let (signer_stop, signer_stopped) = watch::channel(false);
         let signer = tokio::spawn(self.signer.run(signer_stopped));
-        let (services_stop, services_stopped) = watch::channel(*stop.borrow());
+        let (core_stop, core_stopped) = watch::channel(*stop.borrow());
+        let (services_stop, services_stopped) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
         let handle = self.service.handle();
-        tasks.spawn(
-            self.service
-                .serve(self.thin, self.mqtt, services_stopped.clone()),
-        );
+        let external_handle = handle.external_mqtt();
+        let mut core = tokio::spawn(self.service.serve(self.thin, self.mqtt, core_stopped));
+        if let Some(config) = self.driver_watch {
+            tasks.spawn(crate::driver_watch::run(
+                config,
+                handle.clone(),
+                services_stopped.clone(),
+            ));
+        }
+        if let Some((config, prefix)) = self.commands {
+            tasks.spawn(crate::mqtt_commands::run(
+                config,
+                prefix,
+                handle.clone(),
+                core_stop.subscribe(),
+            ));
+        }
         if let Some(external) = self.external_mqtt {
             tasks.spawn(external.run(handle.clone(), services_stopped.clone()));
         }
+        let cloud = self
+            .cloud_account
+            .as_ref()
+            .map(|(handle, _)| handle.clone());
+        if let Some((_, runtime)) = self.cloud_account {
+            tasks.spawn(runtime.run(services_stopped.clone()));
+        }
         if let Some((config, listener)) = self.management {
-            tasks.spawn(crate::management::serve(
+            tasks.spawn(crate::management::serve_with_cloud(
                 listener,
-                handle,
+                handle.clone(),
                 config,
                 services_stopped,
+                cloud,
             ));
         }
         let mut failure = None;
+        let mut core_finished = false;
         if !*stop.borrow() {
             tokio::select! {
                 _=stop.changed()=>{},
-                joined=tasks.join_next()=>{
+                joined=&mut core=>{
+                    core_finished=true;
+                    failure=Some(match joined {
+                        Ok(Err(error))=>error,
+                        Err(error)=>io::Error::other(error),
+                        Ok(Ok(()))=>io::Error::other("device service stopped unexpectedly"),
+                    });
+                },
+                joined=tasks.join_next(), if !tasks.is_empty()=>{
                     failure=Some(match joined {
                         Some(Ok(Err(error)))=>error,
                         Some(Err(error))=>io::Error::other(error),
                         _=>io::Error::other("daemon service stopped unexpectedly"),
+                    });
+                }
+            }
+        }
+        // Keep the publication adapter alive until device workers emit terminal output.
+        core_stop.send_replace(true);
+        if !core_finished {
+            match core.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| io::Error::other(error));
+                }
+            }
+        }
+        if let Some(external) = external_handle {
+            match tokio::time::timeout(Duration::from_secs(10), external.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "terminal MQTT output unconfirmed; retained inventory preserved",
+                        )
                     });
                 }
             }

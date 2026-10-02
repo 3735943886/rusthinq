@@ -10,6 +10,7 @@ use std::{
 const MAX_SOURCE: usize = 524288;
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub watch: bool,
     pub directory: PathBuf,
     pub topic_prefix: String,
     pub il_prefix: Option<String>,
@@ -116,6 +117,31 @@ impl Config {
             ));
         }
         Ok(())
+    }
+    /// Fingerprint only this model and its static module dependencies.
+    pub(crate) fn source_revision(&self, id: &str, model: &str) -> io::Result<u64> {
+        use std::hash::{Hash, Hasher};
+        let root = self.directory.canonicalize()?;
+        let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
+        let source = read(&root, model)?;
+        let mut bundle = Vec::new();
+        let mut total = source.len();
+        modules(
+            &root,
+            &source,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut bundle,
+            &mut total,
+        )?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        model.hash(&mut hash);
+        source.hash(&mut hash);
+        for module in bundle {
+            module.name.hash(&mut hash);
+            module.source.hash(&mut hash);
+        }
+        Ok(hash.finish())
     }
     pub fn prepare(
         &self,

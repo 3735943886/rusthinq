@@ -15,6 +15,9 @@ pub struct Session<S> {
     usable: bool,
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
+    pub(crate) fn into_stream(self) -> S {
+        self.stream
+    }
     /// Caller supplies a connected, authenticated transport (TLS if required).
     /// This connection is exclusive: no subscriptions or other in-flight publishers.
     pub async fn connect(stream: S, client: &str, deadline: Duration) -> io::Result<Self> {

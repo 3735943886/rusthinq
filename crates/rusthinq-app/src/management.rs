@@ -71,19 +71,34 @@ struct App {
     config: Config,
     stop: watch::Receiver<bool>,
     sockets: Arc<Semaphore>,
+    cloud: Option<crate::cloud_account::Handle>,
 }
 pub fn router(handle: Handle, config: Config, stop: watch::Receiver<bool>) -> io::Result<Router> {
+    router_with_cloud(handle, config, stop, None)
+}
+pub fn router_with_cloud(
+    handle: Handle,
+    config: Config,
+    stop: watch::Receiver<bool>,
+    cloud: Option<crate::cloud_account::Handle>,
+) -> io::Result<Router> {
     config.validate()?;
     Ok(build(App {
         handle,
         config,
         stop,
         sockets: Arc::new(Semaphore::new(64)),
+        cloud,
     }))
 }
 fn build(app: App) -> Router {
     let mut routes = Router::new()
         .route("/api/health", get(health))
+        .route("/api/cloud", get(cloud_status))
+        .route("/api/cloud/login", post(cloud_login))
+        .route("/api/cloud/login/complete", post(cloud_complete))
+        .route("/api/cloud/logout", post(cloud_logout))
+        .route("/api/cloud/refresh", post(cloud_refresh))
         .route("/api/mqtt", get(mqtt_status))
         .route("/api/mqtt/retained/delete", post(delete_retained))
         .route("/api/devices", get(devices))
@@ -258,6 +273,7 @@ async fn health(State(app): State<App>) -> Json<Value> {
 fn snapshot(handle: &Handle) -> Value {
     let metadata = handle.metadata_snapshot();
     let models = handle.driver_models();
+    let persisted_models = handle.persisted_models();
     let states = handle.script_states();
     let mut devices = serde_json::Map::new();
     for device in handle.snapshot() {
@@ -269,7 +285,7 @@ fn snapshot(handle: &Handle) -> Value {
             .get(&device.entry.id)
             .filter(|(session, _, _)| Some(*session) == device.session);
         devices.insert(
-            device.entry.id,
+            device.entry.id.clone(),
             json!({
                 "online":device.online,
                 "incarnation":device.entry.incarnation.to_string(),
@@ -277,6 +293,7 @@ fn snapshot(handle: &Handle) -> Value {
                 "model":model.map(|(_,model,_)|model.as_str()).or_else(||meta.map(|m|m.model_name.as_str())).unwrap_or(""),
                 "deviceType":meta.map(|m|m.device_type.as_str()),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
+                "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
                 "mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":false,
                 "removal":device.removal.map(|r|format!("{r:?}"))
             }),
@@ -532,6 +549,10 @@ fn event_value(event: Event) -> Value {
         } => {
             json!({"type":"injected","device":session.device,"generation":session.generation.to_string(),"hex":rusthinq_protocol::hex::encode(data),"toDevice":to_device})
         }
+        Event::ScriptStopped {
+            context: ctx,
+            error,
+        } => json!({"type":"scriptStopped","context":context(&ctx),"error":error}),
         Event::ScriptExecuted {
             sequence,
             context: scope,
@@ -677,11 +698,76 @@ async fn write(socket: &mut WebSocket, value: Value) -> bool {
 }
 
 /// Own HTTP tasks and drain upgraded sockets through their stop receiver/permits.
+async fn cloud_status(State(app): State<App>) -> Json<Value> {
+    Json(match app.cloud {
+        Some(cloud) => json!({"enabled":true,"account":cloud.status()}),
+        None => json!({"enabled":false}),
+    })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudLogin {
+    country: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudComplete {
+    url: String,
+}
+fn cloud_result(result: Result<Value, crate::cloud_account::Error>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match error {
+                crate::cloud_account::Error::InvalidInput => StatusCode::BAD_REQUEST,
+                crate::cloud_account::Error::Busy => StatusCode::TOO_MANY_REQUESTS,
+                crate::cloud_account::Error::Unavailable
+                | crate::cloud_account::Error::Cancelled => StatusCode::CONFLICT,
+                crate::cloud_account::Error::Authentication => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, Json(json!({"error":error.to_string()}))).into_response()
+        }
+    }
+}
+async fn cloud_login(State(app): State<App>, Json(input): Json<CloudLogin>) -> Response {
+    cloud_result(match app.cloud {
+        Some(cloud) => cloud.login(input.country).await,
+        None => Err(crate::cloud_account::Error::Unavailable),
+    })
+}
+async fn cloud_complete(State(app): State<App>, Json(input): Json<CloudComplete>) -> Response {
+    cloud_result(match app.cloud {
+        Some(cloud) => cloud.complete(input.url).await,
+        None => Err(crate::cloud_account::Error::Unavailable),
+    })
+}
+async fn cloud_logout(State(app): State<App>) -> Response {
+    cloud_result(match app.cloud {
+        Some(cloud) => cloud.logout().await,
+        None => Err(crate::cloud_account::Error::Unavailable),
+    })
+}
+async fn cloud_refresh(State(app): State<App>) -> Response {
+    cloud_result(match app.cloud {
+        Some(cloud) => cloud.refresh().await,
+        None => Err(crate::cloud_account::Error::Unavailable),
+    })
+}
 pub async fn serve(
     listener: TcpListener,
     handle: Handle,
     config: Config,
+    stop: watch::Receiver<bool>,
+) -> io::Result<()> {
+    serve_with_cloud(listener, handle, config, stop, None).await
+}
+pub async fn serve_with_cloud(
+    listener: TcpListener,
+    handle: Handle,
+    config: Config,
     mut stop: watch::Receiver<bool>,
+    cloud: Option<crate::cloud_account::Handle>,
 ) -> io::Result<()> {
     config.validate()?;
     let (owned_stop, owned_stopped) = watch::channel(*stop.borrow());
@@ -691,6 +777,7 @@ pub async fn serve(
         config,
         stop: owned_stopped.clone(),
         sockets: sockets.clone(),
+        cloud,
     });
     let mut tasks = JoinSet::new();
     let mut failure = None;

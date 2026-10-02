@@ -22,25 +22,45 @@ struct ScriptSink(mpsc::Sender<(Context, String)>);
 
 #[tokio::test]
 async fn completed_provisioning_auto_loads_real_driver_without_external_mqtt() {
-    auto_driver(false).await;
+    auto_driver(false, false).await;
 }
 #[tokio::test]
 async fn real_driver_external_publications_have_durable_inventory_and_delete_routes() {
-    auto_driver(true).await;
+    auto_driver(true, false).await;
 }
-async fn auto_driver(external: bool) {
+#[tokio::test]
+async fn automatic_driver_reload_preserves_scope_on_compile_failure_and_recovers() {
+    auto_driver(false, true).await;
+}
+async fn auto_driver(external: bool, watched: bool) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
     let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let sources = directory.path().join("drivers");
+    std::fs::create_dir(&sources).unwrap();
+    for source in std::fs::read_dir(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
+    )
+    .unwrap()
+    {
+        let source = source.unwrap().path();
+        if source
+            .extension()
+            .is_some_and(|extension| extension == "rhai")
+        {
+            std::fs::copy(&source, sources.join(source.file_name().unwrap())).unwrap();
+        }
+    }
+    let driver_config = rusthinq_app::drivers::Config {
+        directory: sources.clone(),
+        topic_prefix: "rusthinq".into(),
+        il_prefix: Some("ildevice".into()),
+        bindings: Default::default(),
+        watch: watched,
+    };
     let mut runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
         .unwrap()
-        .with_drivers(rusthinq_app::drivers::Config {
-            directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/drivers"),
-            topic_prefix: "rusthinq".into(),
-            il_prefix: Some("ildevice".into()),
-            bindings: Default::default(),
-        })
+        .with_drivers(driver_config.clone())
         .unwrap();
     let external_stop = watch::channel(false);
     let mut adapter_task = None;
@@ -120,6 +140,13 @@ async fn auto_driver(external: bool) {
     let handle = runtime.handle();
     let mut events = handle.subscribe();
     let (stop, stopped) = watch::channel(false);
+    let watcher = watched.then(|| {
+        tokio::spawn(rusthinq_app::driver_watch::run(
+            driver_config,
+            handle.clone(),
+            stopped.clone(),
+        ))
+    });
     let app = tokio::spawn(runtime.run(stopped));
     let (stream, mut peer) = tokio::io::duplex(8192);
     let running = broker.clone();
@@ -155,8 +182,51 @@ async fn auto_driver(external: bool) {
     }
     assert_eq!(handle.driver_models()["d"].1, "D140110");
     assert_eq!(handle.script_states()["d"].1, 1);
+    if watched {
+        // Poll once with the original prepared driver before editing it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let path = sources.join("D140110.rhai");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{original}\n// updated fixture\n")).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while handle.script_states()["d"].1 != 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle
+            .invoke_script(
+                "d".into(),
+                session,
+                2,
+                "__command".into(),
+                json!({"prop":"unknown","value":"x"}).to_string(),
+            )
+            .await
+            .unwrap();
+        until(&mut events,|event|matches!(event,Event::ScriptOutput{context,payload} if context.generation==2 && {
+            let publication:serde_json::Value=serde_json::from_str(payload).unwrap();
+            publication["topic"]=="rusthinq/d/reject" && serde_json::from_str::<serde_json::Value>(publication["payload"].as_str().unwrap()).unwrap()["code"]=="unknown_property"
+        })).await;
+        std::fs::write(&path, "fn invalid(").unwrap();
+        until(
+            &mut events,
+            |event| matches!(event,Event::Rejected{reason,..} if reason.contains("driver reload")),
+        )
+        .await;
+        assert_eq!(handle.script_states()["d"].1, 2);
+        std::fs::write(&path, original).unwrap();
+        until(&mut events,|event|matches!(event,Event::ScriptExecuted{context,error:None,..} if context.generation==3)).await;
+    }
     if let Some((received, sink)) = confirmed {
         timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(peer);
+        until(&mut events,|event|matches!(event,Event::ScriptStopped{context,error:None} if context.session==session)).await;
+        timeout(Duration::from_secs(5), sink.flush())
             .await
             .unwrap()
             .unwrap();
@@ -165,7 +235,7 @@ async fn auto_driver(external: bool) {
         assert_eq!(sink.delete_owner(owner).await.unwrap(), 2);
         external_stop.0.send_replace(true);
         adapter_task.unwrap().await.unwrap().unwrap();
-        assert_eq!(remote_task.unwrap().await.unwrap(), 2);
+        assert_eq!(remote_task.unwrap().await.unwrap(), 3);
         assert!(
             rusthinq_app::retained_cleanup::Ledger::open(
                 &directory.path().join("retained.json"),
@@ -180,6 +250,12 @@ async fn auto_driver(external: bool) {
     device.await.unwrap();
     stop.send_replace(true);
     app.await.unwrap().unwrap();
+    if let Some(watcher) = watcher {
+        watcher.await.unwrap().unwrap();
+    }
+    let stored = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    assert_eq!(stored.state().metadata["d"].model_name, "D140110");
+    assert!(stored.state().metadata["d"].thinq2);
 }
 
 #[tokio::test]

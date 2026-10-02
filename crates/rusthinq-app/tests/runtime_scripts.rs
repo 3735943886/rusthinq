@@ -471,3 +471,113 @@ async fn context_callbacks_bind_device_state_and_reload_without_il_interpretatio
     stop.send_replace(true);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn shutdown_callback_publishes_once_offline_and_cannot_send_to_device() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let (sink, mut publications) = mpsc::channel(4);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(Sink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let peer = identify(&mut server).await;
+    until(&mut events,|event|matches!(event,Event::Lifecycle(rusthinq_lifecycle::Action::Changed(device)) if device.online)).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            Compiled::new(
+                "fn bye(v){publish(\"offline\");send(\"{}\");publish(\"late\");}",
+                Limits::default(),
+                true,
+            )
+            .unwrap(),
+            worker::Config::default(),
+            Callbacks {
+                shutdown: Some("bye".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(peer);
+    until(&mut events,|event|matches!(event,Event::ScriptStopped{context,error:None} if context.session==session)).await;
+    assert_eq!(
+        timeout(Duration::from_secs(3), publications.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        (
+            Context {
+                device: "d".into(),
+                session,
+                generation: 1
+            },
+            "offline".into()
+        )
+    );
+    until(&mut events,|event|matches!(event,Event::Rejected{reason,..} if reason.contains("shutdown callback cannot send"))).await;
+    assert!(!handle.snapshot()[0].online);
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    assert!(publications.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn shutdown_output_from_replaced_session_never_reaches_successor() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let (sink, mut publications) = mpsc::channel(4);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(Sink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let old = identify(&mut server).await;
+    until(&mut events,|event|matches!(event,Event::Lifecycle(rusthinq_lifecycle::Action::Changed(device)) if device.online)).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            Compiled::new(
+                "fn bye(v){publish(\"old-offline\");}",
+                Limits::default(),
+                true,
+            )
+            .unwrap(),
+            worker::Config::default(),
+            Callbacks {
+                shutdown: Some("bye".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let new = identify(&mut server).await;
+    until(
+        &mut events,
+        |event| matches!(event,Event::ScriptStopped{context,..} if context.session==session),
+    )
+    .await;
+    assert!(handle.snapshot()[0].session.unwrap().generation > session.generation);
+    assert!(publications.try_recv().is_err());
+    drop(old);
+    drop(new);
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    assert!(publications.try_recv().is_err());
+}

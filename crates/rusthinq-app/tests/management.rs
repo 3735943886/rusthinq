@@ -237,3 +237,76 @@ async fn sockets_get_initial_snapshot_and_shutdown_joins_idle_http_and_upgrades(
         .unwrap();
     assert!(timeout(Duration::from_secs(1), socket.next()).await.is_ok());
 }
+
+#[tokio::test]
+async fn cloud_account_api_reports_status_and_durable_logout_without_broker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.json");
+    let (cloud, account) = rusthinq_app::cloud_account::open(path.clone())
+        .await
+        .unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(
+        Storage::open(&dir.path().join("devices.json"), 4).unwrap(),
+        server.handle(),
+        Duration::ZERO,
+        32,
+    )
+    .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(account.run(stopped.clone()));
+    let app = management::router_with_cloud(runtime.handle(), config(false), stopped, Some(cloud))
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request("/api/cloud", "GET", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["account"]["stored"], false);
+    assert!(status["account"].get("refresh").is_none());
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/api/cloud/login",
+            "POST",
+            json!({"country":"invalid"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/api/cloud/login/complete",
+            "POST",
+            json!({"url":"https://evil.example/?code=secret"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .clone()
+        .oneshot(request("/api/cloud/logout", "POST", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["credentials"], Value::Null);
+    let mut cross = request("/api/cloud/logout", "POST", json!({}));
+    cross
+        .headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    cross
+        .headers_mut()
+        .insert("host", "localhost".parse().unwrap());
+    assert_eq!(
+        app.oneshot(cross).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}

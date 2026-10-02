@@ -8,8 +8,17 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceMetadata {
+    pub incarnation: u64,
+    pub model_name: String,
+    pub device_type: String,
+    pub thinq2: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
+    pub metadata: std::collections::BTreeMap<String, DeviceMetadata>,
     pub ledger: Ledger,
     /// Persisted high-water mark, including unused reservations. Without a new
     /// reservation use it as L3's floor; a new block supplies its own floor/ceiling.
@@ -68,6 +77,7 @@ impl Storage {
             Err(error) if error.kind() == io::ErrorKind::NotFound => State {
                 ledger: Ledger::default(),
                 generation_floor: 0,
+                metadata: Default::default(),
             },
             Err(error) => return Err(error),
         };
@@ -108,6 +118,7 @@ impl Storage {
         let candidate = State {
             ledger: self.state.ledger.clone(),
             generation_floor: ceiling,
+            metadata: self.state.metadata.clone(),
         };
         self.commit(candidate)?;
         Ok(GenerationBlock { floor, ceiling })
@@ -168,7 +179,44 @@ impl Storage {
         let candidate = State {
             ledger: ledger.clone(),
             generation_floor: floor,
+            metadata: self
+                .state
+                .metadata
+                .iter()
+                .filter(|(id, meta)| {
+                    ledger
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == **id && entry.incarnation == meta.incarnation)
+                })
+                .map(|(id, meta)| (id.clone(), meta.clone()))
+                .collect(),
         };
+        self.commit(candidate)
+    }
+    /// Model data shares the ledger's exclusive serialized writer and incarnation fence.
+    pub fn save_metadata(
+        &mut self,
+        updates: &std::collections::BTreeMap<String, DeviceMetadata>,
+    ) -> io::Result<()> {
+        if self.uncertain {
+            return Err(io::Error::other(
+                "lifecycle checkpoint uncertain; reopen before metadata write",
+            ));
+        }
+        let mut candidate = self.state.clone();
+        for (id, meta) in updates {
+            if !candidate
+                .ledger
+                .entries
+                .iter()
+                .any(|entry| entry.id == *id && entry.incarnation == meta.incarnation)
+            {
+                return Err(invalid("stale model incarnation"));
+            }
+            candidate.metadata.insert(id.clone(), meta.clone());
+        }
+        validate_metadata(&candidate)?;
         self.commit(candidate)
     }
     fn commit(&mut self, candidate: State) -> io::Result<()> {
@@ -205,13 +253,13 @@ fn validate(ledger: &Ledger, capacity: usize) -> io::Result<()> {
     Ok(())
 }
 fn encode(state: &State) -> Vec<u8> {
-    serde_json::to_vec(&json!({"version":1,"generation_floor":state.generation_floor,"revision":state.ledger.revision,"next_incarnation":state.ledger.next_incarnation,
+    serde_json::to_vec(&json!({"version":2,"metadata":state.metadata,"generation_floor":state.generation_floor,"revision":state.ledger.revision,"next_incarnation":state.ledger.next_incarnation,
         "entries":state.ledger.entries.iter().map(|entry| json!({"id":entry.id,"incarnation":entry.incarnation,"last_generation":entry.last_generation})).collect::<Vec<_>>()})).expect("JSON values")
 }
 fn decode(bytes: &[u8], capacity: usize) -> io::Result<State> {
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid lifecycle JSON"))?;
-    if value["version"].as_u64() != Some(1) {
+    if !matches!(value["version"].as_u64(), Some(1 | 2)) {
         return Err(invalid("unsupported lifecycle version"));
     }
     let entries = value["entries"]
@@ -244,10 +292,38 @@ fn decode(bytes: &[u8], capacity: usize) -> io::Result<State> {
     {
         return Err(invalid("generation floor below saved session"));
     }
-    Ok(State {
+    let metadata = if value["version"].as_u64() == Some(2) {
+        serde_json::from_value(value["metadata"].clone())
+            .map_err(|_| invalid("invalid model metadata"))?
+    } else {
+        Default::default()
+    };
+    let state = State {
         ledger,
         generation_floor,
-    })
+        metadata,
+    };
+    validate_metadata(&state)?;
+    Ok(state)
+}
+fn validate_metadata(state: &State) -> io::Result<()> {
+    if state.metadata.len() > state.ledger.entries.len()
+        || state.metadata.iter().any(|(id, meta)| {
+            meta.model_name.is_empty()
+                || meta.model_name.len() > 256
+                || meta.model_name.chars().any(char::is_control)
+                || meta.device_type.len() > 128
+                || meta.device_type.chars().any(char::is_control)
+                || !state
+                    .ledger
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == *id && entry.incarnation == meta.incarnation)
+        })
+    {
+        return Err(invalid("invalid model metadata identity or bounds"));
+    }
+    Ok(())
 }
 fn number(value: &Value, field: &str) -> io::Result<u64> {
     value[field]

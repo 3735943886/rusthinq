@@ -210,3 +210,68 @@ fn removal_effect_commits_before_model_reports_removed() {
     assert!(restored.state().ledger.entries.is_empty());
     assert_eq!(restored.state().ledger.next_incarnation, 2);
 }
+
+#[test]
+fn model_metadata_is_durable_incarnation_scoped_and_removed_with_its_owner() {
+    use rusthinq_app::lifecycle_storage::DeviceMetadata;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("devices.json");
+    let mut storage = Storage::open(&path, 4).unwrap();
+    let mut ledger = rusthinq_lifecycle::Ledger {
+        revision: 1,
+        next_incarnation: 2,
+        entries: vec![rusthinq_lifecycle::Entry {
+            id: "d".into(),
+            incarnation: 1,
+            last_generation: 10,
+        }],
+    };
+    storage.save(&ledger).unwrap();
+    let record = DeviceMetadata {
+        incarnation: 1,
+        model_name: "D140110".into(),
+        device_type: "204".into(),
+        thinq2: false,
+    };
+    let batch = std::collections::BTreeMap::from([("d".into(), record.clone())]);
+    storage.save_metadata(&batch).unwrap();
+    drop(storage);
+    let mut storage = Storage::open(&path, 4).unwrap();
+    assert_eq!(storage.state().metadata["d"], record);
+    storage.reserve_generations(10).unwrap();
+    assert_eq!(storage.state().metadata["d"], record);
+    ledger.revision += 1;
+    ledger.entries.clear();
+    storage.save(&ledger).unwrap();
+    assert!(storage.state().metadata.is_empty());
+    ledger.revision += 1;
+    ledger.next_incarnation = 3;
+    ledger.entries.push(rusthinq_lifecycle::Entry {
+        id: "d".into(),
+        incarnation: 2,
+        last_generation: 21,
+    });
+    storage.save(&ledger).unwrap();
+    assert!(storage.save_metadata(&batch).is_err());
+    assert!(storage.state().metadata.is_empty());
+}
+
+#[test]
+fn old_lifecycle_schema_upgrades_without_inventing_models_and_invalid_metadata_is_preserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("devices.json");
+    let original=br#"{"version":1,"generation_floor":10,"revision":1,"next_incarnation":2,"entries":[{"id":"d","incarnation":1,"last_generation":10}]}"#;
+    std::fs::write(&path, original).unwrap();
+    let mut storage = Storage::open(&path, 4).unwrap();
+    assert!(storage.state().metadata.is_empty());
+    storage.reserve_generations(1).unwrap();
+    drop(storage);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(value["version"], 2);
+    value["metadata"] = serde_json::json!({"d":{"incarnation":2,"model_name":"D140110","device_type":"204","thinq2":false}});
+    let corrupted = value.to_string();
+    std::fs::write(&path, &corrupted).unwrap();
+    assert!(Storage::open(&path, 4).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted);
+}

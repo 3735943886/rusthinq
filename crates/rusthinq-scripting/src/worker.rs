@@ -65,6 +65,8 @@ impl Request {
     }
 }
 struct Shared {
+    shutdown_callback: Mutex<Option<String>>,
+    shutdown_output: Mutex<Option<Outcome>>,
     config: Config,
     send: mpsc::Sender<Message>,
     slots: Arc<Semaphore>,
@@ -98,6 +100,24 @@ impl Reload {
     }
 }
 impl Handle {
+    pub fn set_shutdown_callback(&self, function: Option<String>) -> Result<(), Error> {
+        if function
+            .as_ref()
+            .is_some_and(|function| function.is_empty() || function.len() > 256)
+        {
+            return Err(Error::InputExceeded);
+        }
+        let _gate = self.0.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.stopped.load(Ordering::Acquire) {
+            return Err(Error::Stopped);
+        }
+        *self
+            .0
+            .shutdown_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = function;
+        Ok(())
+    }
     pub fn status(&self) -> watch::Receiver<Status> {
         self.0.status.subscribe()
     }
@@ -193,6 +213,8 @@ impl Worker {
         let (send, receive) = mpsc::channel(config.capacity);
         let (status, _) = watch::channel(Status::Running { generation: 1 });
         let shared = Arc::new(Shared {
+            shutdown_callback: Mutex::new(None),
+            shutdown_output: Mutex::new(None),
             slots: Arc::new(Semaphore::new(config.capacity)),
             config,
             send,
@@ -211,13 +233,25 @@ impl Worker {
         self.handle.clone()
     }
     /// Finish the current invocation, cancel unstarted work, and join the worker.
-    pub async fn shutdown(mut self) -> Result<(), Error> {
+    pub async fn shutdown(self) -> Result<(), Error> {
+        self.shutdown_with_output().await.map(|_| ())
+    }
+    /// The callback runs once in the worker after queued ordinary work is cancelled.
+    /// Its opaque outputs remain owned by the caller and require retirement fencing.
+    pub async fn shutdown_with_output(mut self) -> Result<Option<Outcome>, Error> {
         self.handle.request_stop();
         self.task
             .take()
             .expect("owned worker")
             .await
-            .map_err(|error| Error::Worker(error.to_string()))
+            .map_err(|error| Error::Worker(error.to_string()))?;
+        Ok(self
+            .handle
+            .0
+            .shutdown_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take())
     }
 }
 impl Drop for Worker {
@@ -273,6 +307,18 @@ fn run(mut host: Host, mut receive: mpsc::Receiver<Message>, shared: Arc<Shared>
             Request::Wake => {}
         }
     }
+    if let Some(function) = shared
+        .shutdown_callback
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let output = host.invoke(host.generation(), &function, "");
+        *shared
+            .shutdown_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(output);
+    }
     shared.stopped.store(true, Ordering::Release);
     shared.status.send_replace(Status::Stopped {
         generation: host.generation(),
@@ -291,8 +337,12 @@ mod tests {
 
     #[tokio::test]
     async fn stop_finishes_current_invocation_cancels_queue_and_reload_then_joins() {
-        let mut compiled =
-            Compiled::new("fn input(v){gate();send(v);}", Limits::default(), true).unwrap();
+        let mut compiled = Compiled::new(
+            "fn input(v){gate();send(v);} fn bye(v){publish(\"bye\");}",
+            Limits::default(),
+            true,
+        )
+        .unwrap();
         let replacement = Compiled::new("fn input(v){send(v);}", Limits::default(), true).unwrap();
         let entered = Arc::new(Notify::new());
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -323,6 +373,7 @@ mod tests {
             .unwrap();
         let queued = handle.invoke(1, "input".into(), "queued".into()).unwrap();
         let reload = handle.reload(1, replacement).unwrap();
+        handle.set_shutdown_callback(Some("bye".into())).unwrap();
         handle.request_stop();
         assert!(matches!(
             handle.invoke(1, "input".into(), "late".into()),
@@ -330,10 +381,13 @@ mod tests {
         ));
         *release.0.lock().unwrap() = true;
         release.1.notify_all();
-        timeout(Duration::from_secs(3), worker.shutdown())
+        let stopped = timeout(Duration::from_secs(3), worker.shutdown_with_output())
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
+        assert_eq!(stopped.outputs, vec![Output::Publish("bye".into())]);
+        assert_eq!(stopped.error, None);
         assert_eq!(
             current.wait().await.unwrap().outputs,
             vec![Output::Send("current".into())]
@@ -359,6 +413,7 @@ mod tests {
             });
         let worker = Worker::spawn(compiled, Config::default()).unwrap();
         let handle = worker.handle();
+        handle.set_shutdown_callback(Some("input".into())).unwrap();
         let result = handle
             .invoke(1, "input".into(), "prefix".into())
             .unwrap()
@@ -382,6 +437,8 @@ mod tests {
                 .error,
             Some(Error::Faulted)
         );
-        worker.shutdown().await.unwrap();
+        let stopped = worker.shutdown_with_output().await.unwrap().unwrap();
+        assert_eq!(stopped.error, Some(Error::Faulted));
+        assert!(stopped.outputs.is_empty());
     }
 }

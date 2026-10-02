@@ -8,6 +8,7 @@ fn config() -> Config {
         topic_prefix: "rusthinq".into(),
         il_prefix: Some("ildevice".into()),
         bindings: BTreeMap::new(),
+        watch: false,
     }
 }
 fn messages(outputs: Vec<Output>) -> Vec<Value> {

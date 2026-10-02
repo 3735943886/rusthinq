@@ -40,6 +40,7 @@ let deviceMappingCapable = false
 // and the "Bridge mode" section are dropped rather than shown disabled with
 // nothing on the page explaining why. Set from the first `features` snapshot.
 let bridgeFeatureEnabled = false
+let cloudAccountEnabled = false
 
 // Renders one link in the Browser<->rusthinq<->MQTT chain: `connected` true/false
 // draws a matching pair -- a green "link" icon when up, a red "link_off" (broken
@@ -360,7 +361,7 @@ function connect() {
                 deviceMappingCapable = !!json.features.scripting
 
                 bridgeFeatureEnabled = !!json.features.bridge
-                document.getElementById('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled)
+                document.getElementById('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled && !cloudAccountEnabled)
                 get('devices_table').classList.toggle('no-bridge', !bridgeFeatureEnabled)
                 // A row already on the page when this arrives was built assuming the feature
                 // was on (the default before the first snapshot) -- redraw it without the
@@ -431,28 +432,51 @@ function connect() {
     }
 }
 
-get('btn_thinq_login_continue').onclick = () => {
-    if (!get('country_code').validity.valid) return
-
-    const countryCode = get('country_code').value.toUpperCase()
-
-    window.open(`${baseUrl}thinq_login?countryCode=${countryCode}`, '_blank')
+async function cloudStatus() {
+    try {
+        const response = await fetch(`${baseUrl}api/cloud`)
+        if (!response.ok) return
+        const cloud = await response.json()
+        cloudAccountEnabled = !!cloud.enabled
+        get('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled && !cloudAccountEnabled)
+        if (!cloudAccountEnabled) return
+        const account = cloud.account
+        get('btn_thinq_login').classList.toggle('hide', account.loggedIn)
+        get('btn_thinq_logout').classList.toggle('hide', !account.stored)
+        get('status_bridge').innerHTML = account.loggedIn ? STATUS_OK : STATUS_ERROR
+        get('status_bridge_text').textContent = account.busy ? 'Connecting LG account' : account.loggedIn ? 'LG account authenticated' : account.error ? account.error : 'LG account not configured'
+    } catch (_) {}
 }
-
+async function pollCloudStatus() {
+    await cloudStatus()
+    setTimeout(pollCloudStatus, 3000)
+}
+pollCloudStatus()
+get('btn_thinq_login_continue').onclick = async () => {
+    if (!get('country_code').validity.valid) return
+    const popup = window.open('about:blank', '_blank')
+    if (popup) popup.opener = null
+    const country = get('country_code').value.toUpperCase()
+    const response = await fetchWrapper('api/cloud/login', { country }, { method: 'POST' })
+    if (!response || !response.ok) { if (popup) popup.close(); return }
+    const { url } = await response.json()
+    if (popup) popup.location = url
+    else toastText('Allow popups and try again')
+    await cloudStatus()
+}
 get('btn_thinq_login_complete').onclick = async () => {
-    if (!get('country_code').validity.valid) return
-
     if (!get('login_url').validity.valid) return
-
-    const countryCode = get('country_code').value.toUpperCase()
-    const url = get('login_url').value
-    await fetchWrapper(`thinq_login_accept`, { url, countryCode }, { method: 'POST' })
+    const response = await fetchWrapper('api/cloud/login/complete', { url: get('login_url').value }, { method: 'POST' })
+    if (!response || !response.ok) return
+    get('login_url').value = ''
     M.Modal.getInstance(get('thinq_login')).close()
+    await cloudStatus()
 }
-
 get('btn_thinq_logout_continue').onclick = async () => {
-    await fetchWrapper(`thinq_logout`, {}, { method: 'POST' })
+    const response = await fetchWrapper('api/cloud/logout', {}, { method: 'POST' })
+    if (!response || !response.ok) return
     M.Modal.getInstance(get('thinq_logout')).close()
+    await cloudStatus()
 }
 
 /*
