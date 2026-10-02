@@ -111,6 +111,14 @@ async fn reload_fences_completed_results_and_preserves_opaque_output_order() {
         2
     );
     assert!(matches!(owner.accept(&devices, old), Err(Error::Stale)));
+    // Known old or future generations must fail admission, before using a
+    // worker queue slot or producing a completion for the application to drop.
+    for generation in [1, 3] {
+        assert!(matches!(
+            owner.invoke(&devices, "a", generation, "input".into(), "stale".into()),
+            Err(Error::Stale)
+        ));
+    }
     let new = owner
         .invoke(&devices, "a", 2, "input".into(), "opaque".into())
         .unwrap()

@@ -23,17 +23,22 @@ struct ScriptSink(mpsc::Sender<(Context, String)>);
 
 #[tokio::test]
 async fn completed_provisioning_auto_loads_real_driver_without_external_mqtt() {
-    auto_driver(false, false).await;
+    auto_driver(false, false, false).await;
 }
 #[tokio::test]
 async fn real_driver_external_publications_have_durable_inventory_and_delete_routes() {
-    auto_driver(true, false).await;
+    auto_driver(true, false, false).await;
 }
 #[tokio::test]
 async fn automatic_driver_reload_preserves_scope_on_compile_failure_and_recovers() {
-    auto_driver(false, true).await;
+    auto_driver(false, true, false).await;
 }
-async fn auto_driver(external: bool, watched: bool) {
+#[tokio::test]
+async fn real_washer_command_is_validated_fenced_and_transmitted_without_claiming_device_ack() {
+    auto_driver(false, false, true).await;
+}
+async fn auto_driver(external: bool, watched: bool, command: bool) {
+    let model = if command { "Pd0F_F" } else { "D140110" };
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
     let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
@@ -156,7 +161,7 @@ async fn auto_driver(external: bool, watched: bool) {
     publish(
         &mut peer,
         "clip/provisioning/devices/d",
-        json!({"did":"d","cmd":"deploy","kind":"D140110","data":{}}),
+        json!({"did":"d","cmd":"deploy","kind":model,"data":{}}),
     )
     .await;
     packet(&mut peer).await;
@@ -168,7 +173,9 @@ async fn auto_driver(external: bool, watched: bool) {
     .await;
     until(&mut events,|event|matches!(event,Event::ScriptOutput {payload,context:Context {generation:1,..}} if serde_json::from_str::<serde_json::Value>(payload).unwrap()["topic"]=="ildevice/d")).await;
     let session = handle.snapshot()[0].session.unwrap();
-    if !external {
+    if command {
+        real_command(&handle, session, &mut peer, &mut events).await;
+    } else if !external {
         handle
             .invoke_script(
                 "d".into(),
@@ -181,7 +188,7 @@ async fn auto_driver(external: bool, watched: bool) {
             .unwrap();
         until(&mut events,|event|matches!(event,Event::ScriptOutput {payload,..} if serde_json::from_str::<serde_json::Value>(payload).unwrap()["topic"]=="rusthinq/d/reject")).await;
     }
-    assert_eq!(handle.driver_models()["d"].1, "D140110");
+    assert_eq!(handle.driver_models()["d"].1, model);
     assert_eq!(handle.script_states()["d"].1, 1);
     if watched {
         // Poll once with the original prepared driver before editing it.
@@ -255,7 +262,7 @@ async fn auto_driver(external: bool, watched: bool) {
         watcher.await.unwrap().unwrap();
     }
     let stored = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
-    assert_eq!(stored.state().metadata["d"].model_name, "D140110");
+    assert_eq!(stored.state().metadata["d"].model_name, model);
     assert!(stored.state().metadata["d"].thinq2);
 }
 
@@ -926,4 +933,134 @@ async fn mqtt_utf8_admission_error_does_not_fault_script_or_change_its_scope() {
     transport.await.unwrap();
     stop.send_replace(true);
     app.await.unwrap().unwrap();
+}
+
+async fn real_command(
+    handle: &rusthinq_app::runtime::Handle,
+    session: rusthinq_lifecycle::SessionKey,
+    peer: &mut DuplexStream,
+    events: &mut broadcast::Receiver<Event>,
+) {
+    let app = rusthinq_app::api::AppHandle::from(handle.clone());
+    let mut projected = app.adapter_events();
+    // Without the appliance's remote-start grant, Rhai rejects and emits no send.
+    app.adapter_invoke(
+        "d".into(),
+        session,
+        1,
+        "__command".into(),
+        json!({"prop":"pause","value":""}).to_string(),
+    )
+    .await
+    .unwrap();
+    until(events, |event| matches!(event, Event::ScriptOutput {payload,..} if {
+        let publication: serde_json::Value = serde_json::from_str(payload).unwrap();
+        publication["topic"] == "rusthinq/d/reject" &&
+        serde_json::from_str::<serde_json::Value>(publication["payload"].as_str().unwrap()).unwrap()["code"] == "requires_unmet"
+    })).await;
+    // This transport has no periodic downlinks: after the driver rejection,
+    // the peer's read buffer must contain no command bytes.
+    let mut bytes = [0; 1];
+    assert!(matches!(
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let mut read = std::pin::pin!(peer.read(&mut bytes));
+            std::task::Poll::Ready(read.as_mut().poll(cx))
+        })
+        .await,
+        std::task::Poll::Pending
+    ));
+    let mut payload = vec![0; 25];
+    payload[5] = 1;
+    payload[16] = 4; // remote start, from the pinned driver's documented offsets
+    let mut inner = vec![0x20, 0xeb, 0, 25];
+    inner.extend(payload);
+    let frame = rusthinq_protocol::aabb::wrap(&inner).unwrap();
+    publish(
+        peer,
+        "clip/message/devices/d",
+        json!({
+            "did":"d", "cmd":"device_packet", "data":rusthinq_protocol::hex::encode(frame)
+        }),
+    )
+    .await;
+    until(events, |event| {
+        matches!(event,Event::ScriptOutput {payload,..} if {
+            let output:serde_json::Value=serde_json::from_str(payload).unwrap();
+            output["topic"]=="rusthinq/d/remote_start" && output["payload"]=="true"
+        })
+    })
+    .await;
+    app.adapter_invoke(
+        "d".into(),
+        session,
+        1,
+        "__command".into(),
+        json!({"prop":"pause","value":""}).to_string(),
+    )
+    .await
+    .unwrap();
+    let downlink = packet(peer).await;
+    assert_eq!(downlink[0] & 1, 0);
+    let mqtt::Packet::Publish { topic, payload, .. } = mqtt::decode(&downlink, 8192).unwrap()
+    else {
+        panic!("expected command downlink")
+    };
+    assert_eq!(topic, "lime/devices/d");
+    let command: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(command["cmd"], "packet");
+    assert_eq!(command["did"], "d");
+    let frame = rusthinq_protocol::hex::decode(command["data"].as_str().unwrap()).unwrap();
+
+    // Read the expected LG app control from the unchanged pinned upstream test.
+    let reference = include_str!("fixtures/drivers/Pd0F_F.test.rhai");
+    let pause = reference
+        .split_once("fn test_pause_and_power_off_are_the_short_controls()")
+        .unwrap()
+        .1
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("expect_eq(a::inner_hex(d, 1), \"")
+                .and_then(|rest| rest.split_once('"').map(|pair| pair.0))
+        })
+        .unwrap();
+    let expected = rusthinq_protocol::hex::decode(pause).unwrap();
+    assert_eq!(frame, rusthinq_protocol::aabb::wrap(&expected).unwrap());
+    // Use the existing event subscription for the transport receipt, while the
+    // management projection explicitly declines to infer appliance acknowledgment.
+    until(events, |event| {
+        matches!(
+            event,
+            Event::ScriptDelivery {
+                delivery: rusthinq_server::Delivery::Sent,
+                ..
+            }
+        )
+    })
+    .await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let event = projected.recv().await.unwrap();
+            if event["type"] == "scriptDelivery" {
+                assert_eq!(event["delivery"], "Sent");
+                assert_eq!(event["deviceAcknowledged"], false);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // A stale script generation is rejected before driver execution or wire send.
+    assert_eq!(
+        app.adapter_invoke(
+            "d".into(),
+            session,
+            2,
+            "__command".into(),
+            json!({"prop":"pause","value":""}).to_string()
+        )
+        .await,
+        Err(rusthinq_app::api::Reject::StaleSession)
+    );
 }

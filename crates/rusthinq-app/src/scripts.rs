@@ -213,7 +213,16 @@ impl Owner {
         }
         self.reconcile(devices);
         let owned = self.workers.get(id).ok_or(Error::Stale)?;
-        let invocation = owned.worker.handle().invoke(generation, function, input)?;
+        let handle = owned.worker.handle();
+        let current_generation = match *handle.status().borrow() {
+            rusthinq_scripting::worker::Status::Running { generation }
+            | rusthinq_scripting::worker::Status::Faulted { generation, .. }
+            | rusthinq_scripting::worker::Status::Stopped { generation } => generation,
+        };
+        if generation != current_generation {
+            return Err(Error::Stale);
+        }
+        let invocation = handle.invoke(generation, function, input)?;
         Ok(Call {
             owner: self.identity.clone(),
             binding: owned.binding,

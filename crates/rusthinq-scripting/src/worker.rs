@@ -414,6 +414,11 @@ mod tests {
         let worker = Worker::spawn(compiled, Config::default()).unwrap();
         let handle = worker.handle();
         handle.set_shutdown_callback(Some("input".into())).unwrap();
+        let unrelated = Worker::spawn(
+            Compiled::new("fn input(v){publish(v);}", Limits::default(), true).unwrap(),
+            Config::default(),
+        )
+        .unwrap();
         let result = handle
             .invoke(1, "input".into(), "prefix".into())
             .unwrap()
@@ -437,6 +442,23 @@ mod tests {
                 .error,
             Some(Error::Faulted)
         );
+        let progressed = timeout(
+            Duration::from_secs(3),
+            unrelated
+                .handle()
+                .invoke(1, "input".into(), "unrelated".into())
+                .unwrap()
+                .wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(progressed.error, None);
+        assert_eq!(
+            progressed.outputs,
+            vec![Output::Publish("unrelated".into())]
+        );
+        unrelated.shutdown().await.unwrap();
         let stopped = worker.shutdown_with_output().await.unwrap().unwrap();
         assert_eq!(stopped.error, Some(Error::Faulted));
         assert!(stopped.outputs.is_empty());

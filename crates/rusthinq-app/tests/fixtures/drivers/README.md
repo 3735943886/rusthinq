@@ -6,8 +6,11 @@ Copied unchanged from `rusthinq-scripts` revision
 these fixtures are test inputs, not a production fallback.
 
 Tests exercise initialization for all eleven models, AABB status/command gating,
+including real Pd0F_F pause bytes through the application/device transport,
 TLV query/retry effects, and automatic attachment through local provisioning.
-They do not assert actual appliance or LG account validation.
+The pinned `D140110.test.rhai` supplies nine upstream real cycle frames and expected
+values for ThinQ1 B64 replay. The tests construct the Mon envelope; no captured
+ThinQ1 TLS session is claimed. They do not assert actual appliance or LG account validation.
 
 | Source | SHA-256 |
 | --- | --- |
@@ -25,3 +28,5 @@ They do not assert actual appliance or LG account validation.
 | `aabb_common.rhai` | `fa6431795f3c6ba58234a59c65dcc02740696336fd89bbd9a9b7ee077abf776c` |
 | `monitoring_common.rhai` | `41b266919c852b0aac35134af1aa45ec7f7968f0952906759f84b977e32f4a60` |
 | `tlv_common.rhai` | `8717043714545beefdf1f05af0a528f43cafd61623a0f5e2d7ce62ea77ec7433` |
+| `D140110.test.rhai` | `f4d200dbab94906eaa0670ab9353e45b43adf6c7ca252378279b4cefa496756b` |
+| `Pd0F_F.test.rhai` | `2c507e782d6780d636d556cc493b7f3a2c27c6582cd326c1af4af731bff2f7ec` |
