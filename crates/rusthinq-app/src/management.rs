@@ -1,5 +1,8 @@
 //! Broker-independent management API and existing dashboard projection.
-use crate::runtime::{Event, Handle};
+use crate::{
+    api::{Delivery, Reject},
+    runtime::Handle,
+};
 use axum::{
     Json, Router,
     extract::{
@@ -13,7 +16,6 @@ use axum::{
 };
 use base64::Engine;
 use rusthinq_lifecycle::SessionKey;
-use rusthinq_server::{Delivery, Reject};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
@@ -44,6 +46,12 @@ impl std::fmt::Debug for Credentials {
 }
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
+        if self.gui && !cfg!(feature = "gui") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GUI feature is disabled",
+            ));
+        }
         if let Some(auth) = &self.credentials {
             if auth.user.is_empty()
                 || auth.user.contains(':')
@@ -92,6 +100,7 @@ pub fn router_with_cloud(
     }))
 }
 fn build(app: App) -> Router {
+    #[allow(unused_mut)]
     let mut routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/cloud", get(cloud_status))
@@ -110,6 +119,7 @@ fn build(app: App) -> Router {
         .route("/ws", get(panel))
         .route("/device", get(monitor))
         .route("/forget/{id}", post(forget));
+    #[cfg(feature = "gui")]
     if app.config.gui {
         routes = routes
             .route(
@@ -323,7 +333,7 @@ async fn forget(
     };
     match timeout(
         Duration::from_secs(5),
-        app.handle.forget_scoped(id, incarnation),
+        app.handle.adapter_forget(id, incarnation),
     )
     .await
     {
@@ -351,20 +361,17 @@ async fn send(State(app): State<App>, Path(id): Path<String>, Json(body): Json<V
     let Some(payload) = body["payload"].as_str() else {
         return error(StatusCode::BAD_REQUEST, "payload must be a JSON string");
     };
-    match timeout(Duration::from_secs(30), async {
-        let receipt = app
-            .handle
-            .send(
-                id,
-                SessionKey {
-                    incarnation,
-                    generation,
-                },
-                payload.as_bytes().to_vec(),
-            )
-            .await?;
-        Ok::<_, Reject>(receipt.wait().await)
-    })
+    match timeout(
+        Duration::from_secs(30),
+        app.handle.adapter_send(
+            id,
+            SessionKey {
+                incarnation,
+                generation,
+            },
+            payload.as_bytes().to_vec(),
+        ),
+    )
     .await
     {
         Ok(Ok(delivery)) => delivery_response(delivery),
@@ -412,7 +419,7 @@ async fn invoke(
     };
     match timeout(
         Duration::from_secs(5),
-        app.handle.invoke_script(
+        app.handle.adapter_invoke(
             id,
             SessionKey {
                 incarnation,
@@ -432,9 +439,9 @@ async fn invoke(
             .into_response(),
         Ok(Err(reject)) => error(
             match reject {
-                rusthinq_scripting::Error::Stale => StatusCode::CONFLICT,
-                rusthinq_scripting::Error::Busy => StatusCode::TOO_MANY_REQUESTS,
-                rusthinq_scripting::Error::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+                Reject::StaleSession => StatusCode::CONFLICT,
+                Reject::Busy => StatusCode::TOO_MANY_REQUESTS,
+                Reject::Stopped => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::BAD_REQUEST,
             },
             &format!("{reject:?}"),
@@ -444,9 +451,6 @@ async fn invoke(
             "admission unknown; do not automatically retry",
         ),
     }
-}
-fn context(context: &crate::scripts::Context) -> Value {
-    json!({"device":context.device,"incarnation":context.session.incarnation.to_string(),"generation":context.session.generation.to_string(),"scriptGeneration":context.generation.to_string()})
 }
 async fn inject(
     State(app): State<App>,
@@ -476,24 +480,18 @@ async fn inject(
         Ok(data) => data,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid hex"),
     };
-    match timeout(Duration::from_secs(30), async {
-        let receipt = app
-            .handle
-            .inject(
-                id,
-                SessionKey {
-                    incarnation,
-                    generation,
-                },
-                data,
-                to_device,
-            )
-            .await?;
-        Ok::<_, Reject>(match receipt {
-            Some(receipt) => Some(receipt.wait().await),
-            None => None,
-        })
-    })
+    match timeout(
+        Duration::from_secs(30),
+        app.handle.adapter_inject(
+            id,
+            SessionKey {
+                incarnation,
+                generation,
+            },
+            data,
+            to_device,
+        ),
+    )
     .await
     {
         Ok(Ok(Some(delivery))) => delivery_response(delivery),
@@ -532,62 +530,23 @@ async fn monitor_message(app: &App, id: &str, session: Option<SessionKey>, text:
         Ok(data) => data,
         Err(_) => return json!({"error":"invalid hex"}),
     };
-    match app.handle.inject(id.into(), session, data, to_device).await {
-        Ok(Some(receipt)) => {
-            json!({"delivery":format!("{:?}",receipt.wait().await),"deviceAcknowledged":false})
+    match app
+        .handle
+        .adapter_inject(id.into(), session, data, to_device)
+        .await
+    {
+        Ok(Some(delivery)) => {
+            json!({"delivery":format!("{:?}",delivery),"deviceAcknowledged":false})
         }
         Ok(None) => json!({"injected":true}),
         Err(reject) => json!({"error":format!("{reject:?}")}),
-    }
-}
-fn event_value(event: Event) -> Value {
-    match event {
-        Event::Injected {
-            session,
-            data,
-            to_device,
-        } => {
-            json!({"type":"injected","device":session.device,"generation":session.generation.to_string(),"hex":rusthinq_protocol::hex::encode(data),"toDevice":to_device})
-        }
-        Event::ScriptStopped {
-            context: ctx,
-            error,
-        } => json!({"type":"scriptStopped","context":context(&ctx),"error":error}),
-        Event::ScriptExecuted {
-            sequence,
-            context: scope,
-            error,
-        } => {
-            json!({"type":"scriptExecuted","sequence":sequence.to_string(),"context":context(&scope),"error":error})
-        }
-        Event::ScriptOutput {
-            context: scope,
-            payload,
-        } => json!({"type":"scriptOutput","context":context(&scope),"payload":payload}),
-        Event::ScriptDelivery {
-            context: scope,
-            delivery,
-        } => {
-            json!({"type":"scriptDelivery","context":context(&scope),"delivery":format!("{delivery:?}"),"deviceAcknowledged":false})
-        }
-        Event::Transport(rusthinq_server::Event::Data(id, bytes)) => {
-            json!({"type":"data","device":id.device,"generation":id.generation.to_string(),"hex":rusthinq_protocol::hex::encode(bytes)})
-        }
-        Event::Lost { transport_events } => json!({"type":"lost","events":transport_events}),
-        Event::Rejected { device, reason } => {
-            json!({"type":"rejected","device":device,"reason":reason})
-        }
-        Event::Metadata(metadata) => {
-            json!({"type":"metadata","device":metadata.device_id,"model":metadata.model_name,"deviceType":metadata.device_type})
-        }
-        other => json!({"type":"stateChanged","detail":format!("{other:?}")}),
     }
 }
 async fn event_socket(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
-    let mut events = app.handle.subscribe();
+    let mut events = app.handle.adapter_events();
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket|async move {
         let _permit=permit;let mut stop=app.stop.clone();
         if *stop.borrow() || !write(&mut socket,json!({"type":"snapshot","state":snapshot(&app.handle)})).await {return;}
@@ -595,7 +554,7 @@ async fn event_socket(State(app): State<App>, upgrade: WebSocketUpgrade) -> Resp
             _=stop.changed()=>break,
             message=socket.recv()=>if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;},
             event=events.recv()=> {
-                let value=match event {Ok(event)=>event_value(event),Err(broadcast::error::RecvError::Lagged(count))=>json!({"type":"lost","events":count,"state":snapshot(&app.handle)}),Err(broadcast::error::RecvError::Closed)=>break};
+                let value=match event {Ok(event)=>event,Err(broadcast::error::RecvError::Lagged(count))=>json!({"type":"lost","events":count,"state":snapshot(&app.handle)}),Err(broadcast::error::RecvError::Closed)=>break};
                 if !write(&mut socket,value).await {break;}
             }
         }}
@@ -618,7 +577,7 @@ async fn panel(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
-    let mut events = app.handle.subscribe(); // subscribe before snapshot
+    let mut events = app.handle.adapter_events(); // subscribe before snapshot
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket| async move {
         let _permit = permit;
         let mut stop = app.stop.clone();
@@ -628,7 +587,7 @@ async fn panel(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
             _=stop.changed()=>break,
             message=socket.recv()=>if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;},
             event=events.recv()=> {
-                let lost = match event {Ok(Event::Lost {transport_events})=>transport_events, Err(broadcast::error::RecvError::Lagged(count))=>count,Err(broadcast::error::RecvError::Closed)=>break,_=>0};
+                let lost = match event {Ok(value) if value["type"]=="lost"=>value["events"].as_u64().unwrap_or(0), Err(broadcast::error::RecvError::Lagged(count))=>count,Err(broadcast::error::RecvError::Closed)=>break,_=>0};
                 let mut value = snapshot(&app.handle);
                 if lost > 0 {value["lostEvents"]=json!(lost);}
                 if !write(&mut socket,value).await {break;}
@@ -651,7 +610,7 @@ async fn monitor(
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
-    let mut events = app.handle.subscribe();
+    let mut events = app.handle.adapter_events();
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket| async move {
         let _permit = permit;
         let mut stop = app.stop.clone();
@@ -674,10 +633,10 @@ async fn monitor(
             },
             event=events.recv()=> {
                 let value = match event {
-                    Ok(Event::Transport(rusthinq_server::Event::Data(id,data))) if id.device == query.id=>json!({"rx":rusthinq_protocol::thinq2::encode_hex(&data)}),
-                    Ok(Event::Injected {session,data,to_device}) if session.device==query.id=>if to_device {json!({"tx":rusthinq_protocol::hex::encode(data),"injected":true})} else {json!({"rx":rusthinq_protocol::hex::encode(data),"injected":true})},
-                    Ok(Event::Lifecycle(_))=>status(&app.handle),
-                    Ok(Event::Lost {transport_events})=>json!({"lostEvents":transport_events}),
+                    Ok(value) if value["type"]=="data" && value["device"]==query.id=>json!({"rx":value["hex"].as_str().unwrap_or_default().to_ascii_uppercase()}),
+                    Ok(value) if value["type"]=="injected" && value["device"]==query.id=>if value["toDevice"]==true {json!({"tx":value["hex"],"injected":true})} else {json!({"rx":value["hex"],"injected":true})},
+                    Ok(value) if value["type"]=="stateChanged"=>status(&app.handle),
+                    Ok(value) if value["type"]=="lost"=>json!({"lostEvents":value["events"]}),
                     Err(broadcast::error::RecvError::Lagged(count))=>json!({"lostEvents":count}),
                     Err(broadcast::error::RecvError::Closed)=>break,_=>continue,
                 };

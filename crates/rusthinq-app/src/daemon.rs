@@ -41,7 +41,11 @@ impl Config {
         if bytes.len() > 65536 {
             return Err(invalid("configuration exceeded"));
         }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| invalid("configuration must be UTF-8 TOML"))?;
+        let document: toml::Value =
+            toml::from_str(text).map_err(|_| invalid("invalid TOML configuration"))?;
+        let value = serde_json::to_value(document).map_err(|_| invalid("invalid configuration"))?;
         let fields = value
             .as_object()
             .ok_or_else(|| invalid("configuration must be an object"))?;
@@ -106,7 +110,7 @@ impl Config {
                     .parse()
                     .map_err(|_| invalid("invalid management bind"))?;
                 let gui = match management.get("gui") {
-                    None => true,
+                    None => cfg!(feature = "gui"),
                     Some(value) => value
                         .as_bool()
                         .ok_or_else(|| invalid("management gui must be boolean"))?,

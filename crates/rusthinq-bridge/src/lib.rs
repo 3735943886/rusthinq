@@ -6,3 +6,5 @@ pub mod passthrough;
 pub mod cloud;
 
 pub mod pairing;
+
+pub mod account;

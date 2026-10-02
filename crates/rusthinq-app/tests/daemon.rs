@@ -131,22 +131,41 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
 #[test]
 fn configuration_resolves_paths_and_rejects_typographical_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.json");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, r#"{"password":"do-not-echo"}"#).unwrap();
+    let error = Config::load(&path).unwrap_err().to_string();
+    assert!(!error.contains("do-not-echo"));
+    std::fs::write(
+        &path,
+        "hostname = \"one.example\"\nhostname = \"two.example\"\n",
+    )
+    .unwrap();
+    assert!(Config::load(&path).is_err());
     let mut value = serde_json::json!({"thinq1_bind":"127.0.0.1:0","mqtt_bind":"127.0.0.1:0","https_bind":"127.0.0.1:0","hostname":"local.example","ca_certificate":"ca.pem","ca_key":"key.pem","device_ledger":"devices.json"});
-    std::fs::write(&path, value.to_string()).unwrap();
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert_eq!(
         Config::load(&path).unwrap().ca_certificate,
         dir.path().join("ca.pem")
     );
     value["drivers"] = serde_json::json!({"directory":".","watch":true});
-    std::fs::write(&path, value.to_string()).unwrap();
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).unwrap().drivers.unwrap().watch);
     value["drivers"]["watch"] = serde_json::json!("true");
-    std::fs::write(&path, value.to_string()).unwrap();
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).is_err());
     value.as_object_mut().unwrap().remove("drivers");
+    value["management"] = serde_json::json!({"bind":"127.0.0.1:0"});
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().management.unwrap().gui,
+        cfg!(feature = "gui")
+    );
+    value["management"]["gui"] = true.into();
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+    assert_eq!(Config::load(&path).is_ok(), cfg!(feature = "gui"));
+    value.as_object_mut().unwrap().remove("management");
     value["mqtt_bnid"] = "127.0.0.1:0".into();
-    std::fs::write(&path, value.to_string()).unwrap();
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).is_err());
 }
 

@@ -87,6 +87,10 @@ impl Ledger {
             }
         }
     }
+    /// Record publication ownership without exposing the lower-layer cleanup model.
+    pub fn inventory_topic(&mut self, owner: String, topic: String) -> io::Result<()> {
+        self.enqueue(&[Tombstone { owner, topic }])
+    }
     pub fn enqueue(&mut self, deletions: &[Tombstone]) -> io::Result<()> {
         let mut candidate = self.cleanup.clone();
         candidate.enqueue(deletions).map_err(policy)?;

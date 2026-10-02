@@ -18,3 +18,5 @@ pub(crate) mod mqtt_commands;
 pub mod cloud_account;
 
 pub mod pairing_storage;
+
+pub mod api;

@@ -6,12 +6,12 @@ use std::{io, path::PathBuf};
 async fn main() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let path = args.next().map(PathBuf::from).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "usage: rusthinq CONFIG.json")
+        io::Error::new(io::ErrorKind::InvalidInput, "usage: rusthinq CONFIG.toml")
     })?;
     if args.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: rusthinq CONFIG.json",
+            "usage: rusthinq CONFIG.toml",
         ));
     }
     let config = tokio::task::spawn_blocking(move || Config::load(&path))

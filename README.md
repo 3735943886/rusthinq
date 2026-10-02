@@ -6,7 +6,7 @@ archived in `legacy/0.1`; migration is still in progress.
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p rusthinq-app --bin rusthinq -- /path/to/config.json
+cargo run -p rusthinq-app --bin rusthinq -- /path/to/config.toml
 ```
 
 Configure TLS device endpoints, an existing CA and durable device inventory using

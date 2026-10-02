@@ -7,7 +7,6 @@ use crate::{
     scripts::{Context, PublishSink},
 };
 use openssl::ssl::{SslConnector, SslMethod};
-use rusthinq_server::retained::Tombstone;
 pub(crate) trait Connection:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
 {
@@ -505,13 +504,11 @@ impl Runtime {
                     });
                 }
                 // A durable inventory write can span removal/replacement; check again afterwards.
-                let deletion = Tombstone {
-                    owner: message.owner.clone(),
-                    topic: message.topic.clone(),
-                };
+                let owner = message.owner.clone();
+                let topic = message.topic.clone();
                 ledger = tokio::task::spawn_blocking(move || {
                     let mut ledger = ledger;
-                    ledger.enqueue(&[deletion])?;
+                    ledger.inventory_topic(owner, topic)?;
                     Ok::<_, io::Error>(ledger)
                 })
                 .await

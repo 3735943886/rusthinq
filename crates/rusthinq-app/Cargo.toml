@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["gui"]
+gui = []
+
 [dependencies]
+toml = "0.8"
 rusthinq-server = { path = "../rusthinq-server" }
 tempfile = "3"
 rusthinq-protocol = { path = "../rusthinq-protocol" }
