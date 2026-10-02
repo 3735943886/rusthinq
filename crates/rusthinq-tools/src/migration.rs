@@ -255,6 +255,15 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
     {
         warnings.push("0.1 [scripting] il_prefix is not a host setting in 0.2; the scripts choose their own topics (rusthinq-scripts: il_common.rhai prefix()).");
     }
+    if legacy
+        .get("mqtt")
+        .is_some_and(|m| m.get("raw_prefix").is_some() || m.get("raw").is_some())
+    {
+        warnings.push("0.1 MQTT raw bus (raw_prefix/raw) is retired; use the management device monitor, rusthinq-capture, or the $raw control routes.");
+    }
+    if legacy.get("log").is_some() {
+        warnings.push("0.1 log categories are not migrated; 0.2 writes application events to stderr without categories.");
+    }
     if legacy.get("gui").is_some() {
         warnings.push("Management binds to loopback with raw injection disabled; review old GUI bind and authentication explicitly.");
     }

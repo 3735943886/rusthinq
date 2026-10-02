@@ -14,6 +14,14 @@ Configure TLS device endpoints, an existing CA and durable device inventory usin
 external MQTT are documented in [operations](docs/0.2-operations.md).
 The management API and dashboard work independently of the external broker.
 
+rusthinq is IL-agnostic: it carries device and cloud traffic and runs Rhai drivers,
+whose output it routes without interpreting. Drivers and any IL output live in
+[rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts) (`il_common.rhai`).
+
+Upgrading from 0.1: read the [release notes](docs/0.2-release-notes.md) and the
+[compatibility inventory](docs/0.2-compatibility.md). `scripts/check-0.2.sh` runs the
+full local check (format, tests, Clippy, the eight feature combinations, GUI JavaScript).
+
 [Milestones](docs/0.2-milestones.md) record completed evidence and remaining work.
 Real-appliance/LG-account validation is excluded at the user's request; unfinished
 implementation items remain visible and are not recorded as completed validation.

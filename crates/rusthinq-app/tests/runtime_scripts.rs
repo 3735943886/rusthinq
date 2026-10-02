@@ -719,3 +719,149 @@ async fn shutdown_output_from_replaced_session_never_reaches_successor() {
     task.await.unwrap().unwrap();
     assert!(publications.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn reload_removes_only_retained_topics_the_new_generation_does_not_publish() {
+    use rusthinq_scripting::context::Config as ContextConfig;
+    let compiled = |topics: &[&str]| {
+        let body: String = topics
+            .iter()
+            .map(|t| format!(r#"ctx.publish_raw("rusthinq/d/{t}","v",true);"#))
+            .collect();
+        Compiled::with_context(
+            &format!("fn on_response(ctx,body){{{body}}}"),
+            Limits::default(),
+            true,
+            ContextConfig::new("d".into(), "model".into()),
+        )
+        .unwrap()
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (sink, adapter) = rusthinq_app::external_mqtt::new(rusthinq_app::external_mqtt::Config {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        tls: false,
+        ca: None,
+        client: "reload".into(),
+        username: None,
+        password: None,
+        inventory: directory.path().join("retained.json"),
+    })
+    .unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_external_mqtt(sink.clone());
+    let handle = runtime.handle();
+    let (adapter_stop, adapter_stopped) = watch::channel(false);
+    let adapter = tokio::spawn(adapter.run(handle.clone(), adapter_stopped));
+    let (seen, mut published) = mpsc::channel::<(String, String)>(32);
+    let broker = tokio::spawn(async move {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let read = async |peer: &mut tokio::net::TcpStream| -> Option<(u8, Vec<u8>)> {
+            let header = peer.read_u8().await.ok()?;
+            let mut length = 0usize;
+            let mut shift = 0;
+            loop {
+                let byte = peer.read_u8().await.ok()?;
+                length |= usize::from(byte & 127) << shift;
+                if byte & 128 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let mut body = vec![0; length];
+            peer.read_exact(&mut body).await.ok()?;
+            Some((header, body))
+        };
+        assert_eq!(read(&mut peer).await.unwrap().0, 0x10);
+        peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+        while let Some((header, body)) = read(&mut peer).await {
+            match header {
+                0xe0 => break,
+                0xc0 => peer.write_all(&[0xd0, 0]).await.unwrap(),
+                _ => {
+                    let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                    let topic = String::from_utf8(body[2..2 + length].to_vec()).unwrap();
+                    let value = String::from_utf8(body[4 + length..].to_vec()).unwrap();
+                    peer.write_all(&[0x40, 2, body[2 + length], body[3 + length]])
+                        .await
+                        .unwrap();
+                    seen.send((topic, value)).await.unwrap();
+                }
+            }
+        }
+    });
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let mut peer = identify(&mut server).await;
+    until(&mut events, |e| {
+        matches!(
+            e,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Online { .. })
+        )
+    })
+    .await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            compiled(&["a", "b"]),
+            worker::Config::default(),
+            Callbacks {
+                response: Some("on_response".into()),
+                ..Callbacks::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut next = async || {
+        timeout(Duration::from_secs(3), published.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    response(&mut peer).await;
+    let mut first = vec![next().await, next().await];
+    first.sort();
+    assert_eq!(
+        first,
+        [
+            ("rusthinq/d/a".into(), "v".into()),
+            ("rusthinq/d/b".into(), "v".into())
+        ]
+    );
+    assert_eq!(
+        handle
+            .reload_script("d".into(), session, 1, compiled(&["a"]))
+            .await,
+        Ok(2)
+    );
+    response(&mut peer).await;
+    // b is cleared; a is republished and never cleared.
+    let mut second = vec![next().await, next().await];
+    second.sort();
+    assert_eq!(
+        second,
+        [
+            ("rusthinq/d/a".into(), "v".into()),
+            ("rusthinq/d/b".into(), String::new())
+        ]
+    );
+    timeout(Duration::from_secs(3), sink.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(published.try_recv().is_err());
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    adapter_stop.send_replace(true);
+    adapter.await.unwrap().unwrap();
+    broker.abort();
+}

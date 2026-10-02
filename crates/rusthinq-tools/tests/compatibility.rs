@@ -185,3 +185,38 @@ fn store_entries(value: &serde_json::Value) -> Vec<rusthinq_lifecycle::Entry> {
         })
         .collect()
 }
+
+#[test]
+fn staged_full_legacy_configuration_loads_in_the_daemon_and_flags_retired_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = dir.path().join("rusthinq-scripts");
+    std::fs::create_dir(&scripts).unwrap();
+    let source = dir.path().join("config.toml");
+    let original = "hostname='rusthinq.lan'\nca_key_file='ca.key'\nca_cert_file='ca.cert'\n\
+        https_port=443\nmqtts_port=8883\nthinq1_port=47878\nlog=['status']\n\
+        [mqtt]\nmqtt_url='mqtt://localhost:1883'\nrusthinq_prefix='home'\nraw_prefix='home-raw'\n\
+        [scripting]\nrhai_dir='rusthinq-scripts'\nwatch=true\nil_prefix='il'\n\
+        [gui]\ngui_port=8080\n";
+    std::fs::write(&source, original).unwrap();
+    let dest = dir.path().join("new");
+    let report = rusthinq_tools::migration::migrate(&source, &dest).unwrap();
+    let warnings = report["warnings"].to_string();
+    for retired in ["il_prefix", "raw bus", "log categories", "Management binds"] {
+        assert!(warnings.contains(retired), "{retired}: {warnings}");
+    }
+    let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
+    let drivers = config.drivers.unwrap();
+    assert_eq!(drivers.topic_prefix, "home");
+    assert!(drivers.watch);
+    assert_eq!(
+        drivers.directory.canonicalize().unwrap(),
+        scripts.canonicalize().unwrap()
+    );
+    assert!(config.management.is_some());
+    // The original installation is untouched: rollback is restarting 0.1 on it.
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("config.0.1.toml")).unwrap(),
+        original
+    );
+}
