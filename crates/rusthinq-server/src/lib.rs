@@ -75,6 +75,8 @@ pub struct SessionId {
 pub enum Event {
     Up(SessionId),
     Data(SessionId, Vec<u8>),
+    /// Original application payload after a complete device-facing frame write.
+    Sent(SessionId, Vec<u8>),
     Response(SessionId, serde_json::Value),
     Down(SessionId, Disconnect),
     Ready(SessionId, serde_json::Value),
@@ -126,6 +128,7 @@ impl Receipt {
 }
 struct Command {
     frame: Vec<u8>,
+    payload: Vec<u8>,
     result: oneshot::Sender<Delivery>,
 }
 struct Entry {
@@ -254,7 +257,11 @@ impl ServerHandle {
         let (result, receipt) = oneshot::channel();
         entry
             .commands
-            .try_send(Command { frame, result })
+            .try_send(Command {
+                frame,
+                payload: payload.to_vec(),
+                result,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Reject::Busy,
                 mpsc::error::TrySendError::Closed(_) => Reject::StaleSession,
@@ -464,6 +471,7 @@ async fn run<S>(
                     if !guard.current() { let _ = command.result.send(Delivery::Failed); break Disconnect::Closed; }
                     let result = write_frame(&mut stream, &command.frame, config.write_timeout, &mut stop, &mut closing).await;
                     let delivery = match &result { Ok(()) => Delivery::Sent, Err((_, 0)) => Delivery::Failed, Err(_) => Delivery::Unknown };
+                    if delivery==Delivery::Sent && let Some(id)=&guard.id {guard.publish(Event::Sent(id.clone(),command.payload));}
                     let _ = command.result.send(delivery);
                     if let Err((reason, _)) = result { break reason; }
                 }
@@ -529,6 +537,9 @@ async fn run<S>(
                     .await
                     {
                         break 'connection reason;
+                    }
+                    if let Some(id) = &guard.id {
+                        guard.publish(Event::Sent(id.clone(), frame[4..].to_vec()));
                     }
                 }
                 Action::Data(payload) => {

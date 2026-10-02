@@ -666,6 +666,7 @@ async fn monitor(
             event=events.recv()=> {
                 let value = match event {
                     Ok(value) if value["type"]=="data" && value["device"]==query.id=>json!({"rx":value["hex"].as_str().unwrap_or_default().to_ascii_uppercase()}),
+                    Ok(value) if value["type"]=="sent" && value["device"]==query.id=>json!({"tx":value["hex"],"deviceAcknowledged":false}),
                     Ok(value) if value["type"]=="injected" && value["device"]==query.id=>if value["toDevice"]==true {json!({"tx":value["hex"],"injected":true})} else {json!({"rx":value["hex"],"injected":true})},
                     Ok(value) if value["type"]=="stateChanged"=>status(&app.handle),
                     Ok(value) if value["type"]=="lost"=>json!({"lostEvents":value["events"]}),

@@ -80,8 +80,8 @@ fn __validate(ctx, prop, value) {
         "number" => {
             let n = (); try { let trimmed = value; trimmed.trim(); n = trimmed.parse_float(); } catch {}
             if n == () || n.is_nan() || n.is_infinite() { return __reject(ctx,prop,"invalid_value","not a number"); }
-            if def.min != () && n < def.min { return __reject(ctx,prop,"out_of_range","below minimum"); }
-            if def.max != () && n > def.max { return __reject(ctx,prop,"out_of_range","above maximum"); }
+            if def.min != () && n < def.min { return __reject(ctx,prop,"out_of_range","below the minimum of "+def.min); }
+            if def.max != () && n > def.max { return __reject(ctx,prop,"out_of_range","above the maximum of "+def.max); }
             if def.step != () && def.step > 0 {
                 let base = if def.min == () {0.0} else {def.min};
                 let steps = (n-base)/def.step;

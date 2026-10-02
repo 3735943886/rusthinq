@@ -135,6 +135,9 @@ fn event_value(event: Event) -> Value {
         } => {
             json!({"type":"scriptDelivery","context":context(&scope),"delivery":format!("{delivery:?}"),"deviceAcknowledged":false})
         }
+        Event::Transport(rusthinq_server::Event::Sent(id, bytes)) => {
+            json!({"type":"sent","device":id.device,"generation":id.generation.to_string(),"hex":rusthinq_protocol::hex::encode(bytes)})
+        }
         Event::Transport(rusthinq_server::Event::Data(id, bytes)) => {
             json!({"type":"data","device":id.device,"generation":id.generation.to_string(),"hex":rusthinq_protocol::hex::encode(bytes)})
         }

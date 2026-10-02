@@ -144,6 +144,14 @@ class DeviceEntry {
                 <span class="tooltipped" style="display: inline-block" data-position="bottom" data-tooltip="Forget this device -- clears its saved state; it won't be listed again unless it reconnects">
                     <a class="btn waves-effect waves-light red" href="#"><i class="material-icons">delete_forever</i></a>
                 </span>`
+            if (this.remoteState.bridgePaired || this.remoteState.bridgePending) {
+                const unpair = document.createElement('button')
+                unpair.className = 'btn-flat'
+                unpair.textContent = 'Unpair'
+                const scope = { incarnation: this.remoteState.incarnation }
+                unpair.onclick = () => fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                td.appendChild(unpair)
+            }
             children.push(td)
 
             this.row.replaceChildren(...children)
@@ -341,7 +349,7 @@ class DeviceEntry {
         } else {
             this.spinner.classList.add('hide')
             this.bridgeDiv.classList.remove('hide')
-            this.bridgeSwitch.checked = !!this.remoteState.bridged
+            this.bridgeSwitch.checked = !!this.remoteState.bridgeEnabled
         }
 
         // Materialize greys out a switch from the disabled attribute, not from a class, so setting
@@ -486,6 +494,8 @@ async function cloudStatus() {
         get('bridge_mode_section').classList.toggle('hide', !bridgeFeatureEnabled && !cloudAccountEnabled)
         if (!cloudAccountEnabled) return
         const account = cloud.account
+        bridge_status = !!account.loggedIn
+        for (const device of Object.values(devices)) device.refreshUI()
         get('btn_thinq_login').classList.toggle('hide', account.loggedIn)
         get('btn_thinq_logout').classList.toggle('hide', !account.stored)
         get('status_bridge').innerHTML = account.loggedIn ? STATUS_OK : STATUS_ERROR

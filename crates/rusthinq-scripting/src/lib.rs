@@ -269,6 +269,9 @@ impl Compiled {
             return Err(Error::InvalidConfig);
         }
         self.ast = self.ast.merge(&entry);
+        if let Some(invocation) = &mut self.invocation_ast {
+            *invocation = invocation.merge(&entry);
+        }
         Ok(self)
     }
     /// Configure the actual consumer before attaching this compiled generation.
@@ -470,3 +473,5 @@ mod tests {
         assert_eq!(other.invoke(1, "input", "healthy").error, None);
     }
 }
+
+pub mod testing;

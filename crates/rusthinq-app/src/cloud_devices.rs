@@ -216,9 +216,12 @@ impl Runtime {
     async fn stop_device(&mut self, id: &str) -> io::Result<()> {
         if let Some(task) = self.tasks.remove(id) {
             task.stop.send_replace(true);
-            task.task
+            // A terminated session already reports its error in device status.
+            // Disabling or retrying must still finish its cleanup.
+            let _ = task
+                .task
                 .await
-                .map_err(|e| io::Error::other(format!("{e:?}")))??;
+                .map_err(|e| io::Error::other(format!("{e:?}")))?;
         }
         Ok(())
     }
@@ -368,15 +371,14 @@ impl Runtime {
                 if client.account_identity() != Some(record.attempt.owner.account.as_str()) {
                     return Err(stale());
                 }
-                if let Some(registration) = &registration {
-                    if !self
+                if let Some(registration) = &registration
+                    && !self
                         .bridge
                         .snapshot()
                         .iter()
                         .any(|s| s.registration == *registration)
-                    {
-                        return Err(stale());
-                    }
+                {
+                    return Err(stale());
                 }
                 let attempt = record.attempt.clone();
                 self.storage(move |store| store.set_enabled(&attempt, false))
@@ -608,10 +610,10 @@ async fn supervise(
             ),
         )
         .await;
-        if matches!(material, Material::ThinQ2 { .. }) {
-            if let Ok(receipt) = context.broker.bridge_state(&local, generation + 1, false) {
-                let _ = timeout(Duration::from_secs(15), receipt.wait()).await;
-            }
+        if matches!(material, Material::ThinQ2 { .. })
+            && let Ok(receipt) = context.broker.bridge_state(&local, generation + 1, false)
+        {
+            let _ = timeout(Duration::from_secs(15), receipt.wait()).await;
         }
         let _ = context.bridge.unbind(&registration, &local);
         if let Some(status) = context
@@ -662,7 +664,6 @@ async fn connected(
     clients: &mut watch::Receiver<Option<Arc<Client>>>,
     account: &str,
 ) -> io::Result<()> {
-    let stream = tokio::select! {biased;_=stop.changed()=>return Ok(()),_=cancelled.changed()=>return Ok(()),result=connector.connect()=>result?};
     let identity = session::Identity {
         device: local.device.clone(),
         model: context
@@ -679,6 +680,16 @@ async fn connected(
             })
             .ok_or_else(stale)?,
     };
+    if matches!(material, Material::ThinQ1 { .. }) {
+        let device_type = context
+            .app
+            .persisted_models()
+            .get(&local.device)
+            .map(|meta| meta.device_type.clone())
+            .unwrap_or_else(|| "201".into());
+        transport::prepare_thinq1(material, &local.device, &identity.model, &device_type).await?;
+    }
+    let stream = tokio::select! {biased;_=stop.changed()=>return Ok(()),_=cancelled.changed()=>return Ok(()),result=connector.connect()=>result?};
     let (uplink, received) = mpsc::channel(32);
     let (output, mut input) = mpsc::channel(32);
     let (_stop, stopped) = watch::channel(false);
@@ -729,7 +740,7 @@ async fn connected(
             result=&mut operation=>return result,
             event=input.recv()=>match event{
                 Some(session::Event::Ready)=>{
-                    if matches!(material,Material::ThinQ2{..}) {if timeout(Duration::from_secs(15),context.broker.bridge_state(local,generation,true).map_err(|e|io::Error::other(format!("{e:?}")))?.wait()).await!=Ok(rusthinq_server::Delivery::Sent){return Err(stale());}}
+                    if matches!(material,Material::ThinQ2{..}) && timeout(Duration::from_secs(15),context.broker.bridge_state(local,generation,true).map_err(|e|io::Error::other(format!("{e:?}")))?.wait()).await!=Ok(rusthinq_server::Delivery::Sent){return Err(stale());}
                     ready=true;if let Some(status)=context.statuses.lock().unwrap_or_else(|e|e.into_inner()).get_mut(&local.device){status.connected=true;status.error=None;}
                 context.app.cloud_changed(local.device.clone());
                 },

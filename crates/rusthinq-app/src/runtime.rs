@@ -1336,7 +1336,7 @@ impl Runtime {
                     Ok(TransportEvent::Down(id,_)) => self.down(id),
                     Ok(event) => {
                         let session = match &event {
-                            TransportEvent::Data(id,_) | TransportEvent::Response(id,_) |
+                            TransportEvent::Data(id,_) | TransportEvent::Sent(id,_) | TransportEvent::Response(id,_) |
                             TransportEvent::Ready(id,_) | TransportEvent::CloudBound(id,_) |
                             TransportEvent::BridgedCloudBound(id,_,_) | TransportEvent::BridgeChanged(id,_,_) => Some(id),
                             TransportEvent::Will {session,..} => session.as_ref(),

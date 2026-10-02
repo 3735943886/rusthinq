@@ -195,3 +195,42 @@ impl Connector {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "cloud TCP/TLS connect timed out"))?
     }
 }
+
+/// Prepare ThinQ1 time-sync subscription before opening RTI. This request does
+/// not register a device and is safe to repeat for each connection attempt.
+pub async fn prepare_thinq1(
+    material: &Material,
+    device: &str,
+    model: &str,
+    device_type: &str,
+) -> io::Result<()> {
+    let Material::ThinQ1 { http_server, .. } = material else {
+        return Err(invalid());
+    };
+    let mut endpoint = service(http_server).map_err(|_| invalid())?;
+    if endpoint.scheme() != "https"
+        || [device, model, device_type]
+            .iter()
+            .any(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
+    {
+        return Err(invalid());
+    }
+    endpoint.set_path("/lgehadm/api/Device/TotalDeviceInfoSvc");
+    let model = model
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| invalid())?;
+    let response=client.post(endpoint).header("Accept","text/xml").header("content-type","text/xml;charset=utf-8").header("x-lgedm-userid","lgehadmUser").header("x-lgedm-password","bxLoLAZ+rp3oJDbEzRuIfAG4YumeqwWM9l6uUH6TupQ=").header("x-lgedm-deviceid",device).header("x-lgedm-devicetype",device_type).body(format!("<lgedmRoot><countryCode>WW</countryCode><modelName>{model}</modelName><itemList><item>THINQ_TIME_SYNC_URI</item><elementList><elementCode>pushDetailYn</elementCode><elementValue>Y</elementValue></elementList></itemList></lgedmRoot>")).send().await.map_err(|_|io::Error::other("ThinQ1 setup request failed"))?;
+    if !response.status().is_success() {
+        return Err(io::Error::other("ThinQ1 setup rejected"));
+    }
+    // No response body is required for the RTI subscription; dropping it bounds memory.
+    Ok(())
+}

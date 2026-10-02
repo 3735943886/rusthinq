@@ -1,0 +1,25 @@
+[package]
+name = "rusthinq-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusthinq-scripting = { path = "../rusthinq-scripting" }
+rusthinq-protocol = { path = "../rusthinq-protocol" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal", "io-std"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "json"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2"
+base64 = "0.22"
+anyhow = "1"
+chrono = "0.4"
+openssl = "0.10"
+tokio-openssl = "0.6"
+
+toml = "0.8"
+tempfile = "3"
+
+[dev-dependencies]

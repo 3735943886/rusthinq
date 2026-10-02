@@ -177,7 +177,11 @@ impl Handle {
         let (result, receive) = oneshot::channel();
         entry
             .commands
-            .try_send(Command { frame, result })
+            .try_send(Command {
+                frame,
+                payload: payload.to_vec(),
+                result,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Reject::Busy,
                 mpsc::error::TrySendError::Closed(_) => Reject::StaleSession,
@@ -361,6 +365,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                                     let _ = command.result.send(if written == 0 {Delivery::Failed} else {Delivery::Unknown});
                                     break 'connection reason;
                                 }
+                                guard.publish(Event::Sent(command.target.clone(),payload));
                             }
                             _ => {delivery=Delivery::Failed;break;}
                         }
@@ -374,6 +379,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         if !filters.iter().any(|filter| mqtt::matches(filter, &topic)) { let _ = command.result.send(Delivery::Failed); continue; }
                         let result = write_frame(&mut writer, &command.frame, config.write_timeout, &mut stop, &mut closing).await;
                         let delivery = match &result { Ok(()) => Delivery::Sent, Err((_, 0)) => Delivery::Failed, Err(_) => Delivery::Unknown };
+                        if delivery==Delivery::Sent && let Some(id)=&guard.id {guard.publish(Event::Sent(id.clone(),command.payload));}
                         let _ = command.result.send(delivery);
                         if let Err((reason, _)) = result { break 'connection reason; }
                     }
@@ -751,6 +757,9 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     .await
                     {
                         break 'connection reason;
+                    }
+                    if let Some(id) = &guard.id {
+                        guard.publish(Event::Sent(id.clone(), payload));
                     }
                 }
                 Action::TimeSyncRequested => {
