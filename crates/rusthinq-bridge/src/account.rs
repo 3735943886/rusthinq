@@ -72,8 +72,10 @@ pub struct Handle {
     status: watch::Receiver<Status>,
     client: watch::Receiver<Option<Arc<Client>>>,
 }
+type ClientFactory = Arc<dyn Fn(&str) -> Result<Client, crate::cloud::Error> + Send + Sync>;
 pub struct Runtime {
     store: Arc<dyn CredentialStore>,
+    factory: ClientFactory,
     commands: mpsc::Receiver<Command>,
     logout: mpsc::Receiver<Command>,
     epoch: watch::Receiver<u64>,
@@ -108,6 +110,7 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
         },
         Runtime {
             store,
+            factory: Arc::new(Client::new),
             commands: received,
             logout: urgent,
             epoch: cancelled,
@@ -331,6 +334,15 @@ impl Runtime {
             error,
         });
     }
+    /// Test seam: build clients against a fake LG service instead of `Client::new`.
+    #[cfg(feature = "test-support")]
+    pub fn with_client_factory(
+        mut self,
+        factory: impl Fn(&str) -> Result<Client, crate::cloud::Error> + Send + Sync + 'static,
+    ) -> Self {
+        self.factory = Arc::new(factory);
+        self
+    }
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
         let mut active = None;
         let mut pending = None;
@@ -375,7 +387,7 @@ impl Runtime {
                         match action {
                             Action::Login(country) => {
                                 let mut client =
-                                    Client::new(&country).map_err(|_| Error::InvalidInput)?;
+                                    (self.factory)(&country).map_err(|_| Error::InvalidInput)?;
                                 let url = client.sign_in_url().await.map_err(remote)?;
                                 pending = Some((country, client));
                                 Ok((serde_json::json!({"url":url}), None))
@@ -419,7 +431,7 @@ impl Runtime {
                                         .map_err(remote)?;
                                     Ok((serde_json::json!({"ok":true}), None))
                                 } else {
-                                    let mut client = Client::new(&credentials.country)
+                                    let mut client = (self.factory)(&credentials.country)
                                         .map_err(|_| Error::InvalidInput)?;
                                     client
                                         .authenticate(&credentials.refresh)

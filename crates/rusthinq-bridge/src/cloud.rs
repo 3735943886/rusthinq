@@ -203,6 +203,34 @@ impl Client {
             account: None,
         })
     }
+    /// Test seam: an LG-compatible service at `gateway`, trusted by `root_pem`, with
+    /// `names` resolved to `address`. Headers, OAuth and request flows are unchanged.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_service(
+        country: &str,
+        gateway: &str,
+        root_pem: &str,
+        names: &[&str],
+        address: std::net::SocketAddr,
+    ) -> Result<Self, Error> {
+        let mut client = Self::new(country)?;
+        let mut http = Http::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(5))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(root_pem.as_bytes())
+                    .map_err(|_| Error::InvalidInput)?,
+            );
+        for name in names {
+            http = http.resolve(name, address);
+        }
+        client.http = http.build().map_err(|_| Error::Network)?;
+        client.gateway_url = endpoint(gateway)?;
+        Ok(client)
+    }
     pub(crate) async fn request(
         &self,
         url: Url,

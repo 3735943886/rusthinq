@@ -663,10 +663,15 @@ async fn supervise(
             .bridge
             .registered(device.clone(), registration.incarnation)
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        context
-            .bridge
-            .bind(&registration, local.clone())
-            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        // Stale here means the local session was replaced or closed since the snapshot:
+        // re-evaluate rather than ending the supervisor.
+        if let Err(error) = context.bridge.bind(&registration, local.clone()) {
+            if error != rusthinq_bridge::devices::Error::Stale {
+                return Err(io::Error::other(format!("{error:?}")));
+            }
+            tokio::select! {biased;_=stop.changed()=>break,_=events.recv()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+            continue;
+        }
         let generation = context
             .generation
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(2))
@@ -698,13 +703,29 @@ async fn supervise(
         {
             let _ = timeout(Duration::from_secs(15), receipt.wait()).await;
         }
-        let _ = context.bridge.unbind(&registration, &local);
+        // Only the cloud session may have ended. Unbind means the *local* session is
+        // finished, after which it can never be bound again; keep the binding while that
+        // local session is still current so the next cloud session can reuse it.
+        let local_current = context.app.snapshot().iter().any(|d| {
+            d.entry.id == device
+                && d.entry.incarnation == registration.incarnation
+                && d.online
+                && d.removal.is_none()
+                && d.session.is_some_and(|s| s.generation == local.generation)
+        });
+        if !local_current {
+            let _ = context.bridge.unbind(&registration, &local);
+        }
         if let Some(status) = context
             .statuses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_mut(&device)
         {
+            // A session that reached Ready was healthy: reconnect promptly, as 0.1 did.
+            if status.connected {
+                backoff = 1;
+            }
             status.connected = false;
             status.error = result.as_ref().err().map(ToString::to_string);
         }

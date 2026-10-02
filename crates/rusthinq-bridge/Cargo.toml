@@ -18,5 +18,9 @@ base64 = "0.22"
 httpdate = "1"
 serde = {version="1",features=["derive"]}
 
+[features]
+# Test seams for composed tests against fake LG services. Never enabled by the daemon.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
