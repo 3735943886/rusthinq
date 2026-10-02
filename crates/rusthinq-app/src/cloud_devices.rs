@@ -150,7 +150,7 @@ impl Runtime {
     ) -> io::Result<(Handle, Self, BridgeHandle)> {
         let store = tokio::task::spawn_blocking(move || Store::open(&path, 256))
             .await
-            .map_err(io::Error::other)??;
+            .map_err(|e| io::Error::other(format!("{e:?}")))??;
         let bridge = BridgeHandle::new(256, 1_000_000, 256)
             .map_err(|_| io::Error::other("invalid bridge limits"))?;
         let (commands, received) = mpsc::channel(16);
@@ -199,6 +199,8 @@ impl Runtime {
                 },
             );
         }
+        drop(statuses);
+        self.app.cloud_changed(String::new());
     }
     async fn storage<T: Send + 'static>(
         &self,
@@ -209,12 +211,14 @@ impl Runtime {
             operation(&mut store.lock().unwrap_or_else(|e| e.into_inner()))
         })
         .await
-        .map_err(io::Error::other)?
+        .map_err(|e| io::Error::other(format!("{e:?}")))?
     }
     async fn stop_device(&mut self, id: &str) -> io::Result<()> {
         if let Some(task) = self.tasks.remove(id) {
             task.stop.send_replace(true);
-            task.task.await.map_err(io::Error::other)??;
+            task.task
+                .await
+                .map_err(|e| io::Error::other(format!("{e:?}")))??;
         }
         Ok(())
     }
@@ -226,10 +230,11 @@ impl Runtime {
     }
     async fn command(
         &mut self,
-        command: Command,
+        operation: Operation,
+        registration: Option<Registration>,
         stop: &mut watch::Receiver<bool>,
     ) -> io::Result<()> {
-        match command.operation {
+        match operation {
             Operation::Pair(pair) => {
                 if !self.current(&pair.device, pair.incarnation) {
                     return Err(stale());
@@ -245,8 +250,10 @@ impl Runtime {
                 let client = self
                     .account
                     .authenticated_client()
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 let identity = client.account_identity().ok_or_else(stale)?.to_string();
+                let mut cancelled = self.account.cancellation();
+                let epoch = *cancelled.borrow_and_update();
                 let owner = Owner {
                     device: pair.device.clone(),
                     incarnation: pair.incarnation,
@@ -254,8 +261,15 @@ impl Runtime {
                 };
                 let attempt = self.storage(move |store| store.begin(owner)).await?;
                 self.project();
-                let mut cancelled = self.account.cancellation();
-                let epoch = *cancelled.borrow_and_update();
+                if !self.current(&pair.device, pair.incarnation)
+                    || *cancelled.borrow() != epoch
+                    || !self
+                        .account
+                        .authenticated_client()
+                        .is_ok_and(|c| c.account_identity() == Some(identity.as_str()))
+                {
+                    return Err(stale());
+                }
                 // Intent is already durable. Unknown remote outcomes stay owned and are never retried.
                 let remote = async {
                     client
@@ -268,9 +282,16 @@ impl Runtime {
                             ciphertext: None,
                         })
                         .await
-                        .map_err(io::Error::other)
+                        .map_err(|e| io::Error::other(format!("{e:?}")))
                 };
-                let material = tokio::select! {biased;_=stop.changed()=>return Err(stale()),_=cancelled.changed()=>return Err(stale()),result=timeout(Duration::from_secs(90),remote)=>result.map_err(|_|io::Error::new(io::ErrorKind::TimedOut,"pairing outcome unknown"))??};
+                let material = owned_remote(&self.account, &identity, epoch, stop, async {
+                    timeout(Duration::from_secs(90), remote)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "pairing outcome unknown")
+                        })?
+                })
+                .await?;
                 if *cancelled.borrow() != epoch {
                     return Err(stale());
                 }
@@ -284,10 +305,10 @@ impl Runtime {
                 let registration = self
                     .bridge
                     .registered(pair.device, pair.incarnation)
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 self.bridge
                     .disable(&registration)
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 Ok(())
             }
             Operation::Enable {
@@ -299,11 +320,14 @@ impl Runtime {
                     return Err(stale());
                 }
                 let record = self.record(&device, incarnation)?;
+                if record.material.is_none() {
+                    return Err(stale());
+                }
                 if enabled {
                     let client = self
                         .account
                         .authenticated_client()
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
                     if client.account_identity() != Some(record.attempt.owner.account.as_str()) {
                         return Err(stale());
                     }
@@ -312,7 +336,7 @@ impl Runtime {
                         .as_ref()
                         .ok_or_else(stale)?
                         .validate()
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 }
                 let attempt = record.attempt.clone();
                 self.storage(move |store| store.set_enabled(&attempt, enabled))
@@ -321,13 +345,13 @@ impl Runtime {
                 let registration = self
                     .bridge
                     .registered(device.clone(), incarnation)
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 if enabled {
                     self.start(record, registration)?;
                 } else {
                     self.bridge
                         .disable(&registration)
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 }
                 self.project();
                 Ok(())
@@ -340,11 +364,11 @@ impl Runtime {
                 let client = self
                     .account
                     .authenticated_client()
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 if client.account_identity() != Some(record.attempt.owner.account.as_str()) {
                     return Err(stale());
                 }
-                if let Some(registration) = &command.registration {
+                if let Some(registration) = &registration {
                     if !self
                         .bridge
                         .snapshot()
@@ -366,15 +390,28 @@ impl Runtime {
                 {
                     self.bridge
                         .disable(&status.registration)
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 }
                 let mut cancelled = self.account.cancellation();
                 cancelled.borrow_and_update();
-                tokio::select! {biased;_=stop.changed()=>return Err(stale()),_=cancelled.changed()=>return Err(stale()),result=client.remove_device(&device)=>result.map_err(io::Error::other)?};
+                let epoch = *cancelled.borrow();
+                owned_remote(
+                    &self.account,
+                    &record.attempt.owner.account,
+                    epoch,
+                    stop,
+                    async {
+                        client
+                            .remove_device(&device)
+                            .await
+                            .map_err(|e| io::Error::other(format!("{e:?}")))
+                    },
+                )
+                .await?;
                 let attempt = record.attempt.clone();
                 self.storage(move |store| store.remove_confirmed(&attempt, true))
                     .await?;
-                if command.registration.is_none()
+                if registration.is_none()
                     && let Some(status) = self
                         .bridge
                         .snapshot()
@@ -383,7 +420,7 @@ impl Runtime {
                 {
                     self.bridge
                         .deregistered(&status.registration)
-                        .map_err(io::Error::other)?;
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 }
                 self.project();
                 Ok(())
@@ -423,10 +460,13 @@ impl Runtime {
                         record.attempt.owner.device.clone(),
                         record.attempt.owner.incarnation,
                     )
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 self.bridge
                     .disable(&registration)
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                if record.enabled {
+                    self.start(record, registration)?;
+                }
             }
         }
         while !*stop.borrow() {
@@ -434,22 +474,23 @@ impl Runtime {
             if command.result.is_closed() {
                 continue;
             }
+            let target = match &command.operation {
+                Operation::Pair(p) => p.device.clone(),
+                Operation::Enable { device, .. } | Operation::Unpair { device, .. } => {
+                    device.clone()
+                }
+            };
             let result = self
-                .command(
-                    Command {
-                        operation: command.operation,
-                        result: oneshot::channel().0,
-                        registration: command.registration,
-                    },
-                    &mut stop,
-                )
+                .command(command.operation, command.registration, &mut stop)
                 .await;
             if let Err(error) = &result {
                 self.project();
                 let mut statuses = self.handle.status.lock().unwrap_or_else(|e| e.into_inner());
-                for status in statuses.values_mut() {
+                if let Some(status) = statuses.get_mut(&target) {
                     status.error = Some(error.to_string());
                 }
+                drop(statuses);
+                self.app.cloud_changed(target);
             }
             let _ = command.result.send(result);
         }
@@ -503,7 +544,7 @@ async fn supervise(
         transport::Connector::new(&prepared, Default::default())
     })
     .await
-    .map_err(io::Error::other)??;
+    .map_err(|e| io::Error::other(format!("{e:?}")))??;
     let mut backoff = 1;
     let mut events = context.app.subscribe();
     loop {
@@ -530,33 +571,41 @@ async fn supervise(
                 generation: s.generation,
             });
         let Some(local) = local.filter(|_| client.is_some()) else {
-            tokio::select! {biased;_=stop.changed()=>break,_=cancelled.changed()=>break,_=clients.changed()=>{},_=events.recv()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+            tokio::select! {biased;_=stop.changed()=>break,_=cancelled.changed()=>{cancelled.borrow_and_update();},_=clients.changed()=>{},_=events.recv()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
             continue;
         };
         context
             .bridge
             .registered(device.clone(), registration.incarnation)
-            .map_err(io::Error::other)?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         context
             .bridge
             .bind(&registration, local.clone())
-            .map_err(io::Error::other)?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         let generation = context
             .generation
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(2))
             .map_err(|_| stale())?;
-        let result = connected(
-            &context,
-            &connector,
-            &material,
-            &registration,
-            &local,
-            generation,
-            &mut events,
-            &mut stop,
-            &mut cancelled,
-            &mut clients,
+        let mut owned_stop = stop.clone();
+        let epoch = *cancelled.borrow();
+        let result = owned_remote(
+            &context.account,
             &account,
+            epoch,
+            &mut owned_stop,
+            connected(
+                &context,
+                &connector,
+                &material,
+                &registration,
+                &local,
+                generation,
+                &mut events,
+                &mut stop,
+                &mut cancelled,
+                &mut clients,
+                &account,
+            ),
         )
         .await;
         if matches!(material, Material::ThinQ2 { .. }) {
@@ -574,8 +623,13 @@ async fn supervise(
             status.connected = false;
             status.error = result.as_ref().err().map(ToString::to_string);
         }
-        if *stop.borrow() || cancelled.has_changed().unwrap_or(true) {
+        context.app.cloud_changed(device.clone());
+        if *stop.borrow() {
             break;
+        }
+        if cancelled.has_changed().unwrap_or(true) {
+            cancelled.borrow_and_update();
+            continue;
         }
         if let Err(error) = &result
             && matches!(
@@ -585,13 +639,13 @@ async fn supervise(
         {
             break;
         }
-        tokio::select! {biased;_=stop.changed()=>break,_=cancelled.changed()=>break,_=tokio::time::sleep(Duration::from_secs(backoff))=>{}}
+        tokio::select! {biased;_=stop.changed()=>break,_=cancelled.changed()=>{cancelled.borrow_and_update();},_=tokio::time::sleep(Duration::from_secs(backoff))=>{}}
         backoff = (backoff * 2).min(60);
     }
     context
         .bridge
         .disable(&registration)
-        .map_err(io::Error::other)?;
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
@@ -663,18 +717,25 @@ async fn connected(
     tokio::pin!(operation);
     let mut ready = false;
     loop {
+        let expires = clients
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.expires_at())
+            .unwrap_or_else(tokio::time::Instant::now);
         tokio::select! {biased;
+        _=tokio::time::sleep_until(expires)=>return Ok(()),
             _=stop.changed()=>return Ok(()),_=cancelled.changed()=>return Ok(()),
             _=clients.changed()=>{if !clients.borrow().as_ref().is_some_and(|c|c.authenticated() && c.account_identity()==Some(account)){return Ok(());}},
             result=&mut operation=>return result,
             event=input.recv()=>match event{
                 Some(session::Event::Ready)=>{
-                    if matches!(material,Material::ThinQ2{..}) {if context.broker.bridge_state(local,generation,true).map_err(io::Error::other)?.wait().await!=rusthinq_server::Delivery::Sent{return Err(stale());}}
+                    if matches!(material,Material::ThinQ2{..}) {if timeout(Duration::from_secs(15),context.broker.bridge_state(local,generation,true).map_err(|e|io::Error::other(format!("{e:?}")))?.wait()).await!=Ok(rusthinq_server::Delivery::Sent){return Err(stale());}}
                     ready=true;if let Some(status)=context.statuses.lock().unwrap_or_else(|e|e.into_inner()).get_mut(&local.device){status.connected=true;status.error=None;}
+                context.app.cloud_changed(local.device.clone());
                 },
                 Some(session::Event::Downlink{payload,result})=>{
-                    let receipt=if ready && matches!(material,Material::ThinQ1{..}){context.bridge.downlink(registration,local,&payload,&context.server,Some(&context.firmware)).map_err(io::Error::other)}else if ready{
-                        let value:serde_json::Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(io::Error::other)?;context.firmware.learn_command(&value)?;context.broker.cloud(local,generation,&payload).map_err(io::Error::other)
+                    let receipt=if ready && matches!(material,Material::ThinQ1{..}){context.bridge.downlink(registration,local,&payload,&context.server,Some(&context.firmware)).map_err(|e|io::Error::other(format!("{e:?}")))}else if ready{
+                        let value:serde_json::Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|e|io::Error::other(format!("{e:?}")))?;context.firmware.learn_command(&value)?;context.broker.cloud(local,generation,&payload).map_err(|e|io::Error::other(format!("{e:?}")))
                     }else{Err(stale())};
                     let delivered=match receipt{Ok(receipt)=>timeout(Duration::from_secs(15),receipt.wait()).await==Ok(rusthinq_server::Delivery::Sent),Err(_)=>false};let _=result.send(delivered);
                 },None=>return Err(stale())
@@ -689,6 +750,33 @@ async fn connected(
                 if !context.app.snapshot().iter().any(|d|d.entry.id==local.device && d.entry.incarnation==registration.incarnation && d.session.is_some_and(|s|s.generation==local.generation) && d.online && d.removal.is_none()){return Ok(());}
                 if ready && let Some(payload)=payload {let (result,_)=oneshot::channel();uplink.try_send(session::Uplink{payload,result}).map_err(|_|io::Error::new(io::ErrorKind::WouldBlock,"cloud uplink capacity exceeded"))?;}
             }
+        }
+    }
+}
+
+async fn owned_remote<T>(
+    account: &account::Handle,
+    identity: &str,
+    epoch: u64,
+    stop: &mut watch::Receiver<bool>,
+    operation: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let mut cancelled = account.cancellation();
+    let mut clients = account.clients();
+    tokio::pin!(operation);
+    loop {
+        if *stop.borrow() || *cancelled.borrow() != epoch {
+            return Err(stale());
+        }
+        let expires = clients
+            .borrow()
+            .as_ref()
+            .filter(|c| c.authenticated() && c.account_identity() == Some(identity))
+            .and_then(|c| c.expires_at())
+            .ok_or_else(stale)?;
+        tokio::select! {biased;
+            _=stop.changed()=>return Err(stale()),_=cancelled.changed()=>return Err(stale()),_=tokio::time::sleep_until(expires)=>return Err(stale()),
+            result=&mut operation=>return result,_=clients.changed()=>{},
         }
     }
 }

@@ -47,6 +47,28 @@ impl Service {
             local: Vec::new(),
         })
     }
+    #[cfg(feature = "bridge")]
+    pub async fn with_cloud_devices(
+        mut self,
+        path: std::path::PathBuf,
+        account: crate::cloud_account::Handle,
+        firmware: rusthinq_bridge::passthrough::Relay,
+    ) -> io::Result<(Self, crate::cloud_devices::Runtime)> {
+        let (handle, cloud, bridge) = crate::cloud_devices::Runtime::open(
+            path,
+            account,
+            self.handle(),
+            self.server.handle(),
+            self.broker.handle(),
+            firmware,
+        )
+        .await?;
+        self.handle().attach_cloud_devices(handle.clone())?;
+        self.runtime =
+            self.runtime
+                .with_bridge(bridge, Arc::new(handle), Duration::from_secs(90))?;
+        Ok((self, cloud))
+    }
     pub fn handle(&self) -> Handle {
         self.runtime.handle()
     }

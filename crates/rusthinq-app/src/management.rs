@@ -95,6 +95,8 @@ fn build(app: App) -> Router {
     #[allow(unused_mut)]
     let mut routes = Router::new()
         .route("/api/health", get(health))
+        .route("/api/cloud/devices", get(cloud_devices))
+        .route("/api/devices/{id}/bridge/{action}", post(cloud_device))
         .route("/api/cloud", get(cloud_status))
         .route("/api/cloud/login", post(cloud_login))
         .route("/api/cloud/login/complete", post(cloud_complete))
@@ -278,6 +280,7 @@ fn snapshot(handle: &Handle) -> Value {
     let models = handle.driver_models();
     let persisted_models = handle.persisted_models();
     let states = handle.script_states();
+    let cloud = handle.cloud_devices();
     let mut devices = serde_json::Map::new();
     for device in handle.snapshot() {
         let meta = metadata
@@ -287,6 +290,12 @@ fn snapshot(handle: &Handle) -> Value {
         let script = states
             .get(&device.entry.id)
             .filter(|(session, _, _)| Some(*session) == device.session);
+        let bridge = cloud["devices"].as_array().and_then(|ds| {
+            ds.iter().find(|d| {
+                d["device"] == device.entry.id
+                    && d["incarnation"].as_u64() == Some(device.entry.incarnation)
+            })
+        });
         devices.insert(
             device.entry.id.clone(),
             json!({
@@ -297,12 +306,12 @@ fn snapshot(handle: &Handle) -> Value {
                 "deviceType":meta.map(|m|m.device_type.as_str()),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
                 "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
-                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some(),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":false,
+                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some(),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
                 "removal":device.removal.map(|r|format!("{r:?}"))
             }),
         );
     }
-    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":!states.is_empty(),"bridge":false},"mqtt":null,"guiMqtt":null,"management":true})
+    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":!states.is_empty(),"bridge":cloud["enabled"]},"mqtt":null,"guiMqtt":null,"management":true})
 }
 async fn devices(State(app): State<App>) -> Json<Value> {
     Json(snapshot(&app.handle))
@@ -680,6 +689,24 @@ async fn write(socket: &mut WebSocket, value: Value) -> bool {
 }
 
 /// Own HTTP tasks and drain upgraded sockets through their stop receiver/permits.
+async fn cloud_devices(State(app): State<App>) -> Json<Value> {
+    Json(app.handle.cloud_devices())
+}
+async fn cloud_device(
+    State(app): State<App>,
+    Path((id, action)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let incarnation = match number(&body, "incarnation") {
+        Ok(n) => n,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    cloud_result(
+        app.handle
+            .cloud_device(id, incarnation, &action, body)
+            .await,
+    )
+}
 async fn cloud_status(State(app): State<App>) -> Json<Value> {
     Json(app.handle.cloud_status())
 }

@@ -64,6 +64,7 @@ struct Admission {
     commands: mpsc::Sender<Command>,
     logout: mpsc::Sender<Command>,
     epoch: watch::Sender<u64>,
+    client: watch::Sender<Option<Arc<Client>>>,
 }
 #[derive(Clone)]
 pub struct Handle {
@@ -100,6 +101,7 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
                 commands,
                 logout,
                 epoch,
+                client: client.clone(),
             })),
             status: watched,
             client: clients,
@@ -176,6 +178,7 @@ impl Handle {
                     mpsc::error::TrySendError::Closed(_) => Error::Stopped,
                 })?;
             if urgent {
+                admission.client.send_replace(None);
                 admission.epoch.send_replace(epoch);
             }
         }
@@ -324,7 +327,11 @@ impl Runtime {
                 continue;
             }
             let refreshing = matches!(command.action, Action::Refresh);
-            self.publish(active.as_ref(), true, None);
+            if matches!(command.action, Action::Logout) {
+                self.publish(None, true, None);
+            } else {
+                self.publish(active.as_ref(), true, None);
+            }
             let result = match command.action {
                 Action::Logout => match self.save(None).await {
                     Ok(()) => {
@@ -543,6 +550,7 @@ mod tests {
                 commands,
                 logout,
                 epoch,
+                client: watch::channel(None).0,
             })),
             status: watched,
             client: watch::channel(None).1,

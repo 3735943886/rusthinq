@@ -18,6 +18,9 @@ use tokio::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    CloudChanged {
+        device: String,
+    },
     Injected {
         session: SessionId,
         data: Vec<u8>,

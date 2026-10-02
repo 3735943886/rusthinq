@@ -316,6 +316,93 @@ impl AppHandle {
             Err(Reject::Disabled)
         }
     }
+    pub fn cloud_devices(&self) -> Value {
+        #[cfg(feature = "bridge")]
+        {
+            match self.0.cloud_devices() {
+                Some(handle) => json!({"enabled":true,"devices":handle.snapshot()}),
+                None => json!({"enabled":false,"devices":[]}),
+            }
+        }
+        #[cfg(not(feature = "bridge"))]
+        {
+            json!({"enabled":false,"devices":[]})
+        }
+    }
+    pub async fn cloud_device(
+        &self,
+        id: String,
+        incarnation: u64,
+        action: &str,
+        body: Value,
+    ) -> Result<Value, CloudError> {
+        #[cfg(feature = "bridge")]
+        {
+            use crate::cloud_devices::{Operation, Pair};
+            let handle = self.0.cloud_devices().ok_or(CloudError::Unavailable)?;
+            let operation = match action {
+                "pair" => {
+                    let model = self
+                        .0
+                        .driver_models()
+                        .get(&id)
+                        .map(|m| (m.1.clone(), m.2))
+                        .or_else(|| {
+                            self.0
+                                .persisted_models()
+                                .get(&id)
+                                .filter(|m| m.incarnation == incarnation)
+                                .map(|m| (m.model_name.clone(), m.thinq2))
+                        })
+                        .ok_or(CloudError::InvalidInput)?;
+                    let device_type = body["deviceType"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            self.0
+                                .metadata_snapshot()
+                                .into_iter()
+                                .find(|m| m.device_id == id)
+                                .map(|m| m.device_type)
+                        })
+                        .ok_or(CloudError::InvalidInput)?;
+                    Operation::Pair(Pair {
+                        device: id.clone(),
+                        incarnation,
+                        alias: body["alias"].as_str().unwrap_or(&model.0).into(),
+                        device_type,
+                        model: model.0,
+                        thinq2: model.1,
+                    })
+                }
+                "enable" | "disable" => Operation::Enable {
+                    device: id,
+                    incarnation,
+                    enabled: action == "enable",
+                },
+                "unpair" => Operation::Unpair {
+                    device: id,
+                    incarnation,
+                },
+                _ => return Err(CloudError::InvalidInput),
+            };
+            handle
+                .operate(operation)
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::WouldBlock => CloudError::Busy,
+                    std::io::ErrorKind::NotConnected => CloudError::Unavailable,
+                    std::io::ErrorKind::InvalidInput => CloudError::InvalidInput,
+                    _ => CloudError::Remote,
+                })?;
+            Ok(self.cloud_devices())
+        }
+        #[cfg(not(feature = "bridge"))]
+        {
+            let _ = (id, incarnation, action, body);
+            Err(CloudError::Unavailable)
+        }
+    }
     pub fn cloud_status(&self) -> Value {
         match self.0.cloud_account() {
             Some(account) => json!({"enabled":true,"account":account.status()}),

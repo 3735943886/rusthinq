@@ -1,6 +1,10 @@
 use super::*;
 impl Handle {
     #[cfg(feature = "bridge")]
+    pub(crate) fn cloud_changed(&self, device: String) {
+        let _ = self.0.events.send(Event::CloudChanged { device });
+    }
+    #[cfg(feature = "bridge")]
     pub(crate) fn cloud_deploy(&self, id: &str, generation: u64) -> Option<serde_json::Value> {
         self.0
             .cloud_deploy

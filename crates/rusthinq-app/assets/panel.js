@@ -244,6 +244,15 @@ class DeviceEntry {
                 </div>`
             children.push(td)
 
+            if (this.remoteState.bridgePaired || this.remoteState.bridgePending) {
+                const unpair = document.createElement('button')
+                unpair.type = 'button'
+                unpair.className = 'btn-flat'
+                unpair.textContent = 'Unpair'
+                const scope = { incarnation: this.remoteState.incarnation }
+                unpair.onclick = () => fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                td.appendChild(unpair)
+            }
             this.bridgeSwitch = td.getElementsByTagName('input')[0]
             this.bridgeDiv = td.getElementsByClassName('switch')[0]
             this.spinner = td.getElementsByClassName('preloader-wrapper')[0]
@@ -253,8 +262,14 @@ class DeviceEntry {
                 this.refreshUI()
 
                 try {
-                    await fetchWrapper(`bridge/${this.id}/enable`, { deviceType }, { method: 'POST' })
-                    this.remoteState.bridged = true
+                    const scope = { incarnation: this.remoteState.incarnation, deviceType }
+                    if (!this.remoteState.bridgePaired) {
+                        if (this.remoteState.bridgePending) { toastText('Pairing outcome unknown. Unpair before retrying.'); return }
+                        const paired = await fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/pair`, scope, { method: 'POST' })
+                        if (!paired?.ok) return
+                    }
+                    const enabled = await fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/enable`, scope, { method: 'POST' })
+                    if (enabled?.ok) this.remoteState.bridgeEnabled = true
                 } finally {
                     this.bridgeBusy = false
                     this.refreshUI()
@@ -266,8 +281,8 @@ class DeviceEntry {
                 this.refreshUI()
 
                 try {
-                    await fetchWrapper(`bridge/${this.id}/disable`, {}, { method: 'POST' })
-                    this.remoteState.bridged = false
+                    const disabled = await fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/disable`, { incarnation: this.remoteState.incarnation }, { method: 'POST' })
+                    if (disabled?.ok) this.remoteState.bridgeEnabled = false
                 } finally {
                     this.bridgeBusy = false
                     this.refreshUI()

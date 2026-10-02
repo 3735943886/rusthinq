@@ -314,6 +314,8 @@ pub struct Daemon {
     external_mqtt: Option<crate::external_mqtt::Runtime>,
     #[cfg(feature = "bridge")]
     cloud_account: Option<(crate::cloud_account::Handle, crate::cloud_account::Runtime)>,
+    #[cfg(feature = "bridge")]
+    cloud_devices: Option<crate::cloud_devices::Runtime>,
     #[cfg(feature = "scripting")]
     driver_watch: Option<crate::drivers::Config>,
     #[cfg(feature = "scripting")]
@@ -337,6 +339,12 @@ impl Daemon {
         if config.cloud_account.is_some() && !cfg!(feature = "bridge") {
             return Err(invalid("bridge feature is disabled"));
         }
+        #[cfg(feature = "bridge")]
+        let pairing_path = config.cloud_account.as_ref().map(|path| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".pairings");
+            PathBuf::from(name)
+        });
         #[cfg(feature = "bridge")]
         let cloud_account = match config.cloud_account.clone() {
             Some(path) => Some(crate::cloud_account::open(path).await?),
@@ -460,6 +468,20 @@ impl Daemon {
         if let Some((account, _)) = &cloud_account {
             service.handle().attach_cloud_account(account.clone())?;
         }
+        #[cfg(feature = "bridge")]
+        let cloud_devices = if let Some((account, _)) = &cloud_account {
+            let (configured, cloud) = service
+                .with_cloud_devices(
+                    pairing_path.expect("account path"),
+                    account.clone(),
+                    firmware.clone(),
+                )
+                .await?;
+            service = configured;
+            Some(cloud)
+        } else {
+            None
+        };
         Ok(Self {
             service,
             signer,
@@ -472,6 +494,8 @@ impl Daemon {
             external_mqtt,
             #[cfg(feature = "bridge")]
             cloud_account,
+            #[cfg(feature = "bridge")]
+            cloud_devices,
             #[cfg(feature = "scripting")]
             driver_watch,
             #[cfg(feature = "scripting")]
@@ -521,6 +545,10 @@ impl Daemon {
         }
         if let Some(external) = self.external_mqtt {
             tasks.spawn(external.run(handle.clone(), services_stopped.clone()));
+        }
+        #[cfg(feature = "bridge")]
+        if let Some(runtime) = self.cloud_devices {
+            tasks.spawn(runtime.run(core_stop.subscribe()));
         }
         #[cfg(feature = "bridge")]
         if let Some((_, runtime)) = self.cloud_account {

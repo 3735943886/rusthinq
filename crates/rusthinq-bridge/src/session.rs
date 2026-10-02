@@ -260,6 +260,7 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
         let mut ready = false;
         let setup = Instant::now() + DEADLINE;
         let mut counter = 10000_u64;
+        let mut seen = std::collections::VecDeque::new();
         loop {
             tokio::select! {
                 _=tokio::time::sleep_until(setup),if !ready=>return Err(io::Error::new(io::ErrorKind::TimedOut,"cloud provisioning timed out")),
@@ -284,8 +285,7 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                 read=reader.read(&mut chunk)=>{
                     let count=read?;if count==0{return Err(io::Error::new(io::ErrorKind::ConnectionReset,"cloud MQTT closed"));}
                     if buffer.is_empty(){partial=Some(Instant::now()+DEADLINE);}buffer.extend_from_slice(&chunk[..count]);
-                    loop {
-                        let Some(size)=mqtt::length(&buffer,MAX+4096).map_err(|_|invalid())? else {break;};
+                    while let Some(size)=mqtt::length(&buffer,MAX+4096).map_err(|_|invalid())? {
                         if buffer.len()<size{break;}
                         let bytes:Vec<_>=buffer.drain(..size).collect();
                         match bytes[0] {
@@ -293,7 +293,9 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                             0xd0 if bytes==[0xd0,0]=>{if pong.take().is_none(){return Err(invalid());}},
                             header if header>>4==3=>{
                                 let mqtt::Packet::Publish{topic,payload,id,qos,duplicate}=mqtt::decode(&bytes,MAX+4096).map_err(|_|invalid())? else{return Err(invalid());};
-                                if header&1!=0 || qos>1 || !mqtt::matches(&config.subscribe,&topic){return Err(invalid());}
+                                if header&1!=0 || qos>1 || payload.len()>MAX || !mqtt::matches(&config.subscribe,&topic){return Err(invalid());}
+                                let fingerprint=openssl::sha::sha256(&payload);
+                                if duplicate && !seen.contains(&(id,fingerprint)){return Err(invalid());}
                                 if !duplicate {
                                     let value:Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|_|invalid())?;
                                     if value["did"]!=config.identity.device{return Err(invalid());}
@@ -308,6 +310,7 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                                         _=>return Err(invalid()),
                                     }
                                 }
+                                if !duplicate {seen.retain(|(prior,_)|*prior!=id);if seen.len()==64{seen.pop_front();}seen.push_back((id,fingerprint));}
                                 if let Some(id)=id{write(&mut writer,&[0x40,2,(id>>8)as u8,id as u8]).await?;}
                             },
                             _=>return Err(invalid()),
