@@ -153,6 +153,36 @@ impl Store {
         self.commit(next)?;
         Ok(attempt)
     }
+    /// Account inventory has confirmed this registration. Import in one durable
+    /// write, always disabled; an existing intent must never be overwritten.
+    pub fn adopt(&mut self, ownership: Owner, material: Material) -> io::Result<()> {
+        owner(&ownership)?;
+        material.validate_stored().map_err(|_| invalid())?;
+        if self.checkpoint.records.contains_key(&ownership.device) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pairing intent already owned",
+            ));
+        }
+        if self.checkpoint.records.len() == self.capacity {
+            return Err(invalid());
+        }
+        let mut next = self.checkpoint.clone();
+        next.next = next.next.checked_add(1).ok_or_else(invalid)?;
+        let attempt = Attempt {
+            owner: ownership,
+            sequence: next.next,
+        };
+        next.records.insert(
+            attempt.owner.device.clone(),
+            Record {
+                attempt,
+                material: Some(material),
+                enabled: false,
+            },
+        );
+        self.commit(next)
+    }
     pub fn complete(&mut self, attempt: &Attempt, material: Material) -> io::Result<()> {
         material.validate().map_err(|_| invalid())?;
         self.current(attempt)?;
@@ -284,6 +314,29 @@ mod tests {
                 0o600
             );
         }
+    }
+    #[test]
+    fn adopted_registration_is_atomic_disabled_and_never_replaces_existing_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adopted.json");
+        let mut store = Store::open(&path, 4).unwrap();
+        store.adopt(ownership(1), material()).unwrap();
+        let record = store.snapshot().remove(0);
+        assert!(!record.enabled);
+        assert!(record.material.is_some());
+        assert!(store.adopt(ownership(2), material()).is_err());
+        drop(store);
+        let mut restored = Store::open(&path, 4).unwrap();
+        assert_eq!(restored.snapshot()[0].attempt, record.attempt);
+        assert!(!restored.snapshot()[0].enabled);
+        restored.set_enabled(&record.attempt, true).unwrap();
+        drop(restored);
+        let mut restored = Store::open(&path, 4).unwrap();
+        assert!(restored.snapshot()[0].enabled);
+        let mut wrong = record.attempt.clone();
+        wrong.owner.account = "different-account".into();
+        assert!(restored.set_enabled(&wrong, false).is_err());
+        assert!(restored.snapshot()[0].enabled);
     }
     #[test]
     fn corrupt_checkpoints_are_preserved_and_write_failure_blocks_retries() {

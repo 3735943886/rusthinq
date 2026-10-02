@@ -735,7 +735,9 @@ fn cloud_result(result: Result<Value, CloudError>) -> Response {
             let status = match error {
                 CloudError::InvalidInput => StatusCode::BAD_REQUEST,
                 CloudError::Busy => StatusCode::TOO_MANY_REQUESTS,
-                CloudError::Unavailable | CloudError::Cancelled => StatusCode::CONFLICT,
+                CloudError::Unavailable | CloudError::Cancelled | CloudError::Rejected => {
+                    StatusCode::CONFLICT
+                }
                 CloudError::Authentication => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
@@ -807,5 +809,107 @@ pub async fn serve(
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod tests {
+    use super::*;
+    use crate::{lifecycle_storage::Storage, runtime::Runtime};
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn websocket_consumers_report_loss_then_resume_and_join_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let runtime = Runtime::new(
+            Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+            server.handle(),
+            Duration::ZERO,
+            2,
+        )
+        .unwrap();
+        let handle = runtime.handle();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(serve(
+            listener,
+            handle.clone(),
+            Config {
+                bind: address,
+                gui: cfg!(feature = "gui"),
+                credentials: None,
+                raw_inject: false,
+            },
+            stopped,
+        ));
+        let mut paths = vec!["/api/events", "/monitor-ws?id=d"];
+        if cfg!(feature = "gui") {
+            paths.push("/ws");
+        }
+        for path in paths {
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}{path}"))
+                .await
+                .unwrap();
+            let initial = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let initial: Value = serde_json::from_str(initial.to_text().unwrap()).unwrap();
+            // No await in this burst: the subscribed socket cannot drain its bounded
+            // event queue until all twenty application events have been published.
+            for _ in 0..20 {
+                handle.cloud_changed("d".into());
+            }
+            let lost = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let lost: Value = serde_json::from_str(lost.to_text().unwrap()).unwrap();
+            if path == "/api/events" {
+                assert_eq!(initial["type"], "snapshot");
+                assert_eq!(lost["type"], "lost");
+                assert_eq!(lost["events"], 18);
+                assert_eq!(lost["state"], initial["state"]);
+            } else {
+                assert_eq!(lost["lostEvents"], 18);
+                if path == "/ws" {
+                    assert_eq!(lost["devices"], initial["devices"]);
+                }
+            }
+            // Drain the two retained events, then verify a later event still arrives.
+            for _ in 0..2 {
+                timeout(Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            handle.cloud_changed("d".into());
+            let resumed = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let resumed: Value = serde_json::from_str(resumed.to_text().unwrap()).unwrap();
+            assert!(resumed.get("lostEvents").is_none());
+            if path == "/api/events" {
+                assert_eq!(resumed["type"], "stateChanged");
+            } else if path == "/ws" {
+                assert_eq!(resumed["devices"], initial["devices"]);
+            } else {
+                assert_eq!(resumed["status"], "offline");
+            }
+            socket.close(None).await.unwrap();
+        }
+        stop.send_replace(true);
+        timeout(Duration::from_secs(4), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

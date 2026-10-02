@@ -390,6 +390,16 @@ impl AppHandle {
                         thinq2: model.1,
                     })
                 }
+                "adopt" => {
+                    if body["archiveDevice"] != id {
+                        return Err(CloudError::InvalidInput);
+                    }
+                    Operation::Adopt {
+                        device: id,
+                        incarnation,
+                        archive: body["archive"].clone(),
+                    }
+                }
                 "enable" | "disable" => Operation::Enable {
                     device: id,
                     incarnation,
@@ -408,6 +418,9 @@ impl AppHandle {
                     std::io::ErrorKind::WouldBlock => CloudError::Busy,
                     std::io::ErrorKind::NotConnected => CloudError::Unavailable,
                     std::io::ErrorKind::InvalidInput => CloudError::InvalidInput,
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied => {
+                        CloudError::Rejected
+                    }
                     _ => CloudError::Remote,
                 })?;
             Ok(self.cloud_devices())

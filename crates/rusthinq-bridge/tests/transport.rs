@@ -336,3 +336,64 @@ fn invalid_identity_endpoint_budget_and_trust_are_rejected_before_network() {
     };
     assert!(Connector::new(&ipv6, config(false)).is_ok());
 }
+
+#[test]
+fn legacy_pairing_aliases_preserve_keys_and_expired_material_stays_cleanup_only() {
+    let original = material(8883, true);
+    let mut archive = serde_json::to_value(&original).unwrap();
+    let object = archive.as_object_mut().unwrap();
+    object.remove("platform");
+    let country = object.remove("country").unwrap();
+    object.insert("countryCode".into(), country);
+    object.insert(
+        "deployAppInfo".into(),
+        serde_json::json!({"protocolVer":"7"}),
+    );
+    let mut no_country = archive.clone();
+    no_country.as_object_mut().unwrap().remove("countryCode");
+    assert!(Material::from_legacy(no_country.clone()).is_err());
+    assert!(Material::from_legacy_in_country(no_country, "KR").is_ok());
+    assert!(Material::from_legacy_in_country(archive.clone(), "US").is_err());
+    let restored = Material::from_legacy(archive.clone()).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(restored).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+    let mut ambiguous = archive.clone();
+    ambiguous["country_code"] = serde_json::json!("US");
+    assert!(Material::from_legacy(ambiguous).is_err());
+    let current = X509::from_pem(fixture().client_cert.as_bytes()).unwrap();
+    let mut expired = X509::builder().unwrap();
+    expired.set_version(2).unwrap();
+    expired
+        .set_serial_number(&BigNum::from_u32(9).unwrap().to_asn1_integer().unwrap())
+        .unwrap();
+    expired.set_subject_name(current.subject_name()).unwrap();
+    expired
+        .set_issuer_name(fixture().client_root.subject_name())
+        .unwrap();
+    expired.set_pubkey(&current.public_key().unwrap()).unwrap();
+    expired
+        .set_not_before(&Asn1Time::from_unix(1).unwrap())
+        .unwrap();
+    expired
+        .set_not_after(&Asn1Time::from_unix(2).unwrap())
+        .unwrap();
+    expired
+        .sign(&fixture().client_issuer, MessageDigest::sha256())
+        .unwrap();
+    archive["certificate"] =
+        serde_json::json!(String::from_utf8(expired.build().to_pem().unwrap()).unwrap());
+    let restored = Material::from_legacy(archive).unwrap();
+    restored.validate_stored().unwrap();
+    assert!(restored.validate().is_err());
+    assert!(Connector::new(&restored, config(true)).is_err());
+    let t1 = Material::from_legacy(
+        serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","platform":"thinq1"}),
+    )
+    .unwrap();
+    t1.validate().unwrap();
+    assert!(Material::from_legacy(serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","platform":"thinq2"})).is_err());
+    assert!(Material::from_legacy(serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","privateKey":"secret"})).is_err());
+}

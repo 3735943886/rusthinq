@@ -9,7 +9,7 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         .unwrap_or("rusthinqctl");
     if args.first().is_some_and(|a| a == "--help" || a == "-h") || args.is_empty() {
         println!(
-            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
+            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl adopt DEVICE device_DEVICE.json\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
         );
         return Ok(());
     }
@@ -50,6 +50,16 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         "send"=>{let id=required(1)?;let mut scope=client.scope(&id).await?;scope["payload"]=json!(required(2)?);client.request(&format!("api/devices/{}/send",segment(&id)),Some(&scope)).await?},
         "inject"=>client.inject(&json!({"device_id":required(1)?,"hex":required(2)?,"inject_ok":args.iter().any(|a|a=="--inject-ok"),"from_device":args.iter().any(|a|a=="--from-device")})).await?,
         "retained-delete"=>{let body:Value=serde_json::from_str(&required(1)?).map_err(io::Error::other)?;client.request("api/mqtt/retained/delete",Some(&body)).await?},
+        "adopt"=>{
+            use std::io::Read;
+            let id=required(1)?;let path=required(2)?;
+            if Path::new(&path).file_name().and_then(|n|n.to_str())!=Some(format!("device_{id}.json").as_str()){return Err(io::Error::new(io::ErrorKind::InvalidInput,"archive filename must match device id"));}
+            let mut bytes=Vec::new();std::fs::File::open(&path)?.take(262145).read_to_end(&mut bytes)?;
+            if bytes.len()>262144 {return Err(io::Error::new(io::ErrorKind::InvalidInput,"archived material exceeded"));}
+            let archive:Value=serde_json::from_slice(&bytes).map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"invalid archived material JSON"))?;
+            let mut scope=client.scope(&id).await?;scope["archive"]=archive;scope["archiveDevice"]=json!(id);
+            client.request(&format!("api/devices/{}/bridge/adopt",segment(&id)),Some(&scope)).await?
+        },
         "replay"=>crate::replay::replay(&client,&required(1)?,Path::new(&required(2)?),args.iter().any(|a|a=="--inject-ok")).await?,
         "capture"=>{crate::capture(client,required(1)?,Path::new(&required(2)?)).await?;json!({"captured":true})},
         _=>return Err(io::Error::new(io::ErrorKind::InvalidInput,"unknown command; use --help")),

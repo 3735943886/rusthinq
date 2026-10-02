@@ -473,6 +473,9 @@ impl Client {
         });
         Ok(())
     }
+    pub fn country(&self) -> &str {
+        &self.country
+    }
     pub fn account_identity(&self) -> Option<&str> {
         self.account
             .as_ref()?

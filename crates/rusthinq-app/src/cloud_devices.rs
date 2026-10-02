@@ -12,6 +12,7 @@ use rusthinq_bridge::{
 };
 use rusthinq_server::{ServerHandle, SessionId, mqtt};
 use serde::Serialize;
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io,
@@ -48,9 +49,14 @@ pub struct Pair {
     pub model: String,
     pub thinq2: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Operation {
     Pair(Pair),
+    Adopt {
+        device: String,
+        incarnation: u64,
+        archive: Value,
+    },
     Enable {
         device: String,
         incarnation: u64,
@@ -238,6 +244,83 @@ impl Runtime {
         stop: &mut watch::Receiver<bool>,
     ) -> io::Result<()> {
         match operation {
+            Operation::Adopt {
+                device,
+                incarnation,
+                archive,
+            } => {
+                if !self.current(&device, incarnation) {
+                    return Err(stale());
+                }
+                let epoch = *self.account.cancellation().borrow();
+                let client = self.account.authenticated_client().map_err(|_| stale())?;
+                let country = client.country().to_owned();
+                let material = self
+                    .storage(move |_| {
+                        Material::from_legacy_in_country(archive, &country).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid archived pairing material",
+                            )
+                        })
+                    })
+                    .await?;
+                if let Some(meta) = self.app.persisted_models().get(&device)
+                    && meta.incarnation == incarnation
+                    && meta.thinq2 != matches!(material, Material::ThinQ2 { .. })
+                {
+                    return Err(stale());
+                }
+                let identity = client.account_identity().ok_or_else(stale)?.to_owned();
+                if let Material::ThinQ2 { country, .. } = &material
+                    && country != client.country()
+                {
+                    return Err(stale());
+                }
+                let devices = owned_remote(&self.account, &identity, epoch, stop, async {
+                    timeout(Duration::from_secs(30), client.list_devices())
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "cloud inventory timed out")
+                        })?
+                        .map_err(|_| io::Error::other("cloud inventory unavailable"))
+                })
+                .await?;
+                if !devices.iter().any(|entry| entry["deviceId"] == device) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "registration absent from authenticated account",
+                    ));
+                }
+                if !self.current(&device, incarnation) {
+                    return Err(stale());
+                }
+                let owner = Owner {
+                    device: device.clone(),
+                    incarnation,
+                    account: identity.clone(),
+                };
+                self.storage(move |store| store.adopt(owner, material))
+                    .await?;
+                self.project();
+                if !self.current(&device, incarnation)
+                    || *self.account.cancellation().borrow() != epoch
+                    || !self.account.authenticated_client().is_ok_and(|c| {
+                        c.account_identity() == Some(identity.as_str())
+                            && c.country() == client.country()
+                    })
+                {
+                    return Err(stale());
+                }
+                let registration = self
+                    .bridge
+                    .registered(device, incarnation)
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                self.bridge
+                    .disable(&registration)
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                Ok(())
+            }
             Operation::Pair(pair) => {
                 if !self.current(&pair.device, pair.incarnation) {
                     return Err(stale());
@@ -478,9 +561,9 @@ impl Runtime {
             }
             let target = match &command.operation {
                 Operation::Pair(p) => p.device.clone(),
-                Operation::Enable { device, .. } | Operation::Unpair { device, .. } => {
-                    device.clone()
-                }
+                Operation::Adopt { device, .. }
+                | Operation::Enable { device, .. }
+                | Operation::Unpair { device, .. } => device.clone(),
             };
             let result = self
                 .command(command.operation, command.registration, &mut stop)

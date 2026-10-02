@@ -119,6 +119,117 @@ fn identity(key: &str, leaf: &str, ca: &str, current: bool) -> Result<(), Error>
     Ok(())
 }
 impl Material {
+    /// Convert a bounded archived 0.1 state without inventing deploy information.
+    /// Expired identities are preserved for explicit cleanup, but cannot be enabled.
+    pub fn from_legacy(value: Value) -> Result<Self, Error> {
+        let object = value.as_object().ok_or(Error::InvalidInput)?;
+        let field = |camel: &str, snake: &str| -> Result<String, Error> {
+            match (
+                object.get(camel),
+                if camel == snake {
+                    None
+                } else {
+                    object.get(snake)
+                },
+            ) {
+                (Some(_), Some(_)) => Err(Error::InvalidInput),
+                (Some(v), None) | (None, Some(v)) => v
+                    .as_str()
+                    .filter(|s| s.len() <= 65536)
+                    .map(str::to_owned)
+                    .ok_or(Error::InvalidInput),
+                _ => Err(Error::InvalidInput),
+            }
+        };
+        let thinq1 = object.contains_key("rtiServer") || object.contains_key("rti_server");
+        if object
+            .get("platform")
+            .is_some_and(|v| v.as_str() != Some(if thinq1 { "thinq1" } else { "thinq2" }))
+        {
+            return Err(Error::InvalidInput);
+        }
+        let material = if thinq1 {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "rtiServer" | "rti_server" | "httpServer" | "http_server" | "platform"
+                )
+            }) {
+                return Err(Error::InvalidInput);
+            }
+            Self::ThinQ1 {
+                http_server: field("httpServer", "http_server")?,
+                rti_server: field("rtiServer", "rti_server")?,
+            }
+        } else {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "countryCode"
+                        | "platform"
+                        | "country_code"
+                        | "apiServer"
+                        | "api_server"
+                        | "mqttServer"
+                        | "mqtt_server"
+                        | "caCertificate"
+                        | "ca_certificate"
+                        | "privateKey"
+                        | "private_key"
+                        | "certificate"
+                        | "pubTopic"
+                        | "pub_topic"
+                        | "provTopic"
+                        | "prov_topic"
+                        | "subTopic"
+                        | "sub_topic"
+                        | "deployAppInfo"
+                        | "deploy_app_info"
+                        | "deployPlatformInfo"
+                        | "deploy_platform_info"
+                )
+            }) {
+                return Err(Error::InvalidInput);
+            }
+            Self::ThinQ2 {
+                country: field("countryCode", "country_code")?,
+                api_server: field("apiServer", "api_server")?,
+                mqtt_server: field("mqttServer", "mqtt_server")?,
+                ca_certificate: field("caCertificate", "ca_certificate")?,
+                private_key: field("privateKey", "private_key")?,
+                certificate: field("certificate", "certificate")?,
+                pub_topic: field("pubTopic", "pub_topic")?,
+                prov_topic: field("provTopic", "prov_topic")?,
+                sub_topic: field("subTopic", "sub_topic")?,
+            }
+        };
+        material.validate_stored()?;
+        Ok(material)
+    }
+    /// Missing regional metadata in older ThinQ2 archives may be supplied only
+    /// from the authenticated client's country, never a placeholder deployment.
+    pub fn from_legacy_in_country(mut value: Value, country: &str) -> Result<Self, Error> {
+        if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err(Error::InvalidInput);
+        }
+        if let Some(object) = value.as_object_mut()
+            && !object.contains_key("rtiServer")
+            && !object.contains_key("rti_server")
+            && !object.contains_key("countryCode")
+            && !object.contains_key("country_code")
+        {
+            object.insert("countryCode".into(), Value::String(country.into()));
+        }
+        let material = Self::from_legacy(value)?;
+        if let Self::ThinQ2 {
+            country: region, ..
+        } = &material
+            && region != country
+        {
+            return Err(Error::InvalidInput);
+        }
+        Ok(material)
+    }
     /// Revalidate deserialized material before any credential is installed in a transport.
     pub fn validate(&self) -> Result<(), Error> {
         self.check(true)
