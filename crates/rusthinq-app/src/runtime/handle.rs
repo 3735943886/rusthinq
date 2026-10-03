@@ -45,6 +45,13 @@ impl Handle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Drivers reload themselves on file change.
+    pub fn driver_watch(&self) -> bool {
+        self.0
+            .driver_watch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Composition-only binding; L4 remains the sole account state/policy owner.
     #[cfg(feature = "bridge")]
     pub fn attach_cloud_account(&self, account: crate::cloud_account::Handle) -> io::Result<()> {

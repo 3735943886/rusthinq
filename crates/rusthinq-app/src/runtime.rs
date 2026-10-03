@@ -113,6 +113,7 @@ struct AttachCleanup {
 }
 struct Shared {
     driver_reload_configured: std::sync::atomic::AtomicBool,
+    driver_watch: std::sync::atomic::AtomicBool,
     cloud: Mutex<Option<crate::cloud_account::Handle>>,
     #[cfg(feature = "bridge")]
     cloud_devices: Mutex<Option<crate::cloud_devices::Handle>>,
@@ -399,6 +400,7 @@ impl Runtime {
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
         let shared = Arc::new(Shared {
             driver_reload_configured: std::sync::atomic::AtomicBool::new(false),
+            driver_watch: std::sync::atomic::AtomicBool::new(false),
             cloud: Mutex::new(None),
             #[cfg(feature = "bridge")]
             cloud_devices: Mutex::new(None),
@@ -571,6 +573,9 @@ impl Runtime {
         if self.script_sink.is_none() {
             self.script_sink = Some(Arc::new(ApplicationSink(self.shared.events.clone(), None)));
         }
+        self.shared
+            .driver_watch
+            .store(config.watch, std::sync::atomic::Ordering::Relaxed);
         self.drivers = Some(config);
         self.shared
             .driver_reload_configured

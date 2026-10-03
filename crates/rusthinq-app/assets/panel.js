@@ -144,12 +144,17 @@ class DeviceEntry {
                 <span class="tooltipped" style="display: inline-block" data-position="bottom" data-tooltip="Forget this device -- clears its saved state; it won't be listed again unless it reconnects">
                     <a class="btn waves-effect waves-light red" href="#"><i class="material-icons">delete_forever</i></a>
                 </span>`
-            if (this.remoteState.bridgePaired || this.remoteState.bridgePending) {
+            // Only to resolve an unknown pairing outcome; disable stops bridging and forget deregisters.
+            if (this.remoteState.bridgePending) {
                 const unpair = document.createElement('button')
                 unpair.className = 'btn-flat'
                 unpair.textContent = 'Unpair'
                 const scope = { incarnation: this.remoteState.incarnation }
-                unpair.onclick = () => fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                unpair.onclick = () => {
+                    // Deletes this device's LG registration; bridging again needs a new pairing.
+                    if (!confirm(`Unpair ${this.remoteState.name || this.id} from the LG account? Bridging it again will require a new pairing.`)) return
+                    fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                }
                 td.appendChild(unpair)
             }
             children.push(td)
@@ -252,13 +257,18 @@ class DeviceEntry {
                 </div>`
             children.push(td)
 
-            if (this.remoteState.bridgePaired || this.remoteState.bridgePending) {
+            // Only to resolve an unknown pairing outcome; disable stops bridging and forget deregisters.
+            if (this.remoteState.bridgePending) {
                 const unpair = document.createElement('button')
                 unpair.type = 'button'
                 unpair.className = 'btn-flat'
                 unpair.textContent = 'Unpair'
                 const scope = { incarnation: this.remoteState.incarnation }
-                unpair.onclick = () => fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                unpair.onclick = () => {
+                    // Deletes this device's LG registration; bridging again needs a new pairing.
+                    if (!confirm(`Unpair ${this.remoteState.name || this.id} from the LG account? Bridging it again will require a new pairing.`)) return
+                    fetchWrapper(`api/devices/${encodeURIComponent(this.id)}/bridge/unpair`, scope, { method: 'POST' })
+                }
                 td.appendChild(unpair)
             }
             this.bridgeSwitch = td.getElementsByTagName('input')[0]

@@ -294,6 +294,9 @@ impl AppHandle {
     pub fn driver_reload_configured(&self) -> bool {
         self.0.driver_reload_configured()
     }
+    pub fn driver_watch(&self) -> bool {
+        self.0.driver_watch()
+    }
     pub async fn adapter_reload_driver(
         &self,
         id: String,

@@ -73,9 +73,26 @@ impl Config {
         Ok(())
     }
 }
+/// LG account aliases by device id, read from the account inventory (0.1 showed them).
+#[derive(Default)]
+struct NameCache {
+    names: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    wanted: tokio::sync::Notify,
+}
+impl NameCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, String>> {
+        self.names.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Coalesced: requests while a read is running produce one more read.
+    fn refresh(&self) {
+        self.wanted.notify_one();
+    }
+}
+type Names = Arc<NameCache>;
 #[derive(Clone)]
 struct App {
     handle: Handle,
+    names: Names,
     config: Config,
     stop: watch::Receiver<bool>,
     sockets: Arc<Semaphore>,
@@ -89,6 +106,7 @@ pub fn router(
     config.validate()?;
     Ok(build(App {
         handle,
+        names: Names::default(),
         config,
         stop,
         sockets: Arc::new(Semaphore::new(64)),
@@ -282,7 +300,29 @@ async fn health(State(app): State<App>) -> Json<Value> {
         json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow())}),
     )
 }
-fn snapshot(handle: &Handle) -> Value {
+/// Names change only through the account, so they are read when they can have changed:
+/// at start, on login/logout, after a pairing change and when a panel opens. No polling.
+async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<bool>) {
+    loop {
+        if handle.cloud_status()["account"]["loggedIn"] != true {
+            names.lock().clear();
+        } else if let Ok(inventory) = handle.cloud_inventory().await {
+            *names.lock() = inventory
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| {
+                    let id = d["deviceId"].as_str()?;
+                    let alias = d["alias"].as_str().filter(|a| !a.is_empty())?;
+                    Some((id.to_owned(), alias.to_owned()))
+                })
+                .collect();
+        }
+        tokio::select! {_=stop.changed()=>{if *stop.borrow() {return;}},_=names.wanted.notified()=>{}}
+    }
+}
+fn snapshot(handle: &Handle, names: &Names) -> Value {
+    let names = names.lock().clone();
     let metadata = handle.metadata_snapshot();
     let models = handle.driver_models();
     let persisted_models = handle.persisted_models();
@@ -316,15 +356,16 @@ fn snapshot(handle: &Handle) -> Value {
                 "deviceType":meta.map(|m|m.device_type.as_str()),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
                 "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
-                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some(),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
-                "removal":device.removal.map(|r|format!("{r:?}"))
+                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some() && (!handle.driver_watch() || script.is_some_and(|(_,_,faulted)|*faulted)),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
+                "removal":device.removal.map(|r|format!("{r:?}")),
+                "name":names.get(&device.entry.id)
             }),
         );
     }
-    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":!states.is_empty(),"bridge":cloud["enabled"]},"mqtt":null,"guiMqtt":null,"management":true})
+    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":!states.is_empty(),"bridge":cloud["enabled"]},"mqtt":null,"guiMqtt":handle.external_mqtt().map(|mqtt|matches!(*mqtt.status().borrow(),crate::external_mqtt::Status::Connected)),"management":true})
 }
 async fn devices(State(app): State<App>) -> Json<Value> {
-    Json(snapshot(&app.handle))
+    Json(snapshot(&app.handle, &app.names))
 }
 fn number(value: &Value, key: &str) -> Result<u64, &'static str> {
     value[key]
@@ -609,12 +650,12 @@ async fn event_socket(State(app): State<App>, upgrade: WebSocketUpgrade) -> Resp
     let mut events = app.handle.adapter_events();
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket|async move {
         let _permit=permit;let mut stop=app.stop.clone();
-        if *stop.borrow() || !write(&mut socket,json!({"type":"snapshot","state":snapshot(&app.handle)})).await {return;}
+        if *stop.borrow() || !write(&mut socket,json!({"type":"snapshot","state":snapshot(&app.handle, &app.names)})).await {return;}
         loop {tokio::select! {
             _=stop.changed()=>break,
             message=socket.recv()=>if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;},
             event=events.recv()=> {
-                let value=match event {Ok(event)=>event,Err(broadcast::error::RecvError::Lagged(count))=>json!({"type":"lost","events":count,"state":snapshot(&app.handle)}),Err(broadcast::error::RecvError::Closed)=>break};
+                let value=match event {Ok(event)=>event,Err(broadcast::error::RecvError::Lagged(count))=>json!({"type":"lost","events":count,"state":snapshot(&app.handle, &app.names)}),Err(broadcast::error::RecvError::Closed)=>break};
                 if !write(&mut socket,value).await {break;}
             }
         }}
@@ -637,18 +678,19 @@ async fn panel(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
+    app.names.refresh();
     let mut events = app.handle.adapter_events(); // subscribe before snapshot
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket| async move {
         let _permit = permit;
         let mut stop = app.stop.clone();
         if *stop.borrow() {return;}
-        if !write(&mut socket,snapshot(&app.handle)).await {return;}
+        if !write(&mut socket,snapshot(&app.handle, &app.names)).await {return;}
         loop {tokio::select! {
             _=stop.changed()=>break,
             message=socket.recv()=>if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;},
             event=events.recv()=> {
                 let lost = match event {Ok(value) if value["type"]=="lost"=>value["events"].as_u64().unwrap_or(0), Err(broadcast::error::RecvError::Lagged(count))=>count,Err(broadcast::error::RecvError::Closed)=>break,_=>0};
-                let mut value = snapshot(&app.handle);
+                let mut value = snapshot(&app.handle, &app.names);
                 if lost > 0 {value["lostEvents"]=json!(lost);}
                 if !write(&mut socket,value).await {break;}
             }
@@ -677,7 +719,7 @@ async fn monitor(
         if *stop.borrow() {return;}
         let captured=app.handle.snapshot().iter().find(|d|d.entry.id==query.id && d.online).and_then(|d|d.session);
         let status = |handle:&Handle| {
-            let value = snapshot(handle);
+            let value = snapshot(handle, &app.names);
             let device = &value["devices"][&query.id];
             json!({"status":if device["online"]==true {"online"} else {"offline"},"injectionEnabled":app.config.injection(),"injectionToggle":app.config.raw_inject_toggle,"meta":{"modelId":device["model"]}})
         };
@@ -733,11 +775,14 @@ async fn cloud_device(
         Ok(n) => n,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
-    cloud_result(
-        app.handle
-            .cloud_device(id, incarnation, &action, body)
-            .await,
-    )
+    let result = app
+        .handle
+        .cloud_device(id, incarnation, &action, body)
+        .await;
+    if matches!(action.as_str(), "pair" | "adopt" | "unpair") {
+        app.names.refresh();
+    }
+    cloud_result(result)
 }
 async fn cloud_status(State(app): State<App>) -> Json<Value> {
     Json(app.handle.cloud_status())
@@ -773,10 +818,14 @@ async fn cloud_login(State(app): State<App>, Json(input): Json<CloudLogin>) -> R
     cloud_result(app.handle.cloud_login(input.country).await)
 }
 async fn cloud_complete(State(app): State<App>, Json(input): Json<CloudComplete>) -> Response {
-    cloud_result(app.handle.cloud_complete(input.url).await)
+    let result = app.handle.cloud_complete(input.url).await;
+    app.names.refresh();
+    cloud_result(result)
 }
 async fn cloud_logout(State(app): State<App>) -> Response {
-    cloud_result(app.handle.cloud_logout().await)
+    let result = app.handle.cloud_logout().await;
+    app.names.refresh();
+    cloud_result(result)
 }
 async fn cloud_refresh(State(app): State<App>) -> Response {
     cloud_result(app.handle.cloud_refresh().await)
@@ -791,8 +840,15 @@ pub async fn serve(
     config.validate()?;
     let (owned_stop, owned_stopped) = watch::channel(*stop.borrow());
     let sockets = Arc::new(Semaphore::new(64));
+    let names = Names::default();
+    let refresher = tokio::spawn(refresh_names(
+        handle.clone(),
+        names.clone(),
+        owned_stopped.clone(),
+    ));
     let app = build(App {
         handle,
+        names,
         config,
         stop: owned_stopped.clone(),
         sockets: sockets.clone(),
@@ -823,6 +879,7 @@ pub async fn serve(
         }
     }
     owned_stop.send_replace(true);
+    let _ = refresher.await;
     while let Some(joined) = tasks.join_next().await {
         if let Err(error) = joined {
             failure.get_or_insert_with(|| io::Error::other(error));
