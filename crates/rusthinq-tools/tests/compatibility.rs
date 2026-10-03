@@ -179,7 +179,7 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
     assert_eq!(management.credentials.unwrap().user, "admin");
     assert!(management.raw_inject);
 
-    // An unauthenticated LAN GUI cannot be served by 0.2; it moves to loopback, loudly.
+    // As in 0.1, a GUI without credentials keeps its LAN bind, unauthenticated.
     std::fs::write(
         &source,
         "hostname='rusthinq.lan'\n[mqtt]\nmqtt_url='mqtt://broker.lan:1884'\nrusthinq_prefix='home'\n\
@@ -187,17 +187,11 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
     )
     .unwrap();
     let dest = dir.path().join("open-gui");
-    let report = rusthinq_tools::migration::migrate(&source, &dest).unwrap();
-    assert!(
-        report["warnings"]
-            .to_string()
-            .contains("without authentication on 0.0.0.0:8080")
-    );
+    rusthinq_tools::migration::migrate(&source, &dest).unwrap();
     let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
-    assert_eq!(
-        config.management.unwrap().bind,
-        "127.0.0.1:8080".parse().unwrap()
-    );
+    let management = config.management.unwrap();
+    assert_eq!(management.bind, "0.0.0.0:8080".parse().unwrap());
+    assert!(management.credentials.is_none());
     let mqtt = config.external_mqtt.unwrap();
     assert_eq!(
         (mqtt.port, mqtt.tls, mqtt.username.clone()),

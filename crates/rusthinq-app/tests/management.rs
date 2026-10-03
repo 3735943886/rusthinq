@@ -113,9 +113,10 @@ async fn authentication_origin_and_api_only_routes_do_not_require_mqtt() {
         app.oneshot(cross).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
+    // As in 0.1, authentication is optional on any bind.
     let mut public = config(true);
     public.bind = "0.0.0.0:8080".parse().unwrap();
-    assert!(public.validate().is_err());
+    assert!(public.validate().is_ok());
 }
 
 #[tokio::test]

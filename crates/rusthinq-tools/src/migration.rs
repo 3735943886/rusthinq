@@ -420,19 +420,11 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
                 .map(|value: String| (!value.is_empty()).then_some(value)),
             }
         };
-        let address: std::net::SocketAddr = bind.parse().map_err(io::Error::other)?;
         config["management"]["bind"] = json!(bind);
-        match (credential("gui_user")?, credential("gui_pass")?) {
-            (Some(user), Some(password)) => {
-                config["management"]["user"] = json!(user);
-                config["management"]["password"] = json!(password);
-            }
-            _ if address.ip().is_loopback() => {}
-            _ => {
-                let local = std::net::SocketAddr::new([127, 0, 0, 1].into(), address.port());
-                config["management"]["bind"] = json!(local.to_string());
-                warnings.push(format!("0.1 served the GUI without authentication on {address}. 0.2 requires a user and password off loopback, so the management endpoint binds {local}. Set [management] user, password and bind = \"{address}\" to serve it on the LAN again."));
-            }
+        // As 0.1, authentication is optional (HTTP Basic only when both are set).
+        if let (Some(user), Some(password)) = (credential("gui_user")?, credential("gui_pass")?) {
+            config["management"]["user"] = json!(user);
+            config["management"]["password"] = json!(password);
         }
     }
     if let Some(prefix) = legacy

@@ -49,22 +49,16 @@ impl Config {
                 "GUI feature is disabled",
             ));
         }
-        if let Some(auth) = &self.credentials {
-            if auth.user.is_empty()
+        if let Some(auth) = &self.credentials
+            && (auth.user.is_empty()
                 || auth.user.contains(':')
                 || auth.password.is_empty()
                 || auth.user.len() > 256
-                || auth.password.len() > 1024
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid management credentials",
-                ));
-            }
-        } else if !self.bind.ip().is_loopback() {
+                || auth.password.len() > 1024)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "non-loopback management requires authentication",
+                "invalid management credentials",
             ));
         }
         Ok(())
