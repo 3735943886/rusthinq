@@ -511,3 +511,136 @@ async fn passthrough_panic_is_reported_without_stopping_local_admission() {
         .unwrap();
     stop(shutdown, task).await;
 }
+
+#[derive(Default)]
+struct Recorder {
+    claimed: Vec<&'static str>,
+    relayed: std::sync::Mutex<Vec<String>>,
+    succeeded: std::sync::Mutex<Vec<String>>,
+    failed: std::sync::Mutex<Vec<String>>,
+}
+impl Passthrough for Recorder {
+    fn relay(&self, name: String, _stream: PrefixedStream) -> PassthroughFuture {
+        self.relayed.lock().unwrap().push(name);
+        Box::pin(async { Ok(()) })
+    }
+    fn claims(&self, name: &str) -> bool {
+        self.claimed.contains(&name)
+    }
+    fn handshake_succeeded(&self, name: &str) {
+        self.succeeded.lock().unwrap().push(name.into());
+    }
+    fn handshake_failed(&self, name: &str) {
+        self.failed.lock().unwrap().push(name.into());
+    }
+}
+async fn minted_peer(
+    address: SocketAddr,
+    authority: &rusthinq_server::certificates::Authority,
+    name: &str,
+    sni: bool,
+) -> Result<String, String> {
+    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    connector
+        .cert_store_mut()
+        .add_cert(X509::from_pem(authority.certificate_pem().as_bytes()).unwrap())
+        .unwrap();
+    let mut configured = connector.build().configure().unwrap();
+    configured.set_use_server_name_indication(sni);
+    configured.set_verify_hostname(sni);
+    let ssl = configured.into_ssl(name).unwrap();
+    let mut stream = SslStream::new(ssl, TcpStream::connect(address).await.unwrap()).unwrap();
+    timeout(Duration::from_secs(5), Pin::new(&mut stream).connect())
+        .await
+        .unwrap()
+        .map_err(|error| error.to_string())?;
+    let peer = stream.ssl().peer_certificate().unwrap();
+    let common = peer
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .unwrap()
+        .data()
+        .to_string()
+        .unwrap();
+    Ok(common)
+}
+
+/// 0.1 (anszom/rethink#107): DNAT setups keep the appliance's LG names, so every requested
+/// name gets a CA-signed leaf; peers without SNI get the configured name; claimed firmware
+/// names are relayed; handshake outcomes reach the passthrough policy.
+#[tokio::test]
+async fn minting_serves_requested_names_defaults_and_relays_only_claimed_names() {
+    let authority =
+        Arc::new(rusthinq_server::certificates::Authority::generate("ca.example", 2048).unwrap());
+    let hook = Arc::new(Recorder {
+        claimed: vec!["firmware.example"],
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let identity = authority
+        .server_identity("rusthinq.local", TlsPolicy::Baseline)
+        .unwrap();
+    let front = FrontDoor::new(Config::default(), vec![identity], Some(hook.clone()))
+        .unwrap()
+        .with_minting(authority.clone(), TlsPolicy::Baseline, "rusthinq.local")
+        .unwrap();
+    let (stop_sender, stopped) = watch::channel(false);
+    let task = tokio::spawn(front.serve(
+        listener,
+        Server::new(ServerConfig::default()).unwrap(),
+        stopped,
+    ));
+
+    for name in ["kic-common.lgthinq.com", "common.iot.kic.lgthinq.com"] {
+        assert_eq!(
+            minted_peer(address, &authority, name, true).await.unwrap(),
+            name
+        );
+    }
+    assert_eq!(
+        minted_peer(address, &authority, "rusthinq.local", false)
+            .await
+            .unwrap(),
+        "rusthinq.local"
+    );
+    assert!(
+        minted_peer(address, &authority, "firmware.example", true)
+            .await
+            .is_err()
+    );
+    assert_eq!(*hook.relayed.lock().unwrap(), ["firmware.example"]);
+    assert_eq!(
+        *hook.succeeded.lock().unwrap(),
+        ["kic-common.lgthinq.com", "common.iot.kic.lgthinq.com"]
+    );
+    // A peer that rejects our root, as a firmware download does, is reported.
+    let other = rusthinq_server::certificates::Authority::generate("other.example", 2048).unwrap();
+    assert!(
+        minted_peer(address, &other, "download.example", true)
+            .await
+            .is_err()
+    );
+    timeout(Duration::from_secs(3), async {
+        while hook.failed.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*hook.failed.lock().unwrap(), ["download.example"]);
+    // Bounded: beyond 64 minted names (two above plus download.example), the default serves.
+    for index in 0..61 {
+        let name = format!("n{index}.example");
+        assert_eq!(
+            minted_peer(address, &authority, &name, true).await.unwrap(),
+            name
+        );
+    }
+    let error = minted_peer(address, &authority, "late.example", true)
+        .await
+        .unwrap_err();
+    assert!(error.contains("certificate verify failed"), "{error}");
+    stop(stop_sender, task).await;
+}

@@ -1,9 +1,10 @@
 //! Owned SNI front door for ThinQ1 TLS sessions and an optional L4 passthrough hook.
-//! Certificates and TLS policy are supplied at construction, never minted from peer input.
-use crate::Server;
+//! Certificates and TLS policy are supplied at construction. With minting enabled, other
+//! requested names get a bounded set of CA-signed leaves, as 0.1 did (anszom/rethink#107).
+use crate::{Server, certificates::Authority};
 use openssl::{
     pkey::PKey,
-    ssl::{Ssl, SslAcceptor, SslMethod, SslOptions, SslVerifyMode, SslVersion},
+    ssl::{Ssl, SslAcceptor, SslContext, SslMethod, SslOptions, SslVerifyMode, SslVersion},
     x509::X509,
 };
 use rusthinq_protocol::{
@@ -15,7 +16,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -125,11 +126,70 @@ pub type PassthroughFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>
 /// L3 supplies untouched TLS bytes and owns cancellation/join of this future.
 pub trait Passthrough: Send + Sync {
     fn relay(&self, name: String, stream: PrefixedStream) -> PassthroughFuture;
+    /// With minting, only claimed names are relayed; the rest are terminated locally.
+    fn claims(&self, _name: &str) -> bool {
+        true
+    }
+    /// A local handshake for `name` completed: proof this name is answered locally.
+    fn handshake_succeeded(&self, _name: &str) {}
+    /// A local handshake for `name` failed, as a firmware download expecting a real
+    /// root does; 0.1 suspected the name so the appliance's retry is relayed.
+    fn handshake_failed(&self, _name: &str) {}
+}
+/// Distinct minted names per front door. Beyond it, or for names that are not
+/// hostnames, the default certificate is served (0.1 `MAX_SNI_CERTS`).
+const MAX_MINTED: usize = 64;
+struct Minter {
+    authority: Arc<Authority>,
+    policy: TlsPolicy,
+    default: SslContext,
+    minted: Mutex<HashMap<String, SslContext>>,
+}
+impl Minter {
+    /// The context for `name`: minted once per name off the I/O thread, else the default.
+    async fn context(self: &Arc<Self>, name: Option<&str>) -> SslContext {
+        let Some(name) = name
+            .map(str::to_ascii_lowercase)
+            .filter(|name| client_hello::hostname(name))
+        else {
+            return self.default.clone();
+        };
+        {
+            let minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(context) = minted.get(&name) {
+                return context.clone();
+            }
+            if minted.len() >= MAX_MINTED {
+                return self.default.clone();
+            }
+        }
+        let minter = self.clone();
+        let issued = name.clone();
+        let context = tokio::task::spawn_blocking(move || {
+            let identity = minter.authority.server_identity(&issued, minter.policy)?;
+            acceptor(identity).map(SslAcceptor::into_context)
+        })
+        .await;
+        let Ok(Ok(context)) = context else {
+            return self.default.clone();
+        };
+        // Recheck: a concurrent handshake may have minted this name or filled the set.
+        let mut minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = minted.get(&name) {
+            return existing.clone();
+        }
+        if minted.len() >= MAX_MINTED {
+            return self.default.clone();
+        }
+        minted.insert(name, context.clone());
+        context
+    }
 }
 struct Router {
     config: Config,
     local: HashMap<String, SslAcceptor>,
     passthrough: Option<Arc<dyn Passthrough>>,
+    minter: Option<Arc<Minter>>,
 }
 pub struct FrontDoor {
     router: Arc<Router>,
@@ -173,9 +233,34 @@ impl FrontDoor {
                 config,
                 local,
                 passthrough,
+                minter: None,
             }),
             events,
         })
+    }
+    /// Serve every other requested name with a leaf minted from `authority` under
+    /// `policy`, and peers without SNI (or beyond the minting bound) with `default`'s
+    /// configured certificate. Passthrough then relays only names it claims.
+    pub fn with_minting(
+        mut self,
+        authority: Arc<Authority>,
+        policy: TlsPolicy,
+        default: &str,
+    ) -> io::Result<Self> {
+        let router = Arc::get_mut(&mut self.router).ok_or_else(|| invalid("front door shared"))?;
+        let default = router
+            .local
+            .get(&default.to_ascii_lowercase())
+            .ok_or_else(|| invalid("minting default is not served"))?
+            .context()
+            .to_owned();
+        router.minter = Some(Arc::new(Minter {
+            authority,
+            policy,
+            default,
+            minted: Mutex::new(HashMap::new()),
+        }));
+        Ok(self)
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Rejection> {
         self.events.subscribe()
@@ -303,11 +388,35 @@ impl Router {
                 .map_err(|_| Failure::Tls)?;
             return Ok(Some(transport));
         }
-        if let (Some(name), Some(hook)) = (name, &self.passthrough) {
-            hook.relay(name, stream).await.map_err(|_| Failure::Io)?;
+        if let (Some(name), Some(hook)) = (&name, &self.passthrough)
+            && (self.minter.is_none() || hook.claims(name))
+        {
+            hook.relay(name.clone(), stream)
+                .await
+                .map_err(|_| Failure::Io)?;
             return Ok(None);
         }
-        Err(Failure::Unserved)
+        let Some(minter) = &self.minter else {
+            return Err(Failure::Unserved);
+        };
+        let context = minter.context(name.as_deref()).await;
+        let accepted = async {
+            let ssl = Ssl::new(&context).map_err(|_| Failure::Tls)?;
+            let mut transport = SslStream::new(ssl, stream).map_err(|_| Failure::Tls)?;
+            timeout_at(deadline, Pin::new(&mut transport).accept())
+                .await
+                .map_err(|_| Failure::Timeout)?
+                .map_err(|_| Failure::Tls)?;
+            Ok(transport)
+        }
+        .await;
+        if let (Some(name), Some(hook)) = (&name, &self.passthrough) {
+            match &accepted {
+                Ok(_) => hook.handshake_succeeded(name),
+                Err(_) => hook.handshake_failed(name),
+            }
+        }
+        accepted.map(Some)
     }
 }
 fn invalid(message: &'static str) -> io::Error {

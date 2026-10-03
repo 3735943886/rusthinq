@@ -9,7 +9,7 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         .unwrap_or("rusthinqctl");
     if args.first().is_some_and(|a| a == "--help" || a == "-h") || args.is_empty() {
         println!(
-            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl adopt DEVICE device_DEVICE.json\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
+            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl adopt DEVICE device_DEVICE.json\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl raw-inject on|off|status\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
         );
         return Ok(());
     }
@@ -49,6 +49,12 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         "set"=>{let id=required(1)?;let mut scope=client.scope(&id).await?;scope["function"]=json!("__command");scope["input"]=json!(json!({"prop":required(2)?,"value":required(3)?}).to_string());client.request(&format!("api/devices/{}/invoke",segment(&id)),Some(&scope)).await?},
         "send"=>{let id=required(1)?;let mut scope=client.scope(&id).await?;scope["payload"]=json!(required(2)?);client.request(&format!("api/devices/{}/send",segment(&id)),Some(&scope)).await?},
         "inject"=>client.inject(&json!({"device_id":required(1)?,"hex":required(2)?,"inject_ok":args.iter().any(|a|a=="--inject-ok"),"from_device":args.iter().any(|a|a=="--from-device")})).await?,
+        "raw-inject"=>match args.get(1).map(String::as_str) {
+            None|Some("status")=>client.request("api/raw-inject",None).await?,
+            Some("on")=>client.request("api/raw-inject",Some(&json!({"enabled":true}))).await?,
+            Some("off")=>client.request("api/raw-inject",Some(&json!({"enabled":false}))).await?,
+            Some(_)=>return Err(io::Error::new(io::ErrorKind::InvalidInput,"raw-inject on|off|status")),
+        },
         "retained-delete"=>{let body:Value=serde_json::from_str(&required(1)?).map_err(io::Error::other)?;client.request("api/mqtt/retained/delete",Some(&body)).await?},
         "adopt"=>{
             use std::io::Read;

@@ -106,13 +106,25 @@ impl Relay {
     pub fn protect_local_endpoints(&self, payload: &Value) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.protect_local_endpoints(payload, now))
     }
-    /// Explicit suspicion from a URL. Refused unlearned SNI names are suspected by `relay`.
+    /// Explicit suspicion from a URL. Without front-door minting, refused unlearned SNI
+    /// names are suspected by `relay`; with it, failed local handshakes are.
     pub fn suspect(&self, download_url: &str) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.suspect(download_url, now))
     }
 }
 
 impl Passthrough for Relay {
+    /// 0.1: only a name already known as a firmware host is spliced to the real server.
+    fn claims(&self, name: &str) -> bool {
+        self.with_hosts(|hosts, now| hosts.route(name, now))
+            .unwrap_or(false)
+    }
+    fn handshake_succeeded(&self, name: &str) {
+        let _ = self.confirm_local(name);
+    }
+    fn handshake_failed(&self, name: &str) {
+        let _ = self.suspect(&format!("https://{name}/"));
+    }
     fn relay(&self, name: String, mut stream: PrefixedStream) -> PassthroughFuture {
         let relay = self.clone();
         Box::pin(async move {

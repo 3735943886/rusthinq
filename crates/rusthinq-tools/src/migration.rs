@@ -186,14 +186,15 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .ok_or_else(|| invalid("advertise_requested_host must be boolean"))?,
     };
     // 0.1 always served the legacy RTL8711am TLS profile (TLS1.0+, SECLEVEL=0) to devices.
-    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","legacy_tls":true,"advertise_requested_host":advertise_requested_host,"management":{"bind":"127.0.0.1:8080","gui":true,"raw_inject":false}});
+    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","legacy_tls":true,"advertise_requested_host":advertise_requested_host,"management":{"bind":"127.0.0.1:8080","gui":true}});
     // Listeners keep 0.1's addresses; a port without `bind` stays unbound. As in 0.1,
     // `advertise` only reaches devices for HTTPS and MQTTS (`/route`).
     for (key, bind, advertise, default) in [
         ("https_port", "https_bind", Some("https_advertise"), 443),
         ("mqtts_port", "mqtt_bind", Some("mqtt_advertise"), 8883),
         ("thinq1_port", "thinq1_bind", None, 47878),
-        ("thinq1_https_port", "thinq1_http_bind", None, 46030),
+        // rethink serves thinq1_https_port as HTTPS (0.1 served plain HTTP there).
+        ("thinq1_https_port", "thinq1_https_bind", None, 46030),
     ] {
         let (address, advertised) = listener(legacy.get(key), default)?;
         if let Some(address) = address {
@@ -391,7 +392,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         } else {
             warnings.push("0.1 mqtt_enabled = false: [external_mqtt] was not written. Add it to connect to the broker.".to_owned());
         }
-        // 0.1 raw injection streams map to 0.2's identity-checked $raw routes.
+        // 0.1 raw injection streams: allow switching injection on at runtime (it starts off).
         let raw: Vec<&str> = mqtt
             .get("raw")
             .and_then(toml::Value::as_array)
@@ -402,7 +403,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
                 .iter()
                 .any(|name| ["inject", "inject_clip", "emit"].contains(name))
         {
-            config["management"]["raw_inject"] = json!(true);
+            config["management"]["raw_inject_toggle"] = json!(true);
         }
     }
     if let Some(gui) = legacy.get("gui") {

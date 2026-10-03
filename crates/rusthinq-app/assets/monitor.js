@@ -15,6 +15,46 @@ function deviceSocketUrl() {
     return url
 }
 
+let deviceOnline = false
+let injectionEnabled = false
+
+// Send buttons follow both the device and the daemon's runtime injection switch.
+function applyInjection() {
+    const usable = deviceOnline && injectionEnabled
+    get('btn_send1').disabled = !usable
+    get('btn_send2').disabled = !usable
+    get('injection').checked = injectionEnabled
+}
+
+get('btn_send1').onclick = () => {
+    // Hex only. There is no ThinQ1-JSON or CLIP-envelope inject path yet, unlike the
+    // rethink original this page was ported from.
+    ws.send(JSON.stringify({ sendToDevice: get('send1').value }))
+}
+get('btn_send2').onclick = () => {
+    ws.send(JSON.stringify({ sendFromDevice: get('send2').value }))
+}
+
+// Runtime only: the daemon starts with injection off and forgets this on restart.
+get('injection').onchange = async () => {
+    const wanted = get('injection').checked
+    try {
+        const response = await fetch(new URL('api/raw-inject', window.location.href), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: wanted }),
+        })
+        const state = await response.json()
+        if (!response.ok) throw new Error(state.error || response.statusText)
+        injectionEnabled = state.enabled === true
+    } catch (error) {
+        const message = document.createElement('span')
+        message.textContent = `Raw injection: ${error.message}`
+        M.toast({ html: message })
+    }
+    applyInjection()
+}
+
 // As on the panel: first retry near-immediately, back off only if that fails too.
 let retryDelay = 250
 
@@ -65,23 +105,10 @@ function connect() {
 
             if (json.status) {
                 get('device_status').innerText = json.status
-                if (json.status === 'online' && json.injectionEnabled) {
-                    get('btn_send1').disabled = false
-                    get('btn_send1').onclick = () => {
-                        // Hex only -- see raw_bus.rs's `raw/inject` topic. There is no
-                        // ThinQ1-JSON or CLIP-envelope inject path yet, unlike the
-                        // rethink original this page was ported from.
-                        ws.send(JSON.stringify({ sendToDevice: get('send1').value }))
-                    }
-
-                    get('btn_send2').disabled = false
-                    get('btn_send2').onclick = () => {
-                        ws.send(JSON.stringify({ sendFromDevice: get('send2').value }))
-                    }
-                } else {
-                    get('btn_send1').disabled = true
-                    get('btn_send2').disabled = true
-                }
+                deviceOnline = json.status === 'online'
+                injectionEnabled = json.injectionEnabled === true
+                get('injection_row').style.display = json.injectionToggle ? '' : 'none'
+                applyInjection()
             }
 
             if (json.meta) {

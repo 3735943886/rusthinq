@@ -25,7 +25,8 @@ fn config(gui: bool) -> Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         gui: gui && cfg!(feature = "gui"),
         credentials: None,
-        raw_inject: false,
+        raw_inject_toggle: false,
+        raw_inject: Default::default(),
     }
 }
 fn request(path: &str, method: &str, body: Value) -> Request<Body> {
@@ -466,4 +467,91 @@ async fn driver_reload_reports_disabled_without_scripting() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     server.shutdown().await;
+}
+
+/// Raw injection always starts off. Only `raw_inject_toggle` installations may switch it at
+/// runtime, and the switch is shared with every injection path (here the inject route).
+#[tokio::test]
+async fn raw_injection_starts_off_and_is_switched_only_when_the_toggle_is_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 128).unwrap();
+    let (_, stop) = watch::channel(false);
+    let body = |response: axum::response::Response| async move {
+        let status = response.status();
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        (status, value)
+    };
+    let inject = || {
+        request(
+            "/api/devices/d/inject",
+            "POST",
+            json!({"incarnation":"1","generation":"1","hex":"00","inject_ok":true}),
+        )
+    };
+
+    let fixed = management::router(runtime.handle(), config(false), stop.clone()).unwrap();
+    let (status, value) = body(
+        fixed
+            .clone()
+            .oneshot(request("/api/raw-inject", "GET", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, value),
+        (StatusCode::OK, json!({"enabled":false,"toggle":false}))
+    );
+    let (status, _) = body(
+        fixed
+            .clone()
+            .oneshot(request("/api/raw-inject", "POST", json!({"enabled":true})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, value) = body(fixed.oneshot(inject()).await.unwrap()).await;
+    assert_eq!(value["error"], "raw injection disabled");
+
+    let mut options = config(false);
+    options.raw_inject_toggle = true;
+    let state = options.raw_inject.clone();
+    let app = management::router(runtime.handle(), options, stop).unwrap();
+    let (_, value) = body(app.clone().oneshot(inject()).await.unwrap()).await;
+    assert_eq!(value["error"], "raw injection disabled");
+    let (status, value) = body(
+        app.clone()
+            .oneshot(request("/api/raw-inject", "POST", json!({"enabled":true})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, value),
+        (StatusCode::OK, json!({"enabled":true,"toggle":true}))
+    );
+    assert!(state.load(std::sync::atomic::Ordering::Relaxed));
+    let (_, value) = body(app.clone().oneshot(inject()).await.unwrap()).await;
+    assert_ne!(value["error"], "raw injection disabled");
+    let (status, _) = body(
+        app.clone()
+            .oneshot(request("/api/raw-inject", "POST", json!({"enabled":"yes"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    body(
+        app.clone()
+            .oneshot(request("/api/raw-inject", "POST", json!({"enabled":false})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let (_, value) = body(app.oneshot(inject()).await.unwrap()).await;
+    assert_eq!(value["error"], "raw injection disabled");
 }

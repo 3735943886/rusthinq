@@ -90,7 +90,8 @@ async fn management_keeps_health_and_explicit_disabled_results_without_optional_
             bind: "127.0.0.1:0".parse().unwrap(),
             gui: false,
             credentials: None,
-            raw_inject: false,
+            raw_inject_toggle: false,
+            raw_inject: Default::default(),
         },
         stopped,
     )
@@ -168,7 +169,8 @@ async fn embedding_rejects_disabled_capabilities_before_loading_ca_or_writing_ch
             bind: "127.0.0.1:0".parse().unwrap(),
             gui: true,
             credentials: None,
-            raw_inject: false,
+            raw_inject_toggle: false,
+            raw_inject: Default::default(),
         });
         let error = match Daemon::prepare(config).await {
             Err(error) => error,

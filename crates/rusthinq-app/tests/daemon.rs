@@ -33,6 +33,7 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         https_advertise: None,
         mqtt_advertise: None,
         http_bind: None,
+        thinq1_https_bind: None,
         thinq1_http_bind: None,
         custom_root_certificate: None,
         bridge_dns: Vec::new(),
@@ -41,7 +42,8 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
             bind: "127.0.0.1:0".parse().unwrap(),
             gui: cfg!(feature = "gui"),
             credentials: None,
-            raw_inject: false,
+            raw_inject_toggle: false,
+            raw_inject: Default::default(),
         }),
         drivers: None,
         external_mqtt: None,
@@ -199,6 +201,7 @@ async fn bind_failure_does_not_create_lifecycle_checkpoint() {
         https_advertise: None,
         mqtt_advertise: None,
         http_bind: None,
+        thinq1_https_bind: None,
         thinq1_http_bind: None,
         custom_root_certificate: None,
         bridge_dns: Vec::new(),
@@ -304,6 +307,7 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
         https_advertise: None,
         mqtt_advertise: None,
         http_bind: None,
+        thinq1_https_bind: None,
         thinq1_http_bind: None,
         custom_root_certificate: None,
         bridge_dns: Vec::new(),
@@ -440,7 +444,7 @@ async fn legacy_listener_options_serve_plain_http_advertise_and_custom_root() {
         dir.path().join("config.toml"),
         "hostname='local.example'\nca_certificate='ca.pem'\nca_key='key.pem'\n\
          device_ledger='devices.json'\nmqtt_bind='127.0.0.1:0'\nhttp_bind='127.0.0.1:0'\n\
-         thinq1_http_bind='127.0.0.1:0'\nhttps_advertise='https://proxy.example'\n\
+         thinq1_http_bind='127.0.0.1:0'\nthinq1_https_bind='127.0.0.1:0'\nhttps_advertise='https://proxy.example'\n\
          mqtt_advertise=18883\nadvertise_requested_host=true\n\
          custom_root_certificate='root.pem'\n",
     )
@@ -475,6 +479,37 @@ async fn legacy_listener_options_serve_plain_http_advertise_and_custom_root() {
     )
     .await;
     assert!(thinq1.contains("<returnCd>0108</returnCd>"), "{thinq1}");
+    // DNAT setups: the appliance keeps asking for its LG name and must get a leaf for it,
+    // on MQTTS and, as upstream rethink serves it, on ThinQ1 HTTPS (46030).
+    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    connector
+        .cert_store_mut()
+        .add_cert(X509::from_pem(ca.certificate_pem().as_bytes()).unwrap())
+        .unwrap();
+    let connector = connector.build();
+    for (address, name) in [
+        (endpoints.mqtt.unwrap(), "common.iot.kic.lgthinq.com"),
+        (endpoints.thinq1_https.unwrap(), "kic.lgeapi.com"),
+    ] {
+        let ssl = connector.configure().unwrap().into_ssl(name).unwrap();
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let mut tls = SslStream::new(ssl, tcp).unwrap();
+        timeout(Duration::from_secs(5), Pin::new(&mut tls).connect())
+            .await
+            .unwrap()
+            .unwrap();
+        if name == "kic.lgeapi.com" {
+            tls.write_all(b"POST /lgehadm/api/Grid/PowerSavingInfoSvc HTTP/1.1\r\nHost: kic.lgeapi.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(3), tls.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&response).contains("<returnCd>0108</returnCd>"));
+        }
+    }
     stop.send_replace(true);
     timeout(Duration::from_secs(5), task)
         .await

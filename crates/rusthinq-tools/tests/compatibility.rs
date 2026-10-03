@@ -154,9 +154,10 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
     );
     assert_eq!(config.http_bind, Some("127.0.0.1:80".parse().unwrap()));
     assert_eq!(
-        config.thinq1_http_bind,
+        config.thinq1_https_bind,
         Some("0.0.0.0:46031".parse().unwrap())
     );
+    assert_eq!(config.thinq1_http_bind, None);
     assert_eq!(config.thinq1_bind, Some("0.0.0.0:47879".parse().unwrap()));
     assert_eq!(
         config.custom_root_certificate.unwrap(),
@@ -177,7 +178,12 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
     let management = config.management.unwrap();
     assert_eq!(management.bind, "192.168.0.111:8080".parse().unwrap());
     assert_eq!(management.credentials.unwrap().user, "admin");
-    assert!(management.raw_inject);
+    assert!(management.raw_inject_toggle);
+    assert!(
+        !management
+            .raw_inject
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // As in 0.1, a GUI without credentials keeps its LAN bind, unauthenticated.
     std::fs::write(
@@ -229,7 +235,7 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
             .is_err()
     );
     assert_eq!(
-        config.thinq1_http_bind,
+        config.thinq1_https_bind,
         Some("0.0.0.0:46030".parse().unwrap())
     );
 }

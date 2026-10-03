@@ -4,7 +4,9 @@ use crate::tls::Identity;
 use openssl::{
     asn1::Asn1Time,
     bn::{BigNum, MsbOption},
+    ec::{EcGroup, EcKey},
     hash::MessageDigest,
+    nid::Nid,
     pkey::{PKey, Private},
     rsa::Rsa,
     sha::sha256,
@@ -115,7 +117,10 @@ impl Authority {
         if !hostname(name) {
             return Err(invalid("invalid served name"));
         }
-        let key = PKey::from_rsa(Rsa::generate(2048).map_err(crypto)?).map_err(crypto)?;
+        // ECDSA P-256 like 0.1's rcgen leaves, which appliances are proven against; it is
+        // also cheap enough to mint per requested name.
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).map_err(crypto)?;
+        let key = PKey::from_ec_key(EcKey::generate(&group).map_err(crypto)?).map_err(crypto)?;
         let mut subject = X509NameBuilder::new().map_err(crypto)?;
         subject
             .append_entry_by_text("O", "rusthinq-leaf")

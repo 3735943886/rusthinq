@@ -29,7 +29,16 @@ pub struct Config {
     pub bind: SocketAddr,
     pub gui: bool,
     pub credentials: Option<Credentials>,
-    pub raw_inject: bool,
+    /// Allows raw injection to be switched on at runtime (`/api/raw-inject`).
+    pub raw_inject_toggle: bool,
+    /// Runtime injection state, shared with the MQTT `$raw` routes. Always starts off
+    /// and is never persisted, so a restart returns to the safe state.
+    pub raw_inject: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Config {
+    fn injection(&self) -> bool {
+        self.raw_inject.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 #[derive(Clone)]
 pub struct Credentials {
@@ -105,6 +114,10 @@ fn build(app: App) -> Router {
         .route("/api/devices/{id}/invoke", post(invoke))
         .route("/api/devices/{id}/reload", post(reload_driver))
         .route("/api/devices/{id}/inject", post(inject))
+        .route(
+            "/api/raw-inject",
+            get(raw_inject_status).post(raw_inject_set),
+        )
         .route("/api/events", get(event_socket))
         .route("/ws", get(panel))
         .route("/device", get(monitor))
@@ -481,12 +494,30 @@ async fn reload_driver(
         Err(_) => error(StatusCode::GATEWAY_TIMEOUT,"reload outcome unknown; inspect scriptGeneration before retrying"),
     }
 }
+fn raw_inject_state(app: &App) -> Value {
+    json!({"enabled":app.config.injection(),"toggle":app.config.raw_inject_toggle})
+}
+async fn raw_inject_status(State(app): State<App>) -> Response {
+    Json(raw_inject_state(&app)).into_response()
+}
+async fn raw_inject_set(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    if !app.config.raw_inject_toggle {
+        return error(StatusCode::FORBIDDEN, "raw injection toggle disabled");
+    }
+    let Some(enabled) = body["enabled"].as_bool() else {
+        return error(StatusCode::BAD_REQUEST, "enabled must be boolean");
+    };
+    app.config
+        .raw_inject
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    Json(raw_inject_state(&app)).into_response()
+}
 async fn inject(
     State(app): State<App>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    if !app.config.raw_inject {
+    if !app.config.injection() {
         return error(StatusCode::FORBIDDEN, "raw injection disabled");
     }
     let incarnation = match number(&body, "incarnation") {
@@ -537,7 +568,7 @@ async fn inject(
     }
 }
 async fn monitor_message(app: &App, id: &str, session: Option<SessionKey>, text: &str) -> Value {
-    if !app.config.raw_inject {
+    if !app.config.injection() {
         return json!({"error":"raw injection disabled"});
     }
     let Some(session) = session else {
@@ -648,7 +679,7 @@ async fn monitor(
         let status = |handle:&Handle| {
             let value = snapshot(handle);
             let device = &value["devices"][&query.id];
-            json!({"status":if device["online"]==true {"online"} else {"offline"},"injectionEnabled":app.config.raw_inject,"meta":{"modelId":device["model"]}})
+            json!({"status":if device["online"]==true {"online"} else {"offline"},"injectionEnabled":app.config.injection(),"injectionToggle":app.config.raw_inject_toggle,"meta":{"modelId":device["model"]}})
         };
         if !write(&mut socket,status(&app.handle)).await {return;}
         loop {tokio::select! {
@@ -833,7 +864,8 @@ mod tests {
                 bind: address,
                 gui: cfg!(feature = "gui"),
                 credentials: None,
-                raw_inject: false,
+                raw_inject_toggle: false,
+                raw_inject: Default::default(),
             },
             stopped,
         ));

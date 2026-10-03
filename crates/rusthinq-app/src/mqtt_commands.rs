@@ -4,6 +4,10 @@ use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
     io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -137,7 +141,7 @@ async fn connected(
     mut stream: crate::external_mqtt::Transport,
     prefix: &str,
     app: &Handle,
-    raw_enabled: bool,
+    raw: &AtomicBool,
 ) -> io::Result<()> {
     let filter = format!("{prefix}/#");
     let mut body = vec![0, 1];
@@ -184,7 +188,7 @@ async fn connected(
         {
             // No queue survives this connection. Capture both identities before
             // admission; the application reconciles them again before execution.
-            if !control(prefix, &topic, &value, app, raw_enabled).await {
+            if !control(prefix, &topic, &value, app, raw.load(Ordering::Relaxed)).await {
                 for (device, (session, generation, faulted)) in app.script_states() {
                     if !faulted && let Some(prop) = property(prefix, &device, &topic) {
                         let input = serde_json::json!({"prop":prop,"value":value}).to_string();
@@ -226,7 +230,7 @@ pub(crate) async fn run(
     mut config: Config,
     prefix: String,
     app: impl Into<Handle>,
-    raw_enabled: bool,
+    raw: Arc<AtomicBool>,
     mut stop: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let app = app.into();
@@ -241,7 +245,7 @@ pub(crate) async fn run(
             if *stop.borrow() {
                 break;
             }
-            tokio::select! { biased; _ = stop.changed() => break, _ = connected(session.into_stream(), &prefix, &app, raw_enabled) => {} }
+            tokio::select! { biased; _ = stop.changed() => break, _ = connected(session.into_stream(), &prefix, &app, &raw) => {} }
         }
         tokio::select! { biased; _ = stop.changed() => break, _ = tokio::time::sleep(Duration::from_secs(delay)) => {} }
         delay = (delay * 2).min(30);
@@ -345,10 +349,15 @@ mod tests {
             );
         }
         let (subscriber, mut broker) = tokio::io::duplex(8192);
-        let route =
-            tokio::spawn(
-                async move { connected(Box::new(subscriber), "lg", &app.into(), false).await },
-            );
+        let route = tokio::spawn(async move {
+            connected(
+                Box::new(subscriber),
+                "lg",
+                &app.into(),
+                &AtomicBool::new(false),
+            )
+            .await
+        });
         assert_eq!(packet(&mut broker).await.unwrap()[0], 0x82);
         broker.write_all(&[0x90, 3, 0, 1, 1]).await.unwrap();
         let mut body = vec![0, 14];

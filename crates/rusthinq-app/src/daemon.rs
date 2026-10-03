@@ -37,7 +37,10 @@ pub struct Config {
     pub mqtt_advertise: Option<Advertise>,
     /// Plain HTTP with the HTTPS routes, behind a TLS-terminating proxy (0.1 `http_port`).
     pub http_bind: Option<SocketAddr>,
-    /// Plain HTTP ThinQ1 provisioning (0.1 `thinq1_https_port`).
+    /// ThinQ1 HTTPS (rethink/0.1 `thinq1_https_port`, default 46030), on the same minting
+    /// TLS listener options as the other device ports, as upstream rethink serves it.
+    pub thinq1_https_bind: Option<SocketAddr>,
+    /// Optional plain HTTP with the same routes (rethink `thinq1_http_port`).
     pub thinq1_http_bind: Option<SocketAddr>,
     /// Served by `/route/certificate` instead of the CA (0.1 `custom_root_cert_file`).
     pub custom_root_certificate: Option<PathBuf>,
@@ -79,6 +82,7 @@ impl Config {
                 "https_advertise",
                 "mqtt_advertise",
                 "http_bind",
+                "thinq1_https_bind",
                 "thinq1_http_bind",
                 "custom_root_certificate",
                 "hostname",
@@ -153,7 +157,8 @@ impl Config {
                     .as_object()
                     .ok_or_else(|| invalid("management must be an object"))?;
                 if fields.keys().any(|key| {
-                    !["bind", "gui", "user", "password", "raw_inject"].contains(&key.as_str())
+                    !["bind", "gui", "user", "password", "raw_inject_toggle"]
+                        .contains(&key.as_str())
                 }) {
                     return Err(invalid("unknown management field"));
                 }
@@ -186,11 +191,12 @@ impl Config {
                     bind,
                     gui,
                     credentials,
-                    raw_inject: match management.get("raw_inject") {
+                    raw_inject: Default::default(),
+                    raw_inject_toggle: match management.get("raw_inject_toggle") {
                         None => false,
-                        Some(value) => value
-                            .as_bool()
-                            .ok_or_else(|| invalid("management raw_inject must be boolean"))?,
+                        Some(value) => value.as_bool().ok_or_else(|| {
+                            invalid("management raw_inject_toggle must be boolean")
+                        })?,
                     },
                 };
                 config.validate()?;
@@ -329,6 +335,7 @@ impl Config {
             https_advertise: advertise("https_advertise")?,
             mqtt_advertise: advertise("mqtt_advertise")?,
             http_bind: address("http_bind")?,
+            thinq1_https_bind: address("thinq1_https_bind")?,
             thinq1_http_bind: address("thinq1_http_bind")?,
             custom_root_certificate: match value.get("custom_root_certificate") {
                 None => None,
@@ -369,6 +376,11 @@ pub struct Daemon {
     thin: Option<(FrontDoor, TcpListener)>,
     mqtt: Option<(FrontDoor, TcpListener)>,
     plain: Vec<(https::Service, TcpListener)>,
+    /// Device TLS refusals, reported on stderr as 0.1 warned about failed handshakes.
+    rejections: Vec<(
+        &'static str,
+        tokio::sync::broadcast::Receiver<rusthinq_server::tls::Rejection>,
+    )>,
     endpoints: Endpoints,
     #[cfg(feature = "bridge")]
     firmware: rusthinq_bridge::passthrough::Relay,
@@ -381,7 +393,11 @@ pub struct Daemon {
     #[cfg(feature = "scripting")]
     driver_watch: Option<crate::drivers::Config>,
     #[cfg(feature = "scripting")]
-    commands: Option<(crate::external_mqtt::Config, String, bool)>,
+    commands: Option<(
+        crate::external_mqtt::Config,
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 impl Daemon {
     /// Binds all endpoints before durable generation reservation. No CA creation.
@@ -430,7 +446,11 @@ impl Daemon {
                 (
                     mqtt,
                     prefix,
-                    config.management.as_ref().is_some_and(|m| m.raw_inject),
+                    config
+                        .management
+                        .as_ref()
+                        .map(|m| m.raw_inject.clone())
+                        .unwrap_or_default(),
                 )
             });
         let external = config
@@ -444,6 +464,7 @@ impl Daemon {
         let mqtt = listen(config.mqtt_bind).await?;
         let http = listen(config.https_bind).await?;
         let plain_http = listen(config.http_bind).await?;
+        let thinq1_https = listen(config.thinq1_https_bind).await?;
         let thinq1_http = listen(config.thinq1_http_bind).await?;
         let management = if let Some(management) = config.management.clone() {
             management.validate()?;
@@ -457,6 +478,7 @@ impl Daemon {
             mqtt: local(&mqtt)?,
             https: local(&http)?,
             http: local(&plain_http)?,
+            thinq1_https: local(&thinq1_https)?,
             thinq1_http: local(&thinq1_http)?,
         };
         // As 0.1: an explicit advertise wins, else the bound port, else the LG default.
@@ -472,6 +494,11 @@ impl Daemon {
         };
         let name = config.hostname.clone();
         let advertise_requested_host = config.advertise_requested_host;
+        let policy = if config.legacy_tls {
+            TlsPolicy::RtkRtl8711am
+        } else {
+            TlsPolicy::Baseline
+        };
         let (ca, storage, block, identities, custom_root) =
             tokio::task::spawn_blocking(move || {
                 let ca = Arc::new(Authority::load(&config.ca_certificate, &config.ca_key)?);
@@ -483,12 +510,7 @@ impl Daemon {
                         Some(bytes)
                     }
                 };
-                let policy = if config.legacy_tls {
-                    TlsPolicy::RtkRtl8711am
-                } else {
-                    TlsPolicy::Baseline
-                };
-                let identities = (0..3)
+                let identities = (0..4)
                     .map(|_| ca.server_identity(&config.hostname, policy))
                     .collect::<io::Result<Vec<_>>>()?;
                 let mut storage = Storage::open(&config.device_ledger, 256)?;
@@ -498,16 +520,20 @@ impl Daemon {
             .await
             .map_err(io::Error::other)??;
         let mut identities = identities.into_iter();
+        // As 0.1, every device listener answers any requested name with a CA-signed leaf
+        // (DNAT setups keep the appliance's LG names) and peers without SNI with `hostname`.
         let thin_front = FrontDoor::new(
             TlsConfig::default(),
-            vec![identities.next().expect("three identities")],
+            vec![identities.next().expect("four identities")],
             None,
-        )?;
+        )?
+        .with_minting(ca.clone(), policy, &name)?;
         let mqtt_front = FrontDoor::new(
             TlsConfig::default(),
-            vec![identities.next().expect("three identities")],
+            vec![identities.next().expect("four identities")],
             None,
-        )?;
+        )?
+        .with_minting(ca.clone(), policy, &name)?;
         #[cfg(feature = "bridge")]
         let firmware = rusthinq_bridge::passthrough::Relay::new(
             Default::default(),
@@ -522,9 +548,22 @@ impl Daemon {
         let passthrough = None;
         let http_front = FrontDoor::new(
             TlsConfig::default(),
-            vec![identities.next().expect("three identities")],
+            vec![identities.next().expect("four identities")],
             passthrough,
-        )?;
+        )?
+        .with_minting(ca.clone(), policy, &name)?;
+        let thinq1_https_front = FrontDoor::new(
+            TlsConfig::default(),
+            vec![identities.next().expect("four identities")],
+            None,
+        )?
+        .with_minting(ca.clone(), policy, &name)?;
+        let rejections = vec![
+            ("ThinQ1 TLS", thin_front.subscribe()),
+            ("MQTTS", mqtt_front.subscribe()),
+            ("HTTPS", http_front.subscribe()),
+            ("ThinQ1 HTTPS", thinq1_https_front.subscribe()),
+        ];
         let (signer, signing) = Signer::new(ca.clone(), Default::default())?;
         let mut provisioning_config = provisioning::Config::new(name);
         provisioning_config.https_port = https_port;
@@ -559,6 +598,13 @@ impl Daemon {
             .flatten()
             .map(|listener| (https.clone(), listener))
             .collect();
+        if let Some(listener) = thinq1_https {
+            service = service.with_local_service(
+                thinq1_https_front,
+                listener,
+                Arc::new(https.clone()),
+            )?;
+        }
         if let Some(http) = http {
             service = service.with_local_service(http_front, http, Arc::new(https))?;
         }
@@ -602,6 +648,7 @@ impl Daemon {
             thin: thin.map(|listener| (thin_front, listener)),
             mqtt: mqtt.map(|listener| (mqtt_front, listener)),
             plain,
+            rejections,
             endpoints,
             #[cfg(feature = "bridge")]
             firmware,
@@ -640,6 +687,25 @@ impl Daemon {
         let mut tasks = tokio::task::JoinSet::new();
         let handle = self.service.handle();
         let external_handle = handle.external_mqtt();
+        for (label, mut rejections) in self.rejections {
+            let mut stop = services_stopped.clone();
+            tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => return Ok(()),
+                        rejection = rejections.recv() => match rejection {
+                            Ok(rejection) => eprintln!("{label}: refused {} ({:?})", rejection.peer, rejection.reason),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => eprintln!("{label}: {lost} refusals not shown"),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // A finished listener is reported by the core; wait for shutdown.
+                                let _ = stop.wait_for(|stopped| *stopped).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
         for (service, listener) in self.plain {
             tasks.spawn(service.serve_plain(listener, 64, core_stop.subscribe()));
         }
@@ -657,12 +723,12 @@ impl Daemon {
             ));
         }
         #[cfg(feature = "scripting")]
-        if let Some((config, prefix, raw_enabled)) = self.commands {
+        if let Some((config, prefix, raw)) = self.commands {
             tasks.spawn(crate::mqtt_commands::run(
                 config,
                 prefix,
                 handle.clone(),
-                raw_enabled,
+                raw,
                 core_stop.subscribe(),
             ));
         }
@@ -764,6 +830,7 @@ pub struct Endpoints {
     pub mqtt: Option<SocketAddr>,
     pub https: Option<SocketAddr>,
     pub http: Option<SocketAddr>,
+    pub thinq1_https: Option<SocketAddr>,
     pub thinq1_http: Option<SocketAddr>,
 }
 async fn listen(address: Option<SocketAddr>) -> io::Result<Option<TcpListener>> {
