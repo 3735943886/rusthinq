@@ -11,6 +11,7 @@ for rusthinq_features in '' bridge scripting gui bridge,scripting bridge,gui scr
         cargo check -p rusthinq-app --no-default-features --features "$rusthinq_features" -j 2
     fi
 done
+node --check crates/rusthinq-app/assets/ui.js
 node --check crates/rusthinq-app/assets/panel.js
 node --check crates/rusthinq-app/assets/monitor.js
 if [[ -n "${RUSTHINQ_SCRIPTS_CHECKOUT:-}" ]]; then

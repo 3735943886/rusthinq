@@ -67,7 +67,7 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         .unwrap();
     let page = String::from_utf8(page).unwrap();
     if cfg!(feature = "gui") {
-        assert!(page.contains("management panel"));
+        assert!(page.contains("rusthinq · Device workspace"));
     } else {
         assert!(page.starts_with("HTTP/1.1 404"));
     }

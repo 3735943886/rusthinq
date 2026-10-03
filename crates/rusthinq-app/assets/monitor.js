@@ -1,150 +1,432 @@
-document.addEventListener('DOMContentLoaded', function () {})
-
-let ws
-let reconnectTimer
-
-get('device_id').innerText = new URLSearchParams(window.location.search).get('id')
-get('device_status').innerText = 'Waiting for rusthinq-gui connection...'
-
-// The socket lives at /device, a sibling of this page. Appending to the page's own path instead
-// asks for /monitordevice, which nothing serves.
-function deviceSocketUrl() {
-    const url = new URL('device', window.location.href)
-    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    url.search = window.location.search
-    return url
-}
-
-let deviceOnline = false
-let injectionEnabled = false
-
-// Send buttons follow both the device and the daemon's runtime injection switch.
-function applyInjection() {
-    const usable = deviceOnline && injectionEnabled
-    get('btn_send1').disabled = !usable
-    get('btn_send2').disabled = !usable
-    get('injection').checked = injectionEnabled
-}
-
-get('btn_send1').onclick = () => {
-    // Hex only. There is no ThinQ1-JSON or CLIP-envelope inject path yet, unlike the
-    // rethink original this page was ported from.
-    ws.send(JSON.stringify({ sendToDevice: get('send1').value }))
-}
-get('btn_send2').onclick = () => {
-    ws.send(JSON.stringify({ sendFromDevice: get('send2').value }))
-}
-
-// Runtime only: the daemon starts with injection off and forgets this on restart.
-get('injection').onchange = async () => {
-    const wanted = get('injection').checked
+(() => {
+  const { $, api, toast, confirm, busy, text } = UI;
+  const id = new URLSearchParams(location.search).get("id");
+  $("device-id").textContent = id || "No device selected";
+  let connected = false,
+    online = false,
+    injection = false,
+    stale = false,
+    paused = false;
+  let direction = "all",
+    selected = null,
+    analysis = null,
+    analysisRevision = 0;
+  let rx = 0,
+    tx = 0,
+    loss = 0,
+    evicted = 0,
+    nextRecord = 0,
+    bufferedBytes = 0,
+    sending = false;
+  let connectionRevision = 0;
+  const records = [],
+    nodes = new Map();
+  function applyInjection() {
+    $("inject-submit").disabled =
+      !connected || !online || !injection || stale || sending;
+    $("injection").checked = injection;
+    $("injection").disabled = !connected || sending;
+    $("injection-badge").textContent = stale
+      ? "Connection changed"
+      : injection
+        ? "Injection enabled"
+        : "Read only";
+    $("injection-badge").className =
+      `badge ${injection || stale ? "warning" : "neutral"}`;
+    $("reconnect-monitor").hidden = !stale;
+  }
+  function state(up) {
+    connected = up;
+    connectionRevision++;
+    if (!up) online = false;
+    $("monitor-connection").textContent = up
+      ? "Connected locally"
+      : "Reconnecting";
+    $("monitor-connection").className = `badge ${up ? "good" : "warning"}`;
+    $("monitor-notice").hidden = up && !stale;
+    $("monitor-notice").textContent = stale
+      ? "The device connection changed. Refresh the monitor connection before sending another packet."
+      : "Connection interrupted. Traffic will resume after reconnection.";
+    applyInjection();
+  }
+  function render() {
+    $("rx-count").textContent = rx;
+    $("tx-count").textContent = tx;
+    $("loss-count").textContent = loss;
+    $("buffer-count").textContent =
+      `${records.length} buffered${evicted ? ` · ${evicted} older records discarded` : ""}`;
+    $("export-capture").disabled = !records.length;
+    if (paused) return;
+    const visible = records.filter(
+      (record) =>
+        record.k !== "lost" && (direction === "all" || record.k === direction),
+    );
+    const active = new Set(visible.map((record) => record.key));
+    for (const [key, node] of nodes)
+      if (!active.has(key)) {
+        node.remove();
+        nodes.delete(key);
+      }
+    $("messages").querySelector(".empty-note")?.remove();
+    if (!visible.length)
+      $("messages").append(
+        text("p", "No packets in this view yet.", "empty-note"),
+      );
+    for (const record of visible) {
+      if (!nodes.has(record.key)) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = `packet-row${record.injected ? " injected" : ""}`;
+        row.setAttribute(
+          "aria-label",
+          `${record.k === "rx" ? "Received" : "Sent"} packet at ${new Date(record.t).toLocaleTimeString()}`,
+        );
+        row.append(
+          text("time", new Date(record.t).toLocaleTimeString()),
+          text(
+            "span",
+            record.k === "rx" ? "RX" : "TX",
+            `badge ${record.k === "rx" ? "good" : "neutral"}`,
+          ),
+          text("code", record.hex),
+        );
+        row.onclick = () => inspect(record);
+        nodes.set(record.key, row);
+        $("messages").append(row);
+      }
+      const node = nodes.get(record.key);
+      node.classList.toggle("selected", selected?.key === record.key);
+      node.setAttribute("aria-pressed", String(selected?.key === record.key));
+    }
+    if ($("autoscroll").checked)
+      $("messages").scrollTop = $("messages").scrollHeight;
+  }
+  function recordPacket(k, hex, injected = false) {
+    if (typeof hex !== "string") return;
+    const record = { key: ++nextRecord, k, t: Date.now(), hex, injected };
+    records.push(record);
+    bufferedBytes += hex.length * 2;
+    if (k === "rx") rx++;
+    else tx++;
+    trim();
+    render();
+  }
+  function trim() {
+    while (records.length > 500 || bufferedBytes > 8 * 1024 * 1024) {
+      bufferedBytes -= (records.shift().hex?.length || 0) * 2;
+      evicted++;
+    }
+  }
+  function recordLoss(count) {
+    loss += count;
+    records.push({
+      key: ++nextRecord,
+      k: "lost",
+      t: Date.now(),
+      events: count,
+    });
+    trim();
+    render();
+    toast(
+      `${count} traffic events were missed. The capture contains a loss marker.`,
+      "error",
+    );
+  }
+  async function inspect(record) {
+    selected = record;
+    analysis = null;
+    const revision = ++analysisRevision;
+    render();
+    $("analysis-empty").hidden = true;
+    $("analysis-content").hidden = false;
+    $("analysis-direction").textContent =
+      `${record.k === "rx" ? "Received" : "Sent"}${record.injected ? " · injected" : ""}`;
+    $("packet-hex").textContent = record.hex;
+    $("analysis-summary").replaceChildren(
+      text("span", "Analyzing…", "badge neutral"),
+    );
+    $("analysis-fields").replaceChildren();
+    $("analysis-notes").replaceChildren();
+    $("analysis-export").textContent = "";
     try {
-        const response = await fetch(new URL('api/raw-inject', window.location.href), {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ enabled: wanted }),
-        })
-        const state = await response.json()
-        if (!response.ok) throw new Error(state.error || response.statusText)
-        injectionEnabled = state.enabled === true
+      const decoded = await api("api/packets/decode", {
+        hex: record.hex,
+        direction: record.k === "rx" ? "fromDevice" : "toDevice",
+        model_id: $("device-title").dataset.model || "",
+      });
+      if (revision !== analysisRevision) return;
+      analysis = decoded;
+      const integrity = decoded.crcOk;
+      const summary = [text("span", decoded.protocol, "badge neutral")];
+      if (typeof integrity === "boolean")
+        summary.push(
+          text(
+            "span",
+            integrity ? "Integrity valid" : "Integrity mismatch",
+            `badge ${integrity ? "good" : "error"}`,
+          ),
+        );
+      if (decoded.unknownCount)
+        summary.push(
+          text("span", `${decoded.unknownCount} unknown tags`, "badge warning"),
+        );
+      $("analysis-summary").replaceChildren(...summary);
+      const fields = decoded.elements?.length
+        ? decoded.elements.map((field) => [
+            field.name || field.hex,
+            String(field.v),
+          ])
+        : (decoded.binaryAnalysis?.fields || []).map((field) => [
+            field.name,
+            `${field.interpretation || field.raw}${field.confidence ? ` · ${field.confidence}` : ""}`,
+          ]);
+      $("analysis-fields").replaceChildren(
+        ...fields.map(([key, value]) => {
+          const row = document.createElement("div");
+          row.className = "analysis-field";
+          row.append(text("span", key), text("span", value));
+          return row;
+        }),
+      );
+      if (!fields.length)
+        $("analysis-fields").append(
+          text(
+            "p",
+            "No decoded fields. Original bytes remain available.",
+            "analysis-note",
+          ),
+        );
+      const notes = [
+        ...(decoded.notes || []),
+        ...(decoded.binaryAnalysis?.re_notes || []),
+      ];
+      $("analysis-notes").replaceChildren(
+        ...notes.slice(0, 12).map((note) => text("p", note, "analysis-note")),
+      );
+      $("analysis-export").textContent =
+        decoded.exportText || JSON.stringify(decoded, null, 2);
     } catch (error) {
-        const message = document.createElement('span')
-        message.textContent = `Raw injection: ${error.message}`
-        M.toast({ html: message })
+      if (revision !== analysisRevision) return;
+      $("analysis-summary").replaceChildren(
+        text("span", "Analysis unavailable", "badge warning"),
+      );
+      $("analysis-notes").replaceChildren(
+        text("p", error.message, "analysis-note"),
+      );
     }
-    applyInjection()
-}
-
-// As on the panel: first retry near-immediately, back off only if that fails too.
-let retryDelay = 250
-
-function connect() {
-    clearTimeout(reconnectTimer)
-    if (ws) {
-        ws.onclose = ws.onopen = ws.onmessage = null
+  }
+  $("copy-packet").onclick = () =>
+    busy($("copy-packet"), async () => {
+      if (selected) {
+        await navigator.clipboard.writeText(selected.hex);
+        toast("Hex copied.");
+      }
+    });
+  $("use-packet").onclick = () => {
+    if (!selected) return;
+    $("inject-hex").value = selected.hex;
+    $("inject-direction").value =
+      selected.k === "rx" ? "fromDevice" : "toDevice";
+    $("inject-hex").focus();
+  };
+  $("export-analysis").onclick = () => {
+    if (analysis)
+      UI.download(
+        "rusthinq-packet-analysis.txt",
+        analysis.exportText || JSON.stringify(analysis, null, 2),
+      );
+  };
+  $("export-capture").onclick = () => {
+    const output = [];
+    if (evicted)
+      output.push({
+        k: "lost",
+        t: records[0]?.t || Date.now(),
+        events: evicted,
+        reason: "browser buffer limit",
+      });
+    output.push(
+      ...records.map(({ key, ...record }) => {
+        if (record.k === "lost") return record;
+        let type = "packet",
+          hex = record.hex;
         try {
-            ws.close()
+          const bytes = Uint8Array.from(hex.match(/.{2}/g) || [], (value) =>
+            parseInt(value, 16),
+          );
+          const payload = new TextDecoder("utf-8", { fatal: true }).decode(
+            bytes,
+          );
+          const value = JSON.parse(payload);
+          if (value.cmd === "ack" && typeof value.data === "string") {
+            type = "ack";
+            hex = value.data;
+          } else if (value.Body?.Format === "B64") {
+            hex = Array.from(atob(value.Body.Data), (value) =>
+              value.charCodeAt(0).toString(16).padStart(2, "0"),
+            ).join("");
+          } else {
+            type = "clip";
+            hex = payload;
+          }
         } catch {}
+        return { ...record, type, hex };
+      }),
+    );
+    UI.download(
+      `rusthinq-capture-${new Date().toISOString().replaceAll(":", "-")}.jsonl`,
+      output.map((record) => JSON.stringify(record)).join("\n") + "\n",
+      "application/x-ndjson",
+    );
+    toast(
+      "Exported the buffered capture. Packet, clip and acknowledgment records are compatible with CLI replay; loss markers are preserved.",
+    );
+  };
+  $("pause-stream").onclick = () => {
+    paused = !paused;
+    $("pause-stream").textContent = paused ? "▷" : "Ⅱ";
+    $("pause-stream").title = paused ? "Resume display" : "Pause display";
+    $("pause-stream").setAttribute("aria-label", $("pause-stream").title);
+    $("pause-stream").setAttribute("aria-pressed", String(paused));
+    render();
+  };
+  $("clear-stream").onclick = () => {
+    records.length = 0;
+    bufferedBytes = 0;
+    nodes.clear();
+    $("messages").replaceChildren();
+    rx = tx = loss = evicted = 0;
+    selected = analysis = null;
+    analysisRevision++;
+    $("analysis-empty").hidden = false;
+    $("analysis-content").hidden = true;
+    $("analysis-direction").textContent = "Select a packet";
+    render();
+  };
+  document.querySelectorAll("[data-direction]").forEach(
+    (button) =>
+      (button.onclick = () => {
+        direction = button.dataset.direction;
+        document.querySelectorAll("[data-direction]").forEach((node) => {
+          node.classList.toggle("active", node === button);
+          node.setAttribute("aria-pressed", String(node === button));
+        });
+        render();
+      }),
+  );
+  $("injection").onchange = () => {
+    const wanted = $("injection").checked;
+    $("injection").disabled = true;
+    (async () => {
+      try {
+        const result = await api("api/raw-inject", { enabled: wanted });
+        injection = result.enabled === true;
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        applyInjection();
+      }
+    })();
+  };
+  $("inject-form").onsubmit = async (event) => {
+    event.preventDefault();
+    if (!connected || !online || !injection || stale || sending) return;
+    const hex = $("inject-hex").value.replace(/\s+/g, "");
+    if (!hex || hex.length % 2 || !/^[0-9a-f]+$/i.test(hex)) {
+      toast("Enter complete hexadecimal byte pairs.", "error");
+      return;
     }
-    ws = new WebSocket(deviceSocketUrl())
-
-    ws.onclose = () => {
-        reconnectTimer = setTimeout(connect, retryDelay)
-        retryDelay = 5000
-        get('device_status').innerText = 'Waiting for rusthinq-gui connection...'
+    const direction = $("inject-direction").value,
+      revision = connectionRevision;
+    sending = true;
+    applyInjection();
+    try {
+      const allowed = await confirm(
+        direction === "toDevice"
+          ? "Send this packet to the device?"
+          : "Simulate this received packet?",
+        `${hex.length / 2} bytes will ${direction === "toDevice" ? "be written to the connected device" : "enter the device processing path"}.`,
+        "Send packet",
+      );
+      if (!allowed) return;
+      if (
+        !connected ||
+        !online ||
+        !injection ||
+        stale ||
+        revision !== connectionRevision
+      )
+        throw new Error(
+          "The connection changed. Review the packet again before sending.",
+        );
+      socket.send(
+        direction === "toDevice"
+          ? { sendToDevice: hex }
+          : { sendFromDevice: hex },
+      );
+      $("delivery-result").textContent =
+        "Submitted. Waiting for the runtime result…";
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      sending = false;
+      applyInjection();
     }
-
-    ws.onopen = () => {
-        retryDelay = 250
-        get('device_status').innerText = 'offline'
-    }
-
-    ws.onmessage = (ev) => {
-        if (typeof ev.data === 'string') {
-            const json = JSON.parse(ev.data)
-            if (json.error || json.lostEvents || json.delivery) {
-                const message = document.createElement('span')
-                message.textContent = json.error || (json.lostEvents ? `Lost ${json.lostEvents} events; reconnect to refresh.` : `Transport delivery: ${json.delivery}`)
-                M.toast({ html: message })
-            }
-            if (json.rx) {
-                const div = pushMessage('rx', json.rx, json.injected)
-                div.onclick = () => {
-                    get('send2').value = json.rx
-                    M.updateTextFields()
-                }
-            }
-
-            if (json.tx) {
-                const div = pushMessage('tx', json.tx, json.injected)
-                div.onclick = () => {
-                    get('send1').value = json.tx
-                    M.updateTextFields()
-                }
-            }
-
-            if (json.status) {
-                get('device_status').innerText = json.status
-                deviceOnline = json.status === 'online'
-                injectionEnabled = json.injectionEnabled === true
-                get('injection_row').style.display = json.injectionToggle ? '' : 'none'
-                applyInjection()
-            }
-
-            if (json.meta) {
-                get('device_model').innerText = json.meta.modelId
-            }
-        }
-    }
-}
-
-// Same as the panel, and for the same reason its readyState check had to go: the restored socket can
-// still read as OPEN here and only report its close afterwards.
-window.addEventListener('pageshow', (ev) => {
-    if (ev.persisted) connect()
-})
-
-function pushMessage(direction, payload, injected) {
-    const timestamp = document.createElement('span')
-    const messages = get('messages')
-
-    timestamp.innerText = new Date().toLocaleTimeString()
-    timestamp.classList.add('timestamp')
-    const div = document.createElement('div')
-    div.classList.add(direction, 'message')
-    if (injected) div.classList.add('injected')
-    div.innerText = payload
-    div.appendChild(timestamp)
-
-    messages.appendChild(div)
-
-    if (get('autoscroll').checked) messages.scrollTop = messages.scrollHeight
-
-    return div
-}
-
-function get(id) {
-    return document.getElementById(id)
-}
-
-connect()
+  };
+  if (!id) {
+    $("device-title").textContent =
+      "Open a device from the workspace to inspect traffic.";
+    $("monitor-connection").textContent = "No device";
+    return;
+  }
+  const socket = UI.socket(`device?id=${encodeURIComponent(id)}`, {
+    open: () => {
+      stale = false;
+      state(true);
+    },
+    close: () => state(false),
+    error: (error) => toast(error.message, "error"),
+    message(value) {
+      if (value.rx) recordPacket("rx", value.rx, value.injected);
+      if (value.tx) recordPacket("tx", value.tx, value.injected);
+      if (value.lostEvents) recordLoss(Number(value.lostEvents));
+      if (value.error) {
+        $("delivery-result").textContent = value.error;
+        toast(value.error, "error");
+      }
+      if (value.delivery)
+        $("delivery-result").textContent =
+          `Transport: ${value.delivery}. This does not confirm appliance acceptance.`;
+      if (value.injected === true && !value.rx && !value.tx)
+        $("delivery-result").textContent =
+          "Received data admitted to the processing path.";
+      if (value.status) {
+        online = value.status === "online";
+        injection = value.injectionEnabled === true;
+        stale = value.sessionChanged === true;
+        if (stale) connectionRevision++;
+        $("injection-control").hidden = !value.injectionToggle;
+        $("monitor-connection").textContent = stale
+          ? "Connection changed"
+          : online
+            ? "Device online"
+            : "Device offline";
+        $("monitor-connection").className =
+          `badge ${online && !stale ? "good" : "warning"}`;
+        $("monitor-notice").hidden = !stale;
+        $("monitor-notice").textContent =
+          "The device connection changed. Refresh the monitor connection before sending another packet.";
+        applyInjection();
+      }
+      if (value.meta) {
+        $("device-title").textContent =
+          value.meta.name ||
+          value.meta.modelName ||
+          value.meta.modelId ||
+          "Model not reported";
+        $("device-title").dataset.model = value.meta.modelId || "";
+      }
+    },
+  });
+  $("reconnect-monitor").onclick = () => socket.reconnect();
+})();

@@ -8,13 +8,19 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceMetadata {
     pub incarnation: u64,
     pub model_name: String,
     pub device_type: String,
     pub thinq2: bool,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub sw_version: String,
+    #[serde(default)]
+    pub last_seen_unix: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
@@ -312,6 +318,10 @@ fn validate_metadata(state: &State) -> io::Result<()> {
             meta.model_name.is_empty()
                 || meta.model_name.len() > 256
                 || meta.model_name.chars().any(char::is_control)
+                || meta.model_id.len() > 256
+                || meta.model_id.chars().any(char::is_control)
+                || meta.sw_version.len() > 256
+                || meta.sw_version.chars().any(char::is_control)
                 || meta.device_type.len() > 128
                 || meta.device_type.chars().any(char::is_control)
                 || !state

@@ -200,16 +200,45 @@ pub fn decode(args: &Value) -> io::Result<Value> {
         .as_str()
         .filter(|s| s.len() <= 2_000_000)
         .ok_or_else(invalid)?;
-    Ok(match packet_codec::decode_packet(text) {
+    let direction = args["direction"].as_str();
+    if direction
+        .is_some_and(|v| !matches!(v, "fromDevice" | "toDevice" | "rx" | "tx" | "from" | "to"))
+    {
+        return Err(invalid());
+    }
+    let mut decoded = match rusthinq_protocol::decode::decode_hex_payload(text, direction) {
+        Ok(decoded) => decoded,
+        Err(reason) => return Ok(json!({"protocol":"Unknown","hex":text,"reason":reason})),
+    };
+    // Preserve the 0.2 baseline fields while restoring the detailed 0.1 analysis.
+    match packet_codec::decode_packet(text) {
         Decoded::Aabb(a) => {
-            json!({"protocol":"Aabb","checksum_ok":a.checksum_ok,"length":a.length,"body":a.body})
+            decoded["checksum_ok"] = json!(a.checksum_ok);
+            decoded["length"] = json!(a.length);
+            decoded["body"] = json!(a.body);
         }
         Decoded::Tlv(t) => {
-            json!({"protocol":"Tlv","direction":format!("{:?}",t.direction),"crc_ok":t.crc_ok,"tlv":t.tlv.iter().map(|v|json!({"t":v.t,"l":v.l,"v":v.v})).collect::<Vec<_>>(),"frame":{"kind":t.frame.kind,"byte5":t.frame.byte5,"byte6":t.frame.byte6,"byte7":t.frame.byte7,"len":t.frame.len},"a":t.a,"s":t.s})
+            decoded["crc_ok"] = json!(t.crc_ok);
+            decoded["tlv"] = json!(
+                t.tlv
+                    .iter()
+                    .map(|v| json!({"t":v.t,"l":v.l,"v":v.v}))
+                    .collect::<Vec<_>>()
+            );
+            decoded["frame"] = json!({"kind":t.frame.kind,"byte5":t.frame.byte5,"byte6":t.frame.byte6,"byte7":t.frame.byte7,"len":t.frame.len});
+            decoded["a"] = json!(t.a);
+            decoded["s"] = json!(t.s);
         }
-        Decoded::Unknown(u) => json!({"protocol":"Unknown","hex":u.hex,"reason":u.reason}),
-    })
+        Decoded::Unknown(u) => decoded["reason"] = json!(u.reason),
+    }
+    decoded["exportText"] = json!(rusthinq_protocol::decode::re_export_text(
+        &decoded,
+        args["model_id"].as_str(),
+        direction,
+    ));
+    Ok(decoded)
 }
+
 pub fn encode(args: &Value) -> io::Result<Value> {
     let direction = match args["direction"].as_str().unwrap_or("toDevice") {
         "toDevice" => Direction::ToDevice,

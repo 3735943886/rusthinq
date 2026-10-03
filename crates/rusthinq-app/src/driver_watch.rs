@@ -42,9 +42,18 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
             }
             let prepare = config.clone();
             let device = id.clone();
+            let metadata = app.persisted_models().get(&id).cloned();
             let compiled = tokio::task::spawn_blocking(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    prepare.prepare(&device, &model, thinq2, true)
+                    prepare.prepare_with_metadata(
+                        &device,
+                        &model,
+                        thinq2,
+                        true,
+                        metadata
+                            .as_ref()
+                            .map(|m| (m.model_name.as_str(), m.sw_version.as_str())),
+                    )
                 }))
                 .unwrap_or_else(|_| {
                     Err(rusthinq_scripting::Error::Compile(

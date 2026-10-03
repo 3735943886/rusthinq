@@ -147,6 +147,16 @@ impl Config {
         thinq2: bool,
         consumer: bool,
     ) -> Result<Compiled, Error> {
+        self.prepare_with_metadata(id, model, thinq2, consumer, None)
+    }
+    pub fn prepare_with_metadata(
+        &self,
+        id: &str,
+        model: &str,
+        thinq2: bool,
+        consumer: bool,
+        metadata: Option<(&str, &str)>,
+    ) -> Result<Compiled, Error> {
         let root = self
             .directory
             .canonicalize()
@@ -165,6 +175,10 @@ impl Config {
         )
         .map_err(|e| Error::Compile(e.to_string()))?;
         let mut ctx = context::Config::new(id.into(), model.into());
+        if let Some((name, version)) = metadata {
+            ctx.model_name = name.into();
+            ctx.sw_version = version.into();
+        }
         ctx.topic_prefix = self.topic_prefix.clone();
         ctx.thinq2 = thinq2;
         ctx.driver_api = true;

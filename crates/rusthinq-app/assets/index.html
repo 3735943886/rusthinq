@@ -1,416 +1,463 @@
 <!doctype html>
-<html>
-    <head>
-        <meta charset="utf-8" />
-        <script>
-            // Set before first paint, so a dark-mode visitor never sees a light flash.
-            (function () {
-                try {
-                    if (localStorage.getItem('rusthinq-dark') === '1') {
-                        document.documentElement.classList.add('dark-theme');
-                    }
-                } catch (e) {}
-            })();
-        </script>
-        <style>
-            /* Materialize sets dark text but no background, which leaves the canvas transparent.
-               Standalone the browser paints it white, but embedded -- in a Home Assistant ingress
-               iframe, say -- a dark host page shows through and the text becomes unreadable. */
-            :root {
-                color-scheme: light;
-                background: #fff;
-            }
-
-            /*
-             * Materialize only repositions a tooltip's floating div when it opens - closing it just
-             * fades it out in place. If the devices table's column widths shift afterwards (another
-             * row's name/id getting longer or shorter re-flows the whole table), a tooltip that was
-             * last opened before that shift is left sitting at a now-stale left, sometimes well past
-             * the right edge. It doesn't repaint there (opacity 0), but it still has a real box, so it
-             * still counts toward the page's scrollable width and drags in a horizontal scrollbar.
-             * Hovering the trigger again recomputes the position and the scrollbar goes away - but
-             * nothing should be able to force a sideways scrollbar on this page, so suppress it here
-             * instead of relying on every tooltip staying positioned correctly at all times.
-             */
-            html {
-                overflow-x: hidden;
-            }
-
-            .offline .hide-when-offline {
-                display: none;
-            }
-
-            /*
-             * The names come from a linked ThinQ account, so an installation without one has nothing
-             * to put in this column on any row. A column of em dashes is width spent saying that, on
-             * the widest table on the page, so the column is not shown at all until something has a
-             * name. An appliance the account does not cover still shows the dash, next to the ones
-             * that do have names, because there the column means something.
-             */
-            #devices_table.no-names .dev-name {
-                display: none;
-            }
-
-            /* This build has no `bridge` Cargo feature at all -- see panel.js's `features`
-               handling. There is no session to toggle on any row, so the column is dropped
-               rather than shown full of disabled switches with nothing explaining why. */
-            #devices_table.no-bridge .dev-bridge {
-                display: none;
-            }
-
-            nav .brand-logo .logo {
-                height: 1em;
-                vertical-align: -0.1em;
-            }
-
-            nav .version {
-                padding: 0 15px;
-                font-size: 0.85rem;
-                opacity: 0.8;
-            }
-
-            /* Materialize's small-only breakpoint, where the brand is centred. The title moves up
-               to make room for the version under it. */
-            @media (max-width: 600px) {
-                nav .brand-logo {
-                    line-height: 42px;
-                }
-
-                nav .version.version-under-title {
-                    position: absolute;
-                    left: 50%;
-                    bottom: 4px;
-                    transform: translateX(-50%);
-                    padding: 0;
-                    line-height: 1;
-                    font-size: 0.7rem;
-                    white-space: nowrap;
-                }
-            }
-
-            .status_field {
-                display: inline-block;
-                width: 1.5em;
-            }
-
-            /* The Browser<->rusthinq<->MQTT chain: the icon between each pair of names
-               *is* the status indicator for that link, rather than a separate leading
-               icon per line -- a "link" (connected) or "link_off" (not) icon, in place
-               between the two things it already names, reads easier than a row of
-               icons above a row of labels. */
-            .conn-arrow {
-                display: inline-block;
-                vertical-align: middle;
-                padding: 0 0.15em;
-            }
-
-            /* The status line and the login/logout button used to stack on their own
-               lines (a couple of <br>s between them) even though there is plenty of
-               horizontal room next to the status text -- that's vertical space this
-               section, and the page's overall scroll length, didn't need to spend.
-               Only one button is ever visible ('hide' toggles the other), so this is
-               just status-left, button-right on one line; flex-wrap keeps it usable if
-               a narrow screen genuinely can't fit both. */
-            .bridge-status-row {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                flex-wrap: wrap;
-                gap: 0.5rem 1rem;
-            }
-
-            .preloader-wrapper.verysmall {
-                width: 24px;
-                height: 24px;
-            }
-
-            .dev-bridge {
-                width: 10em;
-            }
-
-            #btn_dark_toggle {
-                margin-left: auto;
-            }
-
-            /*
-             * The device list is the widest thing on this page, and the widest thing in it is a
-             * 36-character UUID, so on a phone the whole page ends up scrolling sideways. Below the
-             * width where six columns stop fitting, each row becomes a card instead: the name, model
-             * and id stack in one column, with the bridge switch and the action buttons pinned to the
-             * right where a thumb can still reach them. Nothing is hidden - the id and the platform
-             * just move under the name and get out of the way.
-             */
-            @media (max-width: 720px) {
-                #devices_table thead {
-                    display: none;
-                }
-
-                #devices_table tbody tr {
-                    display: grid;
-                    grid-template-columns: minmax(0, 1fr) auto auto;
-                    grid-template-areas:
-                        'name     bridge actions'
-                        'model    bridge actions'
-                        'platform bridge actions'
-                        'id       bridge actions';
-                    gap: 0 0.5rem;
-                    align-items: center;
-                    padding: 0.5rem 0;
-                }
-
-                #devices_table tbody td {
-                    border: none;
-                    padding: 0;
-                    min-width: 0;
-                }
-
-                #devices_table .dev-name {
-                    grid-area: name;
-                    font-weight: 500;
-                }
-                #devices_table .dev-model {
-                    grid-area: model;
-                }
-                #devices_table .dev-platform {
-                    grid-area: platform;
-                }
-                #devices_table .dev-id {
-                    grid-area: id;
-                }
-                #devices_table .dev-bridge {
-                    grid-area: bridge;
-                    width: auto;
-                }
-                #devices_table .dev-actions {
-                    grid-area: actions;
-                }
-
-                #devices_table .dev-platform,
-                #devices_table .dev-id {
-                    font-size: 0.75rem;
-                    color: rgba(0, 0, 0, 0.54);
-                }
-
-                /* Cut off rather than wrapped: a UUID broken across three lines is no more readable
-                   than a truncated one, and it drags the row's height with it. Both cells carry the
-                   full text as a title, and the monitor page shows the id in full anyway. */
-                #devices_table .dev-name,
-                #devices_table .dev-id {
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }
-
-                /* The default button padding is wider than the icons need, and here two of them are
-                   competing with the device's own name for the width of a phone. */
-                #devices_table .dev-actions .btn {
-                    padding: 0 0.75rem;
-                }
-
-                /* No bridge column to reserve a grid track for -- see the no-bridge rule above. */
-                #devices_table.no-bridge tbody tr {
-                    grid-template-columns: minmax(0, 1fr) auto;
-                    grid-template-areas:
-                        'name     actions'
-                        'model    actions'
-                        'platform actions'
-                        'id       actions';
-                }
-            }
-        </style>
-        <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
-        <link
-            rel="stylesheet"
-            href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css"
-        />
-        <link rel="stylesheet" href="dark.css" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <link rel="icon" type="image/png" href="favicon.png" />
-    </head>
-
-    <body class="offline">
-        <nav class="light-blue lighten-1" role="navigation">
-            <div class="nav-wrapper container">
-                <!-- Materialize centres the brand on a narrow screen, so a title wider than the
-                     viewport is itself a reason the page scrolls sideways. Drop the two words that
-                     carry no information once you are looking at the thing. -->
-                <a id="logo-container" href="#" class="brand-logo">
-                    <img class="logo" src="logo.svg" alt="" />
-                    rusthinq <span class="hide-on-med-and-down">management panel</span>
-                </a>
-                <!-- On a phone the brand sits in the middle of the bar, and a version string on the
-                     right would run into it, so there it goes under the title. Both carry a tooltip
-                     (filled in once the first `/ws` snapshot arrives) naming which optional build
-                     features (bridge/scripting) are actually compiled into this binary. -->
-                <span class="version version-under-title hide-on-med-and-up tooltipped" data-position="bottom"></span>
-                <ul class="right hide-on-small-only">
-                    <li><span class="version tooltipped" data-position="bottom"></span></li>
-                </ul>
-                <a href="#" id="btn_dark_toggle" class="right" title="Toggle dark mode">
-                    <i class="material-icons">brightness_6</i>
-                </a>
-            </div>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>rusthinq · Device workspace</title>
+    <script>
+      try {
+        if (
+          localStorage.getItem("rusthinq-dark") === "1" ||
+          (localStorage.getItem("rusthinq-dark") === null &&
+            matchMedia("(prefers-color-scheme: dark)").matches)
+        )
+          document.documentElement.classList.add("dark-theme");
+      } catch (_) {}
+    </script>
+    <link rel="icon" href="favicon.png" />
+    <link rel="stylesheet" href="dark.css" />
+    <script src="ui.js" defer></script>
+    <script src="panel.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="./"
+          ><span class="brand-mark">r<span>·</span></span
+          ><span>rusthinq<small>DEVICE WORKSPACE</small></span></a
+        >
+        <div class="nav-label">YOUR WORKSPACE</div>
+        <nav class="navigation" aria-label="Main navigation">
+          <a href="#devices" data-view="devices" class="active"
+            ><span data-icon="grid"></span>Devices<span
+              id="nav-count"
+              class="nav-count"
+              >0</span
+            ></a
+          >
+          <a href="#cloud" data-view="cloud"
+            ><span data-icon="cloud"></span>LG cloud</a
+          >
+          <a href="#activity" data-view="activity"
+            ><span data-icon="pulse"></span>Activity</a
+          >
+          <a href="#system" data-view="system"
+            ><span data-icon="settings"></span>System</a
+          >
         </nav>
-        <div class="container">
-            <h4 class="header orange-text">Connectivity</h4>
-            Browser <span id="conn_ws" class="conn-arrow"></span> rusthinq
-            <span id="conn_mqtt" class="conn-arrow"></span> MQTT
+        <div class="sidebar-bottom">
+          <div class="local-note">
+            <span class="status-dot" id="sidebar-dot"></span>
+            <div id="sidebar-status">
+              Connecting…<small>Local management</small>
+            </div>
+          </div>
+          <div class="sidebar-footer">
+            <span id="version">rusthinq 0.2</span>
+          </div>
         </div>
-
-        <div class="container hide-when-offline">
-            <h4 class="header orange-text">Connected devices</h4>
-            <table id="devices_table" class="highlight">
-                <thead>
-                    <tr>
-                        <th class="dev-name">Name</th>
-                        <th>ID</th>
-                        <th>Model</th>
-                        <th>Platform</th>
-                        <th class="dev-bridge">Bridge</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-
-                <tbody id="devices_body"></tbody>
-            </table>
+      </aside>
+      <main id="main" class="main-content">
+        <header class="topbar">
+          <div class="breadcrumb">
+            Workspace <span>/</span> <strong id="view-label">Devices</strong>
+          </div>
+          <div class="packet-tools">
+            <span id="connection" class="badge neutral">Connecting</span
+            ><button
+              id="theme-toggle"
+              class="icon-button"
+              title="Toggle dark theme"
+              aria-label="Toggle dark theme"
+              data-icon="moon"
+            ></button>
+          </div>
+        </header>
+        <div id="connection-banner" class="notice" role="status" hidden>
+          Connection interrupted. Showing the last known state; controls are
+          unavailable until reconnection.
         </div>
-
-        <!-- Hidden outright (not just disabled) when this build has no `bridge` Cargo feature
-             at all -- see panel.js's `features` handling. A greyed-out login button with no
-             account behind it to log into would just raise "why is this here" with no answer
-             on the page; the config.toml/README already explain the feature is opt-in. -->
-        <div id="bridge_mode_section" class="container hide-when-offline">
-            <h4 class="header orange-text">Bridge mode</h4>
-            <div class="bridge-status-row">
-                <span><span id="status_bridge" class="status_field"></span>Status: <span id="status_bridge_text"></span></span>
+        <section id="view-devices" class="view">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">A LITTLE MORE CONNECTED</p>
+              <h1>Your devices<span class="accent">.</span></h1>
+              <p class="subtitle">
+                A clear view of everything running in your home.
+              </p>
+            </div>
+            <button id="refresh-devices" class="button secondary">
+              <span data-icon="refresh"></span>Refresh
+            </button>
+          </div>
+          <div class="stat-grid">
+            <article class="stat-card">
+              <span>Total devices</span><strong id="stat-total">—</strong
+              ><small>Your saved inventory</small>
+              <div class="stat-glyph" data-icon="device"></div>
+            </article>
+            <article class="stat-card">
+              <span>Online now</span><strong id="stat-online">—</strong
+              ><small
+                ><span class="status-dot good"></span>Connected locally</small
+              >
+              <div class="stat-glyph" data-icon="bolt"></div>
+            </article>
+            <article class="stat-card">
+              <span>Cloud bridges</span><strong id="stat-bridged">—</strong
+              ><small>Active LG connections</small>
+              <div class="stat-glyph" data-icon="cloud"></div>
+            </article>
+            <article class="stat-card">
+              <span>Needs attention</span><strong id="stat-attention">—</strong
+              ><small>Driver or bridge issues</small>
+              <div class="stat-glyph" data-icon="pulse"></div>
+            </article>
+          </div>
+          <div class="section-toolbar">
+            <div class="segmented" role="group" aria-label="Filter devices">
+              <button data-filter="all" class="active" aria-pressed="true">
+                All devices</button
+              ><button data-filter="online" aria-pressed="false">Online</button
+              ><button data-filter="offline" aria-pressed="false">
+                Offline</button
+              ><button data-filter="attention" aria-pressed="false">
+                Attention
+              </button>
+            </div>
+            <div class="search-group">
+              <label class="search-field"
+                ><span data-icon="search"></span
+                ><input
+                  id="device-search"
+                  type="search"
+                  placeholder="Search name, model or ID"
+                  aria-label="Search devices" /></label
+              ><select id="device-sort" aria-label="Sort devices">
+                <option value="status">Online first</option>
+                <option value="name">Name A–Z</option>
+                <option value="model">Model A–Z</option>
+              </select>
+            </div>
+          </div>
+          <div class="section-caption">
+            <span id="device-count" aria-live="polite"
+              >Waiting for your devices…</span
+            ><span class="live-caption"
+              ><span class="status-dot good"></span>Live updates</span
+            >
+          </div>
+          <div id="device-grid" class="device-grid" aria-label="Devices"></div>
+          <div id="device-empty" class="empty-state" hidden>
+            <span data-icon="device"></span>
+            <h2>No devices yet</h2>
+            <p>Devices appear here when they connect to rusthinq.</p>
+          </div>
+        </section>
+        <section id="view-cloud" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">LOCAL MEETS CLOUD</p>
+              <h1>LG cloud<span class="accent">.</span></h1>
+              <p class="subtitle">
+                Manage your account and keep each bridge in view.
+              </p>
+            </div>
+          </div>
+          <div class="cloud-layout">
+            <article class="surface account-card">
+              <span class="large-icon" data-icon="cloud"></span>
+              <h2>Your ThinQ account</h2>
+              <span id="cloud-badge" class="badge neutral">Checking</span>
+              <p id="cloud-description" class="subtitle">
+                Checking account status…
+              </p>
+              <div class="button-row">
+                <button id="cloud-login" class="button primary" disabled>
+                  Connect LG account</button
+                ><button id="cloud-refresh" class="button secondary" hidden>
+                  Refresh account</button
+                ><button id="cloud-logout" class="button quiet" hidden>
+                  Sign out
+                </button>
+              </div>
+              <p class="small muted">
+                Local devices remain available independently of your LG account.
+              </p>
+            </article>
+            <article class="surface">
+              <div class="surface-heading">
+                <h2>Cloud inventory</h2>
                 <button
-                    id="btn_thinq_login"
-                    class="hide btn waves-effect waves-light modal-trigger"
-                    data-target="thinq_login"
+                  id="load-inventory"
+                  class="button secondary small"
+                  disabled
                 >
-                    Log into your LG account <i class="material-icons right">login</i>
+                  Refresh
                 </button>
-                <button
-                    id="btn_thinq_logout"
-                    class="hide btn waves-effect waves-light modal-trigger tooltipped"
-                    data-target="thinq_logout"
-                    data-position="bottom"
-                    data-tooltip="This will disable bridge mode for all your devices."
+              </div>
+              <p class="small muted">
+                Devices registered to your authenticated LG account.
+              </p>
+              <div id="cloud-inventory" class="inventory-list">
+                <p class="muted">Connect your account to view its devices.</p>
+              </div>
+            </article>
+          </div>
+        </section>
+        <section id="view-activity" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">WHAT’S HAPPENING</p>
+              <h1>Live activity<span class="accent">.</span></h1>
+              <p class="subtitle">
+                Connection changes, driver execution and delivery events.
+              </p>
+            </div>
+            <button id="clear-activity" class="button secondary">
+              Clear activity
+            </button>
+          </div>
+          <div class="surface">
+            <div class="surface-heading">
+              <h2>Recent events</h2>
+              <span class="small muted">Latest 100 · this browser session</span>
+            </div>
+            <div id="activity-list" class="activity-list">
+              <p id="activity-empty" class="empty-note">
+                Listening for events…
+              </p>
+            </div>
+          </div>
+        </section>
+        <section id="view-system" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">THE BIG PICTURE</p>
+              <h1>System overview<span class="accent">.</span></h1>
+              <p class="subtitle">
+                Understand your runtime and external connections.
+              </p>
+            </div>
+          </div>
+          <div class="system-grid">
+            <article class="surface">
+              <h2>Runtime</h2>
+              <dl id="runtime-details" class="detail-list">
+                <dt>Status</dt>
+                <dd>Checking…</dd>
+              </dl>
+            </article>
+            <article class="surface">
+              <h2>External MQTT</h2>
+              <dl id="mqtt-details" class="detail-list">
+                <dt>Status</dt>
+                <dd>Checking…</dd>
+              </dl>
+              <p class="small muted">
+                Transient messages missed during an outage are counted and are
+                never replayed later.
+              </p>
+            </article>
+            <article class="surface wide">
+              <div class="surface-heading">
+                <div>
+                  <h2>Retained message cleanup</h2>
+                  <p class="small muted">
+                    Delete messages owned by rusthinq from the configured
+                    broker.
+                  </p>
+                </div>
+                <span class="badge warning">Advanced</span>
+              </div>
+              <form id="cleanup-form" class="cleanup-form">
+                <label
+                  >Scope<select id="cleanup-scope">
+                    <option value="topic">Single topic</option>
+                    <option value="owner">Owner</option>
+                    <option value="all">All owned topics</option>
+                  </select></label
+                ><label id="cleanup-owner-label"
+                  >Owner<input
+                    id="cleanup-owner"
+                    placeholder="Exact owner identifier"
+                    required /></label
+                ><label id="cleanup-topic-label"
+                  >Topic<input
+                    id="cleanup-topic"
+                    placeholder="Exact MQTT topic"
+                    required /></label
+                ><button
+                  id="cleanup-submit"
+                  class="button danger"
+                  type="submit"
+                  disabled
                 >
-                    logout<i class="material-icons right">logout</i>
+                  Review cleanup
                 </button>
-            </div>
+              </form>
+              <p id="cleanup-result" class="small" role="status"></p>
+            </article>
+          </div>
+        </section>
+        <footer class="page-footer">
+          Made for your devices. <span>rusthinq · local first</span>
+        </footer>
+      </main>
+    </div>
+    <dialog id="device-dialog" class="dialog drawer">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">DEVICE DETAILS</p>
+          <h2 id="detail-title"></h2>
         </div>
-
-        <div id="thinq_login" class="modal">
-            <div class="modal-content">
-                <h4>Log into your LG ThinQ account</h4>
-                <p>
-                    Make sure to enter a country code that matches your account. The LG login page will open in a
-                    window. Please proceed with the login, then copy the URL from the final blank page.
-                </p>
-                <div class="row">
-                    <form class="col s12">
-                        <div class="row">
-                            <div class="input-field col s9">
-                                <input
-                                    id="country_code"
-                                    type="text"
-                                    class="validate"
-                                    minlength="2"
-                                    maxlength="2"
-                                    pattern="[A-Za-z]{2}"
-                                    required
-                                />
-                                <label for="country_code">Country code</label>
-                            </div>
-                            <div class="input-field col s3">
-                                <button
-                                    type="button"
-                                    class="btn waves-effect waves-light"
-                                    id="btn_thinq_login_continue"
-                                >
-                                    Log in <i class="material-icons right">login</i>
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-                <p>Paste the final URL below.</p>
-                <div class="row">
-                    <form class="col s12">
-                        <div class="row">
-                            <div class="input-field col s9">
-                                <input id="login_url" type="text" class="validate" required />
-                                <label for="login_url">URL</label>
-                            </div>
-                            <div class="input-field col s3">
-                                <button
-                                    type="button"
-                                    class="btn waves-effect waves-light"
-                                    id="btn_thinq_login_complete"
-                                >
-                                    Continue
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <a href="#!" class="modal-close waves-effect waves-green btn-flat">Close</a>
-            </div>
+        <button
+          class="icon-button"
+          data-close
+          aria-label="Close device details"
+          data-icon="close"
+        ></button>
+      </div>
+      <div id="detail-status" class="notice" hidden></div>
+      <dl id="device-details" class="detail-list"></dl>
+      <div id="detail-error" class="notice error" hidden></div>
+      <div id="device-actions" class="button-row"></div>
+      <form id="property-form" class="surface inset">
+        <h3>Set a property</h3>
+        <p class="small muted">
+          The driver validates the value before sending a command.
+        </p>
+        <label
+          >Property<input
+            id="property-name"
+            required
+            maxlength="256"
+            placeholder="Property name" /></label
+        ><label
+          >Value<input
+            id="property-value"
+            required
+            maxlength="16384"
+            placeholder="Value" /></label
+        ><button id="property-submit" class="button primary" type="submit">
+          Submit command
+        </button>
+        <p id="property-result" class="small" role="status"></p>
+      </form>
+    </dialog>
+    <dialog id="login-dialog" class="dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">LG THINQ</p>
+          <h2>Connect your account</h2>
         </div>
-
-        <div id="thinq_logout" class="modal">
-            <div class="modal-content">
-                <h4>Logout confirmation</h4>
-                <p>Signing out removes the saved LG account credentials.</p>
-                <button class="btn waves-effect waves-light" id="btn_thinq_logout_continue">
-                    Log out <i class="material-icons right">logout</i>
-                </button>
-            </div>
-            <div class="modal-footer">
-                <a href="#!" class="modal-close waves-effect waves-green btn-flat">Cancel</a>
-            </div>
-        </div>
-
-        <div id="devicetype_query" class="modal">
-            <div class="modal-content">
-                <h4>Select device type</h4>
-                <p>
-                    Please select the appropriate type for this device. This value usually consists of three digits and
-                    can be obtained during the setup process. The device will only register with the ThinQ cloud if the
-                    device type is set correctly.
-                </p>
-                <div class="row">
-                    <form class="col s12">
-                        <div class="row">
-                            <div class="input-field col s9">
-                                <input
-                                    type="text"
-                                    id="devtype-input"
-                                    class="autocomplete validate"
-                                    minlength="3"
-                                    required
-                                />
-                                <label for="devtype-input">Device type</label>
-                            </div>
-                            <div class="input-field col s3">
-                                <button type="button" class="btn waves-effect waves-light" id="btn_devicetype_continue">
-                                    Continue
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <a href="#!" class="modal-close waves-effect waves-green btn-flat">Close</a>
-            </div>
-        </div>
-
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
-        <script src="panel.js"></script>
-    </body>
+        <button
+          class="icon-button"
+          data-close
+          aria-label="Close login"
+          data-icon="close"
+        ></button>
+      </div>
+      <div class="steps">
+        <span class="active">1 · Open LG login</span
+        ><span>2 · Complete connection</span>
+      </div>
+      <p class="muted">
+        Choose the country for your account, then sign in in the new window.
+      </p>
+      <form id="login-start-form">
+        <label
+          >Country code<input
+            id="country-code"
+            value="KR"
+            minlength="2"
+            maxlength="2"
+            pattern="[A-Za-z]{2}"
+            required
+            autocomplete="country"
+            placeholder="KR" /></label
+        ><button id="login-start" class="button primary" type="submit">
+          Open LG login<span data-icon="arrow"></span>
+        </button>
+      </form>
+      <form id="login-complete-form" class="login-step" hidden>
+        <p>
+          After signing in, copy the URL from LG’s final blank page and paste it
+          below.
+        </p>
+        <label
+          >Final login URL<input
+            id="login-url"
+            type="url"
+            required
+            maxlength="4096"
+            autocomplete="off"
+            placeholder="https://…" /></label
+        ><button id="login-complete" class="button primary" type="submit">
+          Complete connection
+        </button>
+      </form>
+      <p id="login-feedback" class="small" role="status"></p>
+    </dialog>
+    <dialog id="pair-dialog" class="dialog">
+      <div class="dialog-header">
+        <h2>Pair with LG cloud</h2>
+        <button
+          class="icon-button"
+          data-close
+          aria-label="Close pairing"
+          data-icon="close"
+        ></button>
+      </div>
+      <p id="pair-description" class="muted"></p>
+      <form id="pair-form">
+        <label
+          >Device type<input
+            id="pair-type"
+            list="device-types"
+            required
+            maxlength="128"
+            placeholder="For example, 201"
+          /><datalist id="device-types">
+            <option value="101">Refrigerator</option>
+            <option value="201">Washer</option>
+            <option value="202">Dryer</option>
+            <option value="204">Dishwasher</option>
+            <option value="223">WashTower</option>
+            <option value="301">Range</option>
+            <option value="302">Microwave</option>
+            <option value="401">Air conditioner</option>
+          </datalist></label
+        ><label
+          >Device name<input id="pair-alias" required maxlength="256" /></label
+        ><button id="pair-submit" class="button primary" type="submit">
+          Pair and enable bridge
+        </button>
+      </form>
+    </dialog>
+    <dialog id="confirm-dialog" class="dialog">
+      <div class="dialog-header">
+        <h2 id="confirm-title"></h2>
+        <button
+          class="icon-button"
+          data-close
+          aria-label="Close confirmation"
+          data-icon="close"
+        ></button>
+      </div>
+      <p id="confirm-description" class="muted"></p>
+      <div class="button-row dialog-footer">
+        <button class="button secondary" data-close>Cancel</button
+        ><button id="confirm-accept" class="button primary">Continue</button>
+      </div>
+    </dialog>
+    <div
+      id="notifications"
+      class="notifications"
+      role="status"
+      aria-live="polite"
+    ></div>
+  </body>
 </html>

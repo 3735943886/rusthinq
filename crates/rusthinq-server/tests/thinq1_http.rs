@@ -143,7 +143,7 @@ async fn response(peer: &mut SslStream<TcpStream>) -> (u16, String, String) {
 #[tokio::test]
 async fn metadata_entities_cdata_and_setting_response_preserve_wire_shape() {
     let mut harness = Harness::start(Config::default()).await;
-    let body=br#"<lgedmRoot><modelName> Model&amp;&#x31;<![CDATA[&raw]]> </modelName><itemList><item>DM_SETTING_INFO_GET_URI</item></itemList><unknown>opaque</unknown></lgedmRoot>"#;
+    let body=br#"<lgedmRoot><modelName> Model&amp;&#x31;<![CDATA[&raw]]> </modelName><itemList><item>DM_SETTING_INFO_GET_URI</item></itemList><modelId>ID_01</modelId><swVersion>1.2.3</swVersion><unknown>opaque</unknown></lgedmRoot>"#;
     let (status, kind, body) = harness
         .request(
             "POST",
@@ -165,7 +165,9 @@ async fn metadata_entities_cdata_and_setting_response_preserve_wire_shape() {
         Metadata {
             device_id: "device".into(),
             model_name: "Model&1&raw".into(),
-            device_type: "201".into()
+            device_type: "201".into(),
+            model_id: "ID_01".into(),
+            sw_version: "1.2.3".into()
         }
     );
     harness.shutdown().await;
@@ -230,6 +232,8 @@ async fn malformed_xml_and_field_limits_do_not_publish_metadata() {
         b"<!DOCTYPE lgedmRoot [<!ENTITY x SYSTEM 'file:///unused'>]><lgedmRoot/>",
         b"<lgedmRoot><modelName>A</modelName><modelName>B</modelName></lgedmRoot>",
         b"<lgedmRoot><modelName>&unknown;</modelName></lgedmRoot>",
+        b"<lgedmRoot><modelName>M</modelName><modelId>A</modelId><modelId>B</modelId></lgedmRoot>",
+        b"<lgedmRoot><modelName>M</modelName><swVersion>A&#10;B</swVersion></lgedmRoot>",
         b"<lgedmRoot><modelName>&#0;</modelName></lgedmRoot>",
         b"<lgedmRoot><modelName>A<nested/>B</modelName></lgedmRoot>",
         b"<lgedmRoot/><lgedmRoot/>",

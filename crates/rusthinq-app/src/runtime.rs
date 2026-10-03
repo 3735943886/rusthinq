@@ -53,6 +53,7 @@ pub enum Event {
     CleanupFailed {
         reason: String,
     },
+    MetadataStored,
     Lifecycle(Action),
     Transport(TransportEvent),
     Lost {
@@ -437,7 +438,11 @@ impl Runtime {
                                     incarnation: meta.incarnation,
                                     generation,
                                 },
-                                meta.model_name.clone(),
+                                if meta.model_id.is_empty() {
+                                    meta.model_name.clone()
+                                } else {
+                                    meta.model_id.clone()
+                                },
                                 meta.thinq2,
                             ),
                         )
@@ -462,6 +467,8 @@ impl Runtime {
                                 device_id: id.clone(),
                                 model_name: meta.model_name.clone(),
                                 device_type: meta.device_type.clone(),
+                                model_id: meta.model_id.clone(),
+                                sw_version: meta.sw_version.clone(),
                             },
                         )
                     })
@@ -603,21 +610,47 @@ impl Runtime {
         }) else {
             return;
         };
-        let device_type = if thinq2 {
-            String::new()
-        } else {
-            self.handle()
-                .metadata_snapshot()
-                .into_iter()
-                .find(|meta| meta.device_id == id)
-                .map(|meta| meta.device_type)
-                .unwrap_or_default()
-        };
+        let observed = self
+            .handle()
+            .metadata_snapshot()
+            .into_iter()
+            .find(|meta| meta.device_id == id);
+        let prior = self
+            .pending_metadata
+            .get(id)
+            .cloned()
+            .or_else(|| self.handle().persisted_models().get(id).cloned())
+            .filter(|meta| meta.incarnation == device.entry.incarnation);
         let record = crate::lifecycle_storage::DeviceMetadata {
             incarnation: device.entry.incarnation,
-            model_name: model.into(),
-            device_type,
+            model_name: observed
+                .as_ref()
+                .map(|meta| meta.model_name.clone())
+                .or_else(|| prior.as_ref().map(|meta| meta.model_name.clone()))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| model.into()),
+            model_id: observed
+                .as_ref()
+                .map(|meta| meta.model_id.clone())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| model.into()),
+            device_type: observed
+                .as_ref()
+                .map(|meta| meta.device_type.clone())
+                .filter(|v| !v.is_empty())
+                .or_else(|| prior.as_ref().map(|meta| meta.device_type.clone()))
+                .unwrap_or_default(),
+            sw_version: observed
+                .as_ref()
+                .map(|meta| meta.sw_version.clone())
+                .filter(|v| !v.is_empty())
+                .or_else(|| prior.as_ref().map(|meta| meta.sw_version.clone()))
+                .unwrap_or_default(),
             thinq2,
+            last_seen_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(0),
         };
         if self
             .shared
@@ -711,12 +744,17 @@ impl Runtime {
                 generation: session.generation,
             }) == Ok(rusthinq_server::Protocol::ThinQ1)
         {
-            self.stage_model(&id, session, &metadata.model_name, false);
+            let selector = if metadata.model_id.is_empty() {
+                &metadata.model_name
+            } else {
+                &metadata.model_id
+            };
+            self.stage_model(&id, session, selector, false);
             self.shared
                 .driver_models
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id.clone(), (session, metadata.model_name.clone(), false));
+                .insert(id.clone(), (session, selector.clone(), false));
         }
         self.emit(Event::Metadata(metadata));
         self.prepare_driver(&id);
@@ -780,10 +818,23 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.into(), (session, model.clone(), thinq2));
         let config = config.clone();
+        let metadata = self
+            .pending_metadata
+            .get(id)
+            .cloned()
+            .or_else(|| self.handle().persisted_models().get(id).cloned());
         let id = id.to_string();
         self.driver_preparation.spawn_blocking(move || {
             let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                config.prepare(&id, &model, thinq2, true)
+                config.prepare_with_metadata(
+                    &id,
+                    &model,
+                    thinq2,
+                    true,
+                    metadata
+                        .as_ref()
+                        .map(|m| (m.model_name.as_str(), m.sw_version.as_str())),
+                )
             }))
             .unwrap_or_else(|_| {
                 Err(rusthinq_scripting::Error::Compile(
@@ -1133,12 +1184,17 @@ impl Runtime {
                 .find(|d| d.entry.id == id.device)
                 .and_then(|d| d.session)
         {
-            self.stage_model(&id.device, session, &metadata.model_name, false);
+            let selector = if metadata.model_id.is_empty() {
+                metadata.model_name.clone()
+            } else {
+                metadata.model_id.clone()
+            };
+            self.stage_model(&id.device, session, &selector, false);
             self.shared
                 .driver_models
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id.device.clone(), (session, metadata.model_name, false));
+                .insert(id.device.clone(), (session, selector, false));
         }
         self.prepare_driver(&id.device);
     }
@@ -1269,7 +1325,7 @@ impl Runtime {
                     match result {
                         WriteResult::Lifecycle(input) => self.input(input),
                         WriteResult::Metadata(result)=>{
-                            if let Err(reason)=result {self.emit(Event::Rejected{device:String::new(),reason:format!("model metadata persistence: {reason}")});}
+                            if let Err(reason)=result {self.emit(Event::Rejected{device:String::new(),reason:format!("model metadata persistence: {reason}")});} else {self.emit(Event::MetadataStored);}
                             if let Some(action)=self.deferred_storage.take() {self.write_action(action);}
                         },
                         WriteResult::Reservation(result) => {
@@ -1363,6 +1419,14 @@ impl Runtime {
                                 && let Some(session)=self.model.devices().iter().find(|d|d.entry.id==id.device).and_then(|d|d.session)
                                 && let Some(model)=deploy["kind"].as_str() {
                                 self.stage_model(&id.device,session,model,true);
+                                if let Some(record) = self.pending_metadata.get_mut(&id.device) {
+                                    for (field, destination) in [("modelName", &mut record.model_name), ("softVer", &mut record.sw_version), ("DeviceType", &mut record.device_type)] {
+                                        if let Some(value) = deploy.pointer(&format!("/data/appInfo/{field}")).and_then(serde_json::Value::as_str)
+                                            && !value.is_empty() && value.len() <= if field == "DeviceType" {128} else {256} && !value.chars().any(char::is_control) {
+                                            *destination = value.into();
+                                        }
+                                    }
+                                }
                                 self.shared.driver_models.lock().unwrap_or_else(|e|e.into_inner()).insert(id.device.clone(),(session,model.to_string(),true));
                                 self.prepare_driver(&id.device);
                             }

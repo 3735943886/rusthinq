@@ -535,6 +535,75 @@ impl Runtime {
         self.tasks.insert(device, Task { stop, task });
         Ok(())
     }
+    /// Read-only account reconciliation never deletes registration material.
+    /// A suspicious empty response is confirmed on a separate poll before pausing.
+    async fn reconcile_account(
+        &mut self,
+        empty: &mut Option<String>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> io::Result<bool> {
+        let client = match self.account.authenticated_client() {
+            Ok(client) => client,
+            Err(_) => {
+                *empty = None;
+                return Ok(false);
+            }
+        };
+        let identity = client.account_identity().ok_or_else(stale)?.to_owned();
+        let epoch = *self.account.cancellation().borrow();
+        let inventory = owned_remote(&self.account, &identity, epoch, stop, async {
+            timeout(Duration::from_secs(30), client.list_devices())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "account reconciliation timed out")
+                })?
+                .map_err(|_| io::Error::other("account inventory unavailable"))
+        })
+        .await?;
+        if inventory.is_empty() && empty.as_ref() != Some(&identity) {
+            *empty = Some(identity);
+            return Ok(true);
+        }
+        *empty = None;
+        for record in self.records() {
+            let owner = &record.attempt.owner;
+            if owner.account != identity
+                || !record.enabled
+                || record.material.is_none()
+                || !self.current(&owner.device, owner.incarnation)
+                || inventory
+                    .iter()
+                    .any(|device| device["deviceId"] == owner.device)
+            {
+                continue;
+            }
+            let attempt = record.attempt.clone();
+            self.storage(move |store| store.set_enabled(&attempt, false))
+                .await?;
+            self.stop_device(&owner.device).await?;
+            if let Some(status) = self.bridge.snapshot().iter().find(|status| {
+                status.registration.device == owner.device
+                    && status.registration.incarnation == owner.incarnation
+            }) {
+                self.bridge
+                    .disable(&status.registration)
+                    .map_err(|_| stale())?;
+            }
+            self.project();
+            if let Some(status) = self
+                .handle
+                .status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&owner.device)
+            {
+                status.connected = false;
+                status.error = Some("Registration absent from the LG account; bridge paused, saved material preserved".into());
+            }
+            self.app.cloud_changed(owner.device.clone());
+        }
+        Ok(false)
+    }
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
         // Restore registration ownership even without authentication or an active socket.
         for record in self.records() {
@@ -554,8 +623,27 @@ impl Runtime {
                 }
             }
         }
+        let mut accounts = self.account.clients();
+        let mut empty_inventory = None;
+        let mut reconcile_at = tokio::time::Instant::now();
         while !*stop.borrow() {
-            let command = tokio::select! {biased;_=stop.changed()=>break,command=self.commands.recv()=>match command{Some(c)=>c,None=>break}};
+            let command = tokio::select! {
+                biased;
+                _=stop.changed()=>break,
+                command=self.commands.recv()=>match command{Some(c)=>c,None=>break},
+                changed=accounts.changed()=>{
+                    if changed.is_err() { break; }
+                    accounts.borrow_and_update();
+                    empty_inventory = None;
+                    reconcile_at = tokio::time::Instant::now();
+                    continue;
+                },
+                _=tokio::time::sleep_until(reconcile_at)=>{
+                    let recheck = self.reconcile_account(&mut empty_inventory, &mut stop).await.unwrap_or(false);
+                    reconcile_at = tokio::time::Instant::now() + Duration::from_secs(if recheck {60} else {900});
+                    continue;
+                }
+            };
             if command.result.is_closed() {
                 continue;
             }

@@ -98,7 +98,7 @@ fn client_identity() -> (String, String) {
 }
 
 /// The account API calls `Client::authenticate` makes, answered like LG does.
-async fn lg_http(listener: TcpListener) {
+async fn lg_http(listener: TcpListener, inventory_id: &str) {
     let acceptor = acceptor("lg.test");
     loop {
         let mut stream = accept_tls(&listener, &acceptor).await;
@@ -128,6 +128,7 @@ async fn lg_http(listener: TcpListener) {
             "/api/service/homes" => {
                 json!({"resultCode":"0000","result":{"item":[{"homeId":"h","currentHomeYn":"Y"}]}})
             }
+            "/api/service/homes/h" => json!({"resultCode":"0000","result":{"devices":[{"deviceId":inventory_id}]}}),
             other => panic!("unexpected LG request {other}"),
         }
         .to_string();
@@ -274,7 +275,7 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
 
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_address: SocketAddr = http_listener.local_addr().unwrap();
-    let lg = tokio::spawn(lg_http(http_listener));
+    let lg = tokio::spawn(lg_http(http_listener, "d"));
     let (account, account_runtime) =
         rusthinq_app::cloud_account::open(directory.path().join("account.json"))
             .await
@@ -539,5 +540,112 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
         .unwrap()
         .unwrap()
         .unwrap();
+    lg.abort();
+}
+
+#[tokio::test]
+async fn missing_account_registration_pauses_bridge_and_preserves_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    storage
+        .save(&Ledger {
+            revision: 1,
+            next_incarnation: 2,
+            entries: vec![Entry {
+                id: "d".into(),
+                incarnation: 1,
+                last_generation: 0,
+            }],
+        })
+        .unwrap();
+    let server = rusthinq_server::Server::new(Default::default()).unwrap();
+    let runtime =
+        rusthinq_app::runtime::Runtime::new(storage, server.handle(), Duration::ZERO, 32).unwrap();
+    let path = dir.path().join("pairings.json");
+    let material = Material::ThinQ1 {
+        http_server: "https://lg.test/api".into(),
+        rti_server: "localhost:5222".into(),
+    };
+    {
+        let mut store = Store::open(&path, 8).unwrap();
+        store
+            .adopt(
+                Owner {
+                    device: "d".into(),
+                    incarnation: 1,
+                    account: "user-1".into(),
+                },
+                material.clone(),
+            )
+            .unwrap();
+        let attempt = store.snapshot()[0].attempt.clone();
+        store.set_enabled(&attempt, true).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("account.json"),
+        json!({"schema":1,"credentials":{"country":"KR","refresh":"refresh"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let lg = tokio::spawn(lg_http(listener, "some-other-device"));
+    let (account, account_runtime) =
+        rusthinq_app::cloud_account::open(dir.path().join("account.json"))
+            .await
+            .unwrap();
+    let account_runtime = account_runtime.with_client_factory(move |country| {
+        Client::with_test_service(
+            country,
+            "https://lg.test/gateway",
+            authority().certificate_pem(),
+            &["lg.test"],
+            address,
+        )
+    });
+    let broker = rusthinq_server::mqtt::Broker::sharing(server.handle(), Arc::new(SystemClock));
+    let relay =
+        passthrough::Relay::new(Default::default(), Arc::new(passthrough::HttpsConnector)).unwrap();
+    let (handle, cloud, _) = rusthinq_app::cloud_devices::Runtime::open(
+        path.clone(),
+        account,
+        runtime.handle(),
+        server.handle(),
+        broker.handle(),
+        relay,
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let account_task = tokio::spawn(account_runtime.run(stopped.clone()));
+    let cloud_task = tokio::spawn(cloud.run(stopped));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let status = &handle.snapshot()[0];
+            if !status.enabled
+                && status
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("Registration absent"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send_replace(true);
+    for task in [account_task, cloud_task] {
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    let restored = Store::open(&path, 8).unwrap().snapshot();
+    assert!(!restored[0].enabled);
+    assert!(restored[0].material.is_some());
+    assert_eq!(restored[0].attempt.owner.account, "user-1");
+    server.shutdown().await;
     lg.abort();
 }

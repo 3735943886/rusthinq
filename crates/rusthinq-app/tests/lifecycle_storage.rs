@@ -232,6 +232,7 @@ fn model_metadata_is_durable_incarnation_scoped_and_removed_with_its_owner() {
         model_name: "D140110".into(),
         device_type: "204".into(),
         thinq2: false,
+        ..Default::default()
     };
     let batch = std::collections::BTreeMap::from([("d".into(), record.clone())]);
     storage.save_metadata(&batch).unwrap();

@@ -1,192 +1,210 @@
 <!doctype html>
-<html>
-    <head>
-        <meta charset="utf-8" />
-        <script>
-            (function () {
-                try {
-                    if (localStorage.getItem('rusthinq-dark') === '1') {
-                        document.documentElement.classList.add('dark-theme');
-                    }
-                } catch (e) {}
-            })();
-        </script>
-        <style>
-            /* See index.html -- Materialize leaves the canvas transparent, which a dark host page
-               shows through when this is embedded. */
-            :root {
-                color-scheme: light;
-                background: #fff;
-            }
-
-            nav .brand-logo .logo {
-                height: 1em;
-                vertical-align: -0.1em;
-            }
-
-            .status_label {
-                width: 10em;
-                display: inline-block;
-            }
-            .flex_x {
-                display: flex;
-                flex-direction: row;
-                align-items: center;
-            }
-            .flex_y {
-                display: flex;
-                flex-direction: column;
-            }
-            .flex_grow {
-                flex: 1;
-            }
-            #messages {
-                border: solid 1px black;
-                border-radius: 8px;
-                padding: 8px;
-                overflow-y: scroll;
-                margin-bottom: 8px;
-            }
-            body {
-                height: 100vh;
-            }
-
-            .message {
-                clear: both;
-                border: solid 1px black;
-                border-radius: 4px;
-                padding: 2px 4px;
-                margin: 2px;
-                word-wrap: anywhere;
-            }
-
-            .tx.message {
-                float: right;
-                background: rgb(117, 42, 119);
-                color: white;
-            }
-            .rx.message {
-                float: left;
-                background: rgb(116, 171, 203);
-            }
-
-            .message.injected {
-                background: #c04040;
-            }
-
-            .message .timestamp {
-                background: #ffff80;
-                color: black;
-                margin: 0px 8px;
-                padding: 0px 4px;
-            }
-            .rx.message .timestamp {
-                float: left;
-            }
-            .tx.message .timestamp {
-                float: right;
-            }
-
-            .reduced_margins .input-field {
-                margin: 4px;
-            }
-
-            .monitor-controls {
-                display: flex;
-                flex-wrap: wrap;
-                align-items: center;
-                gap: 4px 24px;
-                margin-bottom: 8px;
-            }
-
-            .monitor-controls .toggle {
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                white-space: nowrap;
-                border-radius: 4px;
-                padding: 2px 8px;
-            }
-
-            .monitor-controls .toggle > label {
-                cursor: pointer;
-            }
-
-            .monitor-controls .switch label .lever {
-                margin: 0;
-            }
-        </style>
-        <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet" />
-        <link
-            rel="stylesheet"
-            href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css"
-        />
-        <link rel="stylesheet" href="dark.css" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <link rel="icon" type="image/png" href="favicon.png" />
-    </head>
-
-    <body class="flex_y">
-        <nav class="light-blue lighten-1" role="navigation">
-            <div class="nav-wrapper container">
-                <a id="logo-container" href="/" class="brand-logo">
-                    <img class="logo" src="logo.svg" alt="" />
-                    rusthinq <span class="hide-on-med-and-down">management panel</span>
-                </a>
-            </div>
-        </nav>
-        <div class="container">
-            <h4 class="header orange-text">Device status</h4>
-            <span class="status_label">Device ID:</span> <span id="device_id" class="status_value"></span> <br />
-            <span class="status_label">Device model:</span> <span id="device_model" class="status_value"></span> <br />
-            <span class="status_label">Status:</span> <span id="device_status" class="status_value"></span> <br />
-            <span id="injection_row" style="display: none">
-                <span class="status_label">Raw injection:</span>
-                <span class="switch">
-                    <label><input id="injection" type="checkbox" /> <span class="lever"></span></label>
-                </span>
-                <br />
-            </span>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>rusthinq · Packet studio</title>
+    <script>
+      try {
+        if (
+          localStorage.getItem("rusthinq-dark") === "1" ||
+          (localStorage.getItem("rusthinq-dark") === null &&
+            matchMedia("(prefers-color-scheme: dark)").matches)
+        )
+          document.documentElement.classList.add("dark-theme");
+      } catch (_) {}
+    </script>
+    <link rel="icon" href="favicon.png" />
+    <link rel="stylesheet" href="dark.css" />
+    <script src="ui.js" defer></script>
+    <script src="monitor.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <main class="monitor-shell" id="main">
+      <header class="topbar">
+        <a class="button quiet" href="./"
+          ><span data-icon="back"></span>Back to workspace</a
+        >
+        <div class="packet-tools">
+          <span id="monitor-connection" class="badge neutral">Connecting</span
+          ><button
+            id="theme-toggle"
+            class="icon-button"
+            title="Toggle dark theme"
+            aria-label="Toggle dark theme"
+            data-icon="moon"
+          ></button>
         </div>
-
-        <div class="reduced_margins container flex_y flex_grow" style="overflow: hidden">
-            <h4 class="header orange-text">Messages</h4>
-            <div class="monitor-controls">
-                <span class="toggle">
-                    <label for="autoscroll">Auto-scroll</label>
-                    <span class="switch">
-                        <label><input id="autoscroll" type="checkbox" checked /> <span class="lever"></span></label>
-                    </span>
-                </span>
-            </div>
-            <div class="flex_grow" id="messages"></div>
-            <div class="flex_x">
-                <div class="input-field flex_grow">
-                    <input id="send1" type="text" />
-                    <label for="send1">Send to device (hex)</label>
-                </div>
-                &nbsp;
-                <div class="input-field">
-                    <button disabled class="btn waves-effect waves-light" id="btn_send1">
-                        Send <i class="material-icons right">send</i>
-                    </button>
-                </div>
-            </div>
-            <div class="flex_x">
-                <div class="input-field">
-                    <button disabled class="btn waves-effect waves-light" id="btn_send2">
-                        Send <i class="material-icons left">send</i>
-                    </button>
-                </div>
-                &nbsp;
-                <div class="input-field flex_grow">
-                    <input id="send2" type="text" />
-                    <label for="send2">Inject from device (hex)</label>
-                </div>
-            </div>
+      </header>
+      <div class="page-heading monitor-heading">
+        <div>
+          <p class="eyebrow">A CLOSER LOOK</p>
+          <h1>Packet studio<span class="accent">.</span></h1>
+          <p id="device-title" class="subtitle">
+            Waiting for device information…
+          </p>
+          <p id="device-id" class="monitor-id"></p>
         </div>
-
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
-        <script src="monitor.js"></script>
-    </body>
+        <button id="export-capture" class="button secondary" disabled>
+          <span data-icon="download"></span>Export capture
+        </button>
+      </div>
+      <div id="monitor-notice" class="notice" role="status" hidden></div>
+      <div class="monitor-layout">
+        <section class="surface packet-surface" aria-label="Live packet stream">
+          <div class="packet-toolbar">
+            <h2>Live traffic</h2>
+            <div class="packet-tools">
+              <div class="segmented" role="group" aria-label="Packet direction">
+                <button data-direction="all" class="active" aria-pressed="true">
+                  All</button
+                ><button data-direction="rx" aria-pressed="false">
+                  Received</button
+                ><button data-direction="tx" aria-pressed="false">Sent</button>
+              </div>
+              <button
+                id="pause-stream"
+                class="icon-button"
+                title="Pause display"
+                aria-label="Pause display"
+                aria-pressed="false"
+              >
+                Ⅱ</button
+              ><button id="clear-stream" class="button quiet small">
+                Clear
+              </button>
+            </div>
+          </div>
+          <div class="packet-counts">
+            <span><strong id="rx-count">0</strong> received</span
+            ><span><strong id="tx-count">0</strong> sent</span
+            ><span><strong id="loss-count">0</strong> missed events</span
+            ><span id="buffer-count">0 buffered</span>
+          </div>
+          <div id="messages" class="packet-list">
+            <p class="empty-note">
+              Listening for traffic. Select a packet to inspect its contents.
+            </p>
+          </div>
+          <div class="packet-list-footer">
+            <label class="toggle"
+              ><input type="checkbox" id="autoscroll" checked />Follow
+              latest</label
+            ><span>Latest 500 records</span>
+          </div>
+        </section>
+        <aside class="studio-side">
+          <section class="surface">
+            <div class="surface-heading">
+              <h2>Packet inspector</h2>
+              <span id="analysis-direction" class="badge neutral"
+                >Select a packet</span
+              >
+            </div>
+            <p id="analysis-empty" class="small muted">
+              Select a received or sent packet to see its protocol, integrity
+              checks and decoded fields.
+            </p>
+            <div id="analysis-content" hidden>
+              <div id="analysis-summary" class="analysis-summary"></div>
+              <div id="packet-hex" class="packet-hex"></div>
+              <div id="analysis-fields" class="analysis-fields"></div>
+              <div id="analysis-notes"></div>
+              <div class="button-row">
+                <button id="copy-packet" class="button secondary small">
+                  <span data-icon="copy"></span>Copy hex</button
+                ><button id="use-packet" class="button secondary small">
+                  Use in composer
+                </button>
+              </div>
+              <details>
+                <summary>Analysis export</summary>
+                <pre id="analysis-export"></pre>
+                <button id="export-analysis" class="button quiet small">
+                  Download analysis
+                </button>
+              </details>
+            </div>
+          </section>
+          <section class="surface">
+            <div class="injection-heading">
+              <h2>Packet composer</h2>
+              <span id="injection-badge" class="badge neutral">Read only</span>
+            </div>
+            <p class="small muted" id="injection-description">
+              Observation is always available. Injection requires permission and
+              a current device connection.
+            </p>
+            <label id="injection-control" class="toggle" hidden
+              ><input type="checkbox" id="injection" />Enable raw
+              injection</label
+            >
+            <form id="inject-form" class="injection-form">
+              <label
+                >Direction<select id="inject-direction">
+                  <option value="toDevice">Send to device</option>
+                  <option value="fromDevice">Simulate received data</option>
+                </select></label
+              ><label
+                >Hex payload<textarea
+                  id="inject-hex"
+                  placeholder="AA … BB"
+                  maxlength="131072"
+                  required
+                  spellcheck="false"
+                ></textarea>
+              </label>
+              <div class="button-row">
+                <button
+                  id="inject-submit"
+                  class="button primary"
+                  type="submit"
+                  disabled
+                >
+                  Review and send</button
+                ><button
+                  id="reconnect-monitor"
+                  class="button secondary"
+                  type="button"
+                  hidden
+                >
+                  Refresh connection
+                </button>
+              </div>
+              <p id="delivery-result" class="small" role="status"></p>
+            </form>
+          </section>
+        </aside>
+      </div>
+      <footer class="page-footer">
+        Local wire writes are not appliance acknowledgements.<span
+          >rusthinq · packet studio</span
+        >
+      </footer>
+    </main>
+    <dialog id="confirm-dialog" class="dialog">
+      <div class="dialog-header">
+        <h2 id="confirm-title"></h2>
+        <button
+          class="icon-button"
+          data-close
+          aria-label="Close confirmation"
+          data-icon="close"
+        ></button>
+      </div>
+      <p id="confirm-description" class="muted"></p>
+      <div class="button-row dialog-footer">
+        <button class="button secondary" data-close>Cancel</button
+        ><button id="confirm-accept" class="button primary">Continue</button>
+      </div>
+    </dialog>
+    <div
+      id="notifications"
+      class="notifications"
+      role="status"
+      aria-live="polite"
+    ></div>
+  </body>
 </html>

@@ -14,6 +14,8 @@ fn metadata(id: &str, model: &str) -> Metadata {
         device_id: id.into(),
         model_name: model.into(),
         device_type: "purifier".into(),
+        model_id: model.into(),
+        sw_version: "1.2.3".into(),
     }
 }
 async fn until(events: &mut broadcast::Receiver<Event>, predicate: impl Fn(&Event) -> bool) {
@@ -121,6 +123,9 @@ async fn model_information_survives_restart_and_is_rebound_only_to_current_incar
     task.await.unwrap().unwrap();
     let storage = Storage::open(&path, 4).unwrap();
     assert_eq!(storage.state().metadata["d"].model_name, "D140110");
+    assert_eq!(storage.state().metadata["d"].model_id, "D140110");
+    assert_eq!(storage.state().metadata["d"].sw_version, "1.2.3");
+    assert!(storage.state().metadata["d"].last_seen_unix > 0);
     let mut server = Server::new(Config {
         generation_floor: storage.state().generation_floor,
         ..Default::default()

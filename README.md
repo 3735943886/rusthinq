@@ -13,6 +13,8 @@ Configure TLS device endpoints, an existing CA and durable device inventory usin
 [the runtime guide](docs/0.2-runtime.md). Optional management, real Rhai drivers and
 external MQTT are documented in [operations](docs/0.2-operations.md).
 The management API and dashboard work independently of the external broker.
+The redesigned [dashboard and packet studio](docs/0.2-dashboard.md) include local
+assets, responsive layouts, dark mode and detailed packet analysis.
 
 rusthinq is IL-agnostic: it carries device and cloud traffic and runs Rhai drivers,
 whose output it routes without interpreting. Drivers and any IL output live in

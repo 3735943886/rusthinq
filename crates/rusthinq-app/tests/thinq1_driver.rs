@@ -188,6 +188,7 @@ async fn automatic_driver(external: bool) {
             device_id: "dishwasher".into(),
             model_name: "D140110".into(),
             device_type: "dishwasher".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -497,6 +498,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
             device_id: "dishwasher".into(),
             model_name: "D140110".into(),
             device_type: "dishwasher".into(),
+            ..Default::default()
         })
         .await
         .unwrap();

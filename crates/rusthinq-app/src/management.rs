@@ -96,6 +96,7 @@ struct App {
     config: Config,
     stop: watch::Receiver<bool>,
     sockets: Arc<Semaphore>,
+    analysis: Arc<Semaphore>,
 }
 pub fn router(
     handle: impl Into<Handle>,
@@ -110,12 +111,15 @@ pub fn router(
         config,
         stop,
         sockets: Arc::new(Semaphore::new(64)),
+        analysis: Arc::new(Semaphore::new(2)),
     }))
 }
 fn build(app: App) -> Router {
     #[allow(unused_mut)]
     let mut routes = Router::new()
         .route("/api/health", get(health))
+        .route("/api/packets/decode", post(decode_packet))
+        .route("/api/tlv/catalog", get(tlv_catalog))
         .route("/api/cloud/devices", get(cloud_devices))
         .route("/api/cloud/inventory", get(cloud_inventory))
         .route("/api/devices/{id}/bridge/{action}", post(cloud_device))
@@ -149,6 +153,15 @@ fn build(app: App) -> Router {
                     (
                         [("content-type", "text/html; charset=utf-8")],
                         include_str!("../assets/index.html"),
+                    )
+                }),
+            )
+            .route(
+                "/ui.js",
+                get(|| async {
+                    (
+                        [("content-type", "text/javascript; charset=utf-8")],
+                        include_str!("../assets/ui.js"),
                     )
                 }),
             )
@@ -257,6 +270,52 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
     }
     next.run(request).await
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PacketDecode {
+    hex: String,
+    direction: Option<String>,
+    model_id: Option<String>,
+}
+async fn decode_packet(State(app): State<App>, Json(input): Json<PacketDecode>) -> Response {
+    let Ok(permit) = app.analysis.clone().try_acquire_owned() else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "packet analysis capacity exceeded",
+        );
+    };
+    if input.hex.len() > 131072
+        || input
+            .model_id
+            .as_ref()
+            .is_some_and(|v| v.len() > 256 || v.chars().any(char::is_control))
+        || input
+            .direction
+            .as_deref()
+            .is_some_and(|v| !matches!(v, "fromDevice" | "toDevice"))
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid packet analysis input");
+    }
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut decoded =
+            rusthinq_protocol::decode::decode_hex_payload(&input.hex, input.direction.as_deref())?;
+        decoded["exportText"] = json!(rusthinq_protocol::decode::re_export_text(
+            &decoded,
+            input.model_id.as_deref(),
+            input.direction.as_deref(),
+        ));
+        Ok::<_, String>(decoded)
+    });
+    match task.await {
+        Ok(Ok(decoded)) => Json(decoded).into_response(),
+        Ok(Err(reason)) => error(StatusCode::BAD_REQUEST, &reason),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "packet analysis failed"),
+    }
+}
+async fn tlv_catalog() -> Json<Value> {
+    Json(rusthinq_protocol::decode::tlv_catalog_json())
+}
 async fn mqtt_status(State(app): State<App>) -> Json<Value> {
     let Some(handle) = app.handle.external_mqtt() else {
         return Json(json!({"status":"Disabled"}));
@@ -300,8 +359,7 @@ async fn health(State(app): State<App>) -> Json<Value> {
         json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow())}),
     )
 }
-/// Names change only through the account, so they are read when they can have changed:
-/// at start, on login/logout, after a pairing change and when a panel opens. No polling.
+/// Refresh on explicit account changes and periodically for changes in the LG app.
 async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<bool>) {
     loop {
         if handle.cloud_status()["account"]["loggedIn"] != true {
@@ -318,7 +376,7 @@ async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<b
                 })
                 .collect();
         }
-        tokio::select! {_=stop.changed()=>{if *stop.borrow() {return;}},_=names.wanted.notified()=>{}}
+        tokio::select! {_=stop.changed()=>{if *stop.borrow() {return;}},_=names.wanted.notified()=>{},_=tokio::time::sleep(Duration::from_secs(900))=>{}}
     }
 }
 fn snapshot(handle: &Handle, names: &Names) -> Value {
@@ -333,6 +391,9 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
         let meta = metadata
             .iter()
             .find(|meta| meta.device_id == device.entry.id);
+        let saved = persisted_models
+            .get(&device.entry.id)
+            .filter(|meta| meta.incarnation == device.entry.incarnation);
         let model = models.get(&device.entry.id);
         let script = states
             .get(&device.entry.id)
@@ -353,7 +414,11 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
                 "incarnation":device.entry.incarnation.to_string(),
                 "generation":device.session.map(|s|s.generation.to_string()),
                 "model":model.map(|(_,model,_)|model.as_str()).or_else(||meta.map(|m|m.model_name.as_str())).unwrap_or(""),
-                "deviceType":meta.map(|m|m.device_type.as_str()),
+                "modelId":saved.map(|m|m.model_id.as_str()).filter(|v| !v.is_empty()).or_else(||model.map(|(_,model,_)|model.as_str())),
+                "modelName":saved.map(|m|m.model_name.as_str()),
+                "swVersion":saved.map(|m|m.sw_version.as_str()),
+                "lastSeenUnix":saved.map(|m|m.last_seen_unix),
+                "deviceType":meta.map(|m|m.device_type.as_str()).filter(|v| !v.is_empty()).or_else(||saved.map(|m|m.device_type.as_str())),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
                 "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
                 "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some() && (!handle.driver_watch() || script.is_some_and(|(_,_,faulted)|*faulted)),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
@@ -362,7 +427,7 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
             }),
         );
     }
-    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":!states.is_empty(),"bridge":cloud["enabled"]},"mqtt":null,"guiMqtt":handle.external_mqtt().map(|mqtt|matches!(*mqtt.status().borrow(),crate::external_mqtt::Status::Connected)),"management":true})
+    json!({"devices":devices,"version":env!("CARGO_PKG_VERSION"),"features":{"scripting":cfg!(feature="scripting"),"bridge":cloud["enabled"]},"mqtt":null,"guiMqtt":handle.external_mqtt().map(|mqtt|matches!(*mqtt.status().borrow(),crate::external_mqtt::Status::Connected)),"management":true})
 }
 async fn devices(State(app): State<App>) -> Json<Value> {
     Json(snapshot(&app.handle, &app.names))
@@ -721,7 +786,7 @@ async fn monitor(
         let status = |handle:&Handle| {
             let value = snapshot(handle, &app.names);
             let device = &value["devices"][&query.id];
-            json!({"status":if device["online"]==true {"online"} else {"offline"},"injectionEnabled":app.config.injection(),"injectionToggle":app.config.raw_inject_toggle,"meta":{"modelId":device["model"]}})
+            json!({"status":if device["online"]==true {"online"} else {"offline"},"sessionChanged":app.handle.snapshot().iter().find(|d|d.entry.id==query.id).and_then(|d|d.session)!=captured,"injectionEnabled":app.config.injection(),"injectionToggle":app.config.raw_inject_toggle,"meta":{"modelId":device["modelId"],"modelName":device["modelName"],"name":device["name"],"swVersion":device["swVersion"]}})
         };
         if !write(&mut socket,status(&app.handle)).await {return;}
         loop {tokio::select! {
@@ -852,6 +917,7 @@ pub async fn serve(
         config,
         stop: owned_stopped.clone(),
         sockets: sockets.clone(),
+        analysis: Arc::new(Semaphore::new(2)),
     });
     let mut tasks = JoinSet::new();
     let mut failure = None;

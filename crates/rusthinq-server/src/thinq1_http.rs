@@ -33,11 +33,13 @@ impl Default for Config {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
     pub device_id: String,
     pub model_name: String,
     pub device_type: String,
+    pub model_id: String,
+    pub sw_version: String,
 }
 #[derive(Clone)]
 pub struct Service {
@@ -162,6 +164,8 @@ impl Service {
                             device_id: device_id.expect("validated identity"),
                             model_name,
                             device_type,
+                            model_id: parsed.model_id.unwrap_or_default(),
+                            sw_version: parsed.sw_version.unwrap_or_default(),
                         })
                         .is_err()
                 {
@@ -230,6 +234,8 @@ fn xml(inner: &str) -> Response<Full<Bytes>> {
 struct Parsed {
     model: Option<String>,
     item: Option<String>,
+    model_id: Option<String>,
+    sw_version: Option<String>,
 }
 fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
     let text = std::str::from_utf8(bytes).map_err(|_| ())?;
@@ -238,7 +244,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
     }
     let mut reader = Reader::from_str(text);
     reader.config_mut().expand_empty_elements = true;
-    let mut seen = [false; 2];
+    let mut seen = [false; 4];
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut parsed = Parsed::default();
     let mut value = String::new();
@@ -266,7 +272,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
                 }
                 stack.push(element.name().as_ref().to_vec());
                 if let Some(model) = target(&stack) {
-                    let index = usize::from(!model);
+                    let index = model;
                     if seen[index] {
                         return Err(());
                     }
@@ -296,15 +302,19 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
                     return Err(());
                 }
                 if let Some(model) = target(&stack) {
-                    let slot = if model {
-                        &mut parsed.model
-                    } else {
-                        &mut parsed.item
+                    let slot = match model {
+                        0 => &mut parsed.model,
+                        1 => &mut parsed.item,
+                        2 => &mut parsed.model_id,
+                        _ => &mut parsed.sw_version,
                     };
                     if slot.is_some() {
                         return Err(());
                     }
                     let text = value.trim().to_owned();
+                    if model >= 2 && (text.len() > 256 || text.chars().any(char::is_control)) {
+                        return Err(());
+                    }
                     if !text.is_empty() {
                         *slot = Some(text);
                     }
@@ -340,15 +350,19 @@ fn append(value: &mut String, stack: &[Vec<u8>], decoded: &str) -> Result<(), ()
     }
     Ok(())
 }
-fn target(stack: &[Vec<u8>]) -> Option<bool> {
+fn target(stack: &[Vec<u8>]) -> Option<usize> {
     if stack.len() == 2 && stack[0] == b"lgedmRoot" && stack[1] == b"modelName" {
-        Some(true)
+        Some(0)
     } else if stack.len() == 3
         && stack[0] == b"lgedmRoot"
         && stack[1] == b"itemList"
         && stack[2] == b"item"
     {
-        Some(false)
+        Some(1)
+    } else if stack.len() == 2 && stack[0] == b"lgedmRoot" && stack[1] == b"modelId" {
+        Some(2)
+    } else if stack.len() == 2 && stack[0] == b"lgedmRoot" && stack[1] == b"swVersion" {
+        Some(3)
     } else {
         None
     }

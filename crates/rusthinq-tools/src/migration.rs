@@ -574,7 +574,13 @@ pub fn legacy_devices(bytes: &[u8]) -> io::Result<Value> {
                 .as_str()
                 .ok_or_else(|| invalid("invalid legacy device type"))?,
         };
-        if model.len() > 256
+        if ["modelId", "swVersion"].iter().any(|key| {
+            state.get(key).is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|v| v.len() > 256 || v.chars().any(char::is_control))
+            })
+        }) || model.len() > 256
             || model.chars().any(char::is_control)
             || device_type.len() > 128
             || device_type.chars().any(char::is_control)
@@ -588,7 +594,7 @@ pub fn legacy_devices(bytes: &[u8]) -> io::Result<Value> {
             return Err(invalid("unknown legacy device platform"));
         }
         if !model.is_empty() && !platform.is_empty() {
-            metadata.insert(id.clone(),json!({"incarnation":incarnation,"model_name":model,"device_type":device_type,"thinq2":platform=="thinq2"}));
+            metadata.insert(id.clone(),json!({"incarnation":incarnation,"model_name":model,"device_type":device_type,"thinq2":platform=="thinq2","model_id":state["modelId"].as_str().unwrap_or(model),"sw_version":state["swVersion"].as_str().unwrap_or(""),"last_seen_unix":state["last_seen_unix"].as_u64().unwrap_or(0)}));
         }
     }
     Ok(

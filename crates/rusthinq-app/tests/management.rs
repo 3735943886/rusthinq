@@ -358,6 +358,7 @@ async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_wi
             device_id: "d".into(),
             model_name: "model".into(),
             device_type: "fixture".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -554,4 +555,47 @@ async fn raw_injection_starts_off_and_is_switched_only_when_the_toggle_is_allowe
     .await;
     let (_, value) = body(app.oneshot(inject()).await.unwrap()).await;
     assert_eq!(value["error"], "raw injection disabled");
+}
+
+#[tokio::test]
+async fn offline_analysis_is_available_without_gui_and_rejects_invalid_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 16).unwrap();
+    let (_, stop) = watch::channel(false);
+    let app = management::router(runtime.handle(), config(false), stop).unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/api/packets/decode",
+            "POST",
+            json!({"hex":"01", "direction":"fromDevice", "model_id":"test"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let decoded: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert!(decoded["exportText"].is_string());
+    for body in [
+        json!({"hex":"01", "direction":"sideways"}),
+        json!({"hex":"00".repeat(65537)}),
+        json!({"hex":"01", "model_id":"\n"}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("/api/packets/decode", "POST", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        app.oneshot(request("/api/tlv/catalog", "GET", json!({})))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    server.shutdown().await;
 }

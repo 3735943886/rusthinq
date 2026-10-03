@@ -179,6 +179,8 @@ pub struct Metadata {
     pub device_id: String,
     pub model_name: String,
     pub device_type: String,
+    pub model_id: String,
+    pub sw_version: String,
 }
 #[derive(Debug)]
 pub enum CloudError {
@@ -240,6 +242,8 @@ impl AppHandle {
                 device_id: m.device_id,
                 model_name: m.model_name,
                 device_type: m.device_type,
+                model_id: m.model_id,
+                sw_version: m.sw_version,
             })
             .collect()
     }

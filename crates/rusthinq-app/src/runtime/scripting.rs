@@ -497,9 +497,27 @@ impl Runtime {
                 let _ = request.result.send(Err(error));
             }
             Ok((config, model, thinq2)) => {
+                let metadata = self
+                    .pending_metadata
+                    .get(&request.device)
+                    .cloned()
+                    .or_else(|| {
+                        self.handle()
+                            .persisted_models()
+                            .get(&request.device)
+                            .cloned()
+                    });
                 self.driver_reload_preparation.spawn_blocking(move || {
                     let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        config.prepare(&request.device, &model, thinq2, true)
+                        config.prepare_with_metadata(
+                            &request.device,
+                            &model,
+                            thinq2,
+                            true,
+                            metadata
+                                .as_ref()
+                                .map(|m| (m.model_name.as_str(), m.sw_version.as_str())),
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         Err(rusthinq_scripting::Error::Compile(
