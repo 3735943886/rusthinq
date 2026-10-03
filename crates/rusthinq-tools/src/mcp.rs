@@ -19,6 +19,24 @@ pub fn tools() -> Value {
             json!({}),
             &[]
         ),
+        tool(
+            "cloud_start",
+            "Enable the shared, read-only LG notification observer",
+            json!({}),
+            &[]
+        ),
+        tool(
+            "cloud_stop",
+            "Disable the LG observer (shared by GUI and captures)",
+            json!({"clear":{"type":"boolean"}}),
+            &[]
+        ),
+        tool(
+            "read_cloud",
+            "Read bounded time-aligned LG notifications; cursors are decimal strings, reset/lost mark discontinuities",
+            json!({"cursor":{"type":"string"},"limit":{"type":"integer"},"device_id":{"type":"string"}}),
+            &[]
+        ),
         tool("health", "Read daemon health", json!({}), &[]),
         tool(
             "decode_packet",
@@ -81,7 +99,8 @@ pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Val
                         "endpoint required",
                     )),
                 },
-                "list_devices" | "health" | "inject" => {
+                "list_devices" | "health" | "inject" | "cloud_start" | "cloud_stop"
+                | "read_cloud" => {
                     if client.is_none() {
                         match Client::environment() {
                             Ok(value) => *client = Some(value),
@@ -92,6 +111,39 @@ pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Val
                     match name {
                         "list_devices" => client.request("api/devices", None).await,
                         "health" => client.request("api/health", None).await,
+                        "cloud_start" => {
+                            client
+                                .request("api/cloud/notifications", Some(&json!({"enabled":true})))
+                                .await
+                        }
+                        "cloud_stop" => {
+                            client
+                                .request(
+                                    "api/cloud/notifications",
+                                    Some(&json!({"enabled":false,"clear":args["clear"]==true})),
+                                )
+                                .await
+                        }
+                        "read_cloud" => {
+                            let cursor = args["cursor"].as_str().unwrap_or("0").parse::<u64>();
+                            match cursor {
+                                Err(_) => Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "cursor must be a decimal u64 string",
+                                )),
+                                Ok(cursor) => {
+                                    let mut path = format!(
+                                        "api/cloud/notifications?cursor={cursor}&limit={}",
+                                        args["limit"].as_u64().unwrap_or(100).min(200)
+                                    );
+                                    if let Some(device) = args["device_id"].as_str() {
+                                        path.push_str("&device=");
+                                        path.push_str(&crate::segment(device));
+                                    }
+                                    client.request(&path, None).await
+                                }
+                            }
+                        }
                         _ => client.inject(args).await,
                     }
                 }

@@ -599,3 +599,94 @@ async fn offline_analysis_is_available_without_gui_and_rejects_invalid_scope() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn diagnostics_exclude_credentials_and_presentation_requires_live_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 16).unwrap();
+    let (_, stop) = watch::channel(false);
+    let app = management::router(runtime.handle(), config(false), stop).unwrap();
+    let response = app
+        .clone()
+        .oneshot(request("/api/diagnostics", "GET", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(report["runtime"]["uptimeSeconds"].is_number());
+    assert!(
+        report["privacy"]
+            .as_str()
+            .unwrap()
+            .contains("No credentials")
+    );
+    assert!(report.get("publications").is_none());
+    let response=app.clone().oneshot(request("/api/devices/d/presentation?incarnation=9007199254740993&generation=1&script_generation=1","GET",json!({}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/api/cloud/notifications",
+            "POST",
+            json!({"enabled":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .oneshot(request(
+            "/api/cloud/notifications?limit=0",
+            "GET",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let state: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(state["enabled"], false);
+    assert_eq!(state["events"], json!([]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_socket_resets_old_cursor_and_joins_on_management_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 16).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(management::serve(
+        listener,
+        runtime.handle(),
+        config(false),
+        stopped,
+    ));
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{address}/api/cloud/notifications/ws?cursor=9007199254740993"
+    ))
+    .await
+    .unwrap();
+    let message = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let snapshot: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(snapshot["type"], "cloudSnapshot");
+    assert_eq!(snapshot["snapshot"]["reset"], true);
+    assert_eq!(snapshot["snapshot"]["cursor"], "0");
+    assert_eq!(snapshot["snapshot"]["enabled"], false);
+    stop.send_replace(true);
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.shutdown().await;
+}

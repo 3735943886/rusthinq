@@ -18,6 +18,8 @@
     <link rel="icon" href="favicon.png" />
     <link rel="stylesheet" href="dark.css" />
     <script src="ui.js" defer></script>
+    <script src="cloud-feed.js" defer></script>
+    <script src="controls.js" defer></script>
     <script src="panel.js" defer></script>
   </head>
   <body>
@@ -206,6 +208,23 @@
               </div>
             </article>
           </div>
+          <article class="surface inset">
+            <div class="surface-heading">
+              <h2>LG notifications</h2>
+              <span id="cloud-feed-status" class="badge neutral"
+                >LG feed disabled</span
+              >
+            </div>
+            <p class="small muted">
+              Read-only account notifications. Observation starts explicitly and
+              resets after restart. Account events without a device ID are
+              labeled separately.
+            </p>
+            <button id="cloud-feed-toggle" class="button secondary" disabled>
+              Start LG feed
+            </button>
+            <div id="cloud-feed" class="cloud-feed"></div>
+          </article>
         </section>
         <section id="view-activity" class="view" hidden>
           <div class="page-heading">
@@ -245,6 +264,16 @@
           <div class="system-grid">
             <article class="surface">
               <h2>Runtime</h2>
+              <button
+                id="download-diagnostics"
+                class="button secondary"
+                type="button"
+              >
+                Download diagnostics
+              </button>
+              <p class="small muted">
+                Credentials, certificates and packet contents are excluded.
+              </p>
               <dl id="runtime-details" class="detail-list">
                 <dt>Status</dt>
                 <dd>Checking…</dd>
@@ -321,31 +350,44 @@
         ></button>
       </div>
       <div id="detail-status" class="notice" hidden></div>
-      <dl id="device-details" class="detail-list"></dl>
+      <section class="surface inset">
+        <h3>Device controls</h3>
+        <div id="device-controls" class="device-controls"></div>
+      </section>
+      <details class="surface inset">
+        <summary>Device information</summary>
+        <dl id="device-details" class="detail-list"></dl>
+      </details>
+      <details class="surface inset">
+        <summary>Connection diagnostics</summary>
+        <dl id="device-diagnostics" class="detail-list"></dl>
+      </details>
       <div id="detail-error" class="notice error" hidden></div>
       <div id="device-actions" class="button-row"></div>
-      <form id="property-form" class="surface inset">
-        <h3>Set a property</h3>
-        <p class="small muted">
-          The driver validates the value before sending a command.
-        </p>
-        <label
-          >Property<input
-            id="property-name"
-            required
-            maxlength="256"
-            placeholder="Property name" /></label
-        ><label
-          >Value<input
-            id="property-value"
-            required
-            maxlength="16384"
-            placeholder="Value" /></label
-        ><button id="property-submit" class="button primary" type="submit">
-          Submit command
-        </button>
-        <p id="property-result" class="small" role="status"></p>
-      </form>
+      <details id="advanced-command" class="surface inset">
+        <summary>Advanced command</summary>
+        <form id="property-form">
+          <p class="small muted">
+            The driver validates the value before sending a command.
+          </p>
+          <label
+            >Property<input
+              id="property-name"
+              required
+              maxlength="256"
+              placeholder="Property name" /></label
+          ><label
+            >Value<input
+              id="property-value"
+              required
+              maxlength="16384"
+              placeholder="Value" /></label
+          ><button id="property-submit" class="button primary" type="submit">
+            Submit command
+          </button>
+          <p id="property-result" class="small" role="status"></p>
+        </form>
+      </details>
     </dialog>
     <dialog id="login-dialog" class="dialog">
       <div class="dialog-header">

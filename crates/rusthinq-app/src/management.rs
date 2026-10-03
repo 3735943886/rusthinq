@@ -97,6 +97,7 @@ struct App {
     stop: watch::Receiver<bool>,
     sockets: Arc<Semaphore>,
     analysis: Arc<Semaphore>,
+    observer: crate::cloud_observer::Observer,
 }
 pub fn router(
     handle: impl Into<Handle>,
@@ -105,7 +106,11 @@ pub fn router(
 ) -> io::Result<Router> {
     let handle = handle.into();
     config.validate()?;
+    let observer = crate::cloud_observer::Observer::new(
+        cfg!(feature = "bridge") && handle.cloud_status()["enabled"] == true,
+    );
     Ok(build(App {
+        observer,
         handle,
         names: Names::default(),
         config,
@@ -118,6 +123,13 @@ fn build(app: App) -> Router {
     #[allow(unused_mut)]
     let mut routes = Router::new()
         .route("/api/health", get(health))
+        .route("/api/diagnostics", get(diagnostics))
+        .route("/api/devices/{id}/presentation", get(presentation))
+        .route(
+            "/api/cloud/notifications",
+            get(notifications).post(notification_control),
+        )
+        .route("/api/cloud/notifications/ws", get(notification_socket))
         .route("/api/packets/decode", post(decode_packet))
         .route("/api/tlv/catalog", get(tlv_catalog))
         .route("/api/cloud/devices", get(cloud_devices))
@@ -153,6 +165,24 @@ fn build(app: App) -> Router {
                     (
                         [("content-type", "text/html; charset=utf-8")],
                         include_str!("../assets/index.html"),
+                    )
+                }),
+            )
+            .route(
+                "/cloud-feed.js",
+                get(|| async {
+                    (
+                        [("content-type", "text/javascript; charset=utf-8")],
+                        include_str!("../assets/cloud-feed.js"),
+                    )
+                }),
+            )
+            .route(
+                "/controls.js",
+                get(|| async {
+                    (
+                        [("content-type", "text/javascript; charset=utf-8")],
+                        include_str!("../assets/controls.js"),
                     )
                 }),
             )
@@ -354,9 +384,144 @@ async fn delete_retained(State(app): State<App>, Json(request): Json<RetainedDel
         ),
     }
 }
+#[derive(Deserialize)]
+struct PresentationScope {
+    incarnation: u64,
+    generation: u64,
+    script_generation: u64,
+}
+async fn presentation(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(scope): Query<PresentationScope>,
+) -> Response {
+    let session = SessionKey {
+        incarnation: scope.incarnation,
+        generation: scope.generation,
+    };
+    if !app
+        .handle
+        .snapshot()
+        .iter()
+        .any(|d| d.entry.id == id && d.online && d.session == Some(session))
+        || !app
+            .handle
+            .script_states()
+            .get(&id)
+            .is_some_and(|(current, generation, _)| {
+                *current == session && *generation == scope.script_generation
+            })
+    {
+        return error(StatusCode::CONFLICT, "device presentation scope changed");
+    }
+    Json(json!({"incarnation":scope.incarnation.to_string(),"generation":scope.generation.to_string(),"scriptGeneration":scope.script_generation.to_string(),"publications":app.handle.publications(&id,session,scope.script_generation)})).into_response()
+}
+async fn diagnostics(State(app): State<App>) -> Json<Value> {
+    Json(
+        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":app.handle.diagnostics(),"devices":snapshot(&app.handle,&app.names)["devices"],"cloud":{"enabled":app.handle.cloud_status()["enabled"],"loggedIn":app.handle.cloud_status()["account"]["loggedIn"]},"notifications":app.observer.snapshot(0,0,None),"mqtt":app.handle.external_mqtt().map(|m|json!({"status":format!("{:?}",*m.status().borrow()),"droppedTransient":m.dropped_transient()})),"privacy":"No credentials, certificates or wire payloads are included."}),
+    )
+}
+#[derive(Default, Deserialize)]
+struct NotificationQuery {
+    #[serde(default)]
+    cursor: u64,
+    limit: Option<usize>,
+    device: Option<String>,
+}
+async fn notifications(
+    State(app): State<App>,
+    Query(query): Query<NotificationQuery>,
+) -> Json<Value> {
+    Json(app.observer.snapshot(
+        query.cursor,
+        query.limit.unwrap_or(100),
+        query.device.as_deref(),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationControl {
+    enabled: Option<bool>,
+    #[serde(default)]
+    clear: bool,
+}
+async fn notification_control(
+    State(app): State<App>,
+    Json(input): Json<NotificationControl>,
+) -> Response {
+    if input.enabled == Some(true) && app.handle.cloud_status()["account"]["loggedIn"] != true {
+        return error(
+            StatusCode::CONFLICT,
+            "Sign in to LG before enabling notifications",
+        );
+    }
+    if let Some(enabled) = input.enabled
+        && let Err(reason) = app.observer.set_enabled(enabled)
+    {
+        return error(StatusCode::SERVICE_UNAVAILABLE, reason);
+    }
+    if input.clear {
+        app.observer.clear();
+    }
+    Json(app.observer.snapshot(0, 0, None)).into_response()
+}
+async fn notification_socket(
+    State(app): State<App>,
+    Query(query): Query<NotificationQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "management socket capacity exceeded",
+        );
+    };
+    let mut events = app.observer.subscribe();
+    upgrade.max_message_size(4096).on_upgrade(move |mut socket| async move {
+        let _permit = permit;
+        let mut stop = app.stop.clone();
+        if *stop.borrow() { return; }
+        let initial = app.observer.snapshot(query.cursor, 0, None);
+        let reset = initial["reset"] == true;
+        let boundary = initial["cursor"].as_str().and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
+        let mut cursor = if reset { 0 } else { query.cursor };
+        let mut first = true;
+        loop {
+            let mut snapshot = app.observer.snapshot(cursor, 200, query.device.as_deref());
+            let next = snapshot["nextCursor"].as_str().and_then(|v|v.parse::<u64>().ok()).unwrap_or(cursor);
+            snapshot["cursor"] = json!(next.to_string());
+            snapshot["reset"] = json!(reset && first);
+            first = false;
+            if !write(&mut socket, json!({"type":"cloudSnapshot","snapshot":snapshot})).await { return; }
+            if next == cursor || next >= boundary { break; }
+            cursor = next;
+            if *stop.borrow() { return; }
+        }
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.changed() => break,
+                message = socket.recv() => {
+                    if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) { break; }
+                },
+                value = events.recv() => {
+                    let value = match value {
+                        Ok(value) => value,
+                        Err(broadcast::error::RecvError::Lagged(events)) => json!({"type":"cloudLoss","events":events,"t":crate::observability::now_ms()}),
+                        Err(_) => break,
+                    };
+                    if value["type"] == "cloudNotification" && query.device.as_deref().is_some_and(|id|value["devices"].as_array().is_some_and(|ids|!ids.is_empty()&&!ids.iter().any(|v|v==id))) {
+                        continue;
+                    }
+                    if !write(&mut socket, value).await { break; }
+                }
+            }
+        }
+    }).into_response()
+}
 async fn health(State(app): State<App>) -> Json<Value> {
     Json(
-        json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow())}),
+        json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow()),"diagnostics":app.handle.diagnostics()}),
     )
 }
 /// Refresh on explicit account changes and periodically for changes in the LG app.
@@ -420,7 +585,7 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
                 "lastSeenUnix":saved.map(|m|m.last_seen_unix),
                 "deviceType":meta.map(|m|m.device_type.as_str()).filter(|v| !v.is_empty()).or_else(||saved.map(|m|m.device_type.as_str())),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
-                "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|persisted.model_name==*name && persisted.thinq2==*t2)),
+                "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|(if persisted.model_id.is_empty(){&persisted.model_name}else{&persisted.model_id})==name && persisted.thinq2==*t2)),
                 "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some() && (!handle.driver_watch() || script.is_some_and(|(_,_,faulted)|*faulted)),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
                 "removal":device.removal.map(|r|format!("{r:?}")),
                 "name":names.get(&device.entry.id)
@@ -911,7 +1076,17 @@ pub async fn serve(
         names.clone(),
         owned_stopped.clone(),
     ));
+    let observer = crate::cloud_observer::Observer::new(
+        cfg!(feature = "bridge") && handle.cloud_status()["enabled"] == true,
+    );
+    #[cfg(feature = "bridge")]
+    let observer_task = tokio::spawn(
+        observer
+            .clone()
+            .run(handle.account_handle(), owned_stopped.clone()),
+    );
     let app = build(App {
+        observer,
         handle,
         names,
         config,
@@ -946,6 +1121,8 @@ pub async fn serve(
     }
     owned_stop.send_replace(true);
     let _ = refresher.await;
+    #[cfg(feature = "bridge")]
+    let _ = observer_task.await;
     while let Some(joined) = tasks.join_next().await {
         if let Err(error) = joined {
             failure.get_or_insert_with(|| io::Error::other(error));

@@ -579,6 +579,96 @@ impl Client {
         .await
         .map(|_| ())
     }
+    /// Fresh account observer identity; no certificate/client ID is persisted or shared with devices.
+    pub async fn notification_subscription(
+        &self,
+        private_key: String,
+        csr: String,
+    ) -> Result<crate::notifications::Subscription, Error> {
+        self.notification_subscription_at(private_key, csr, endpoint("https://common.lgthinq.com")?)
+            .await
+    }
+    pub async fn notification_subscription_at(
+        &self,
+        private_key: String,
+        csr: String,
+        route: Url,
+    ) -> Result<crate::notifications::Subscription, Error> {
+        let account = self.account.as_ref().ok_or(Error::NotAuthenticated)?;
+        let mut headers = account.headers.clone();
+        let client_id = format!("{}{}", nonce()?, nonce()?);
+        header(&mut headers, "x-client-id", &client_id)?;
+        let api = &self.gateway.as_ref().ok_or(Error::NotAuthenticated)?.api;
+        self.api(
+            append(api, "service/users/client")?,
+            Method::POST,
+            {
+                let mut registration = headers.clone();
+                header(&mut registration, "x-device-type", "601")?;
+                registration
+            },
+            None,
+        )
+        .await?;
+        let certificate = self
+            .api(
+                append(api, "service/users/client/certificate")?,
+                Method::POST,
+                headers,
+                Some(json!({"csr":csr})),
+            )
+            .await?;
+        let filters = certificate["subscriptions"]
+            .as_array()
+            .filter(|v| !v.is_empty() && v.len() <= 64)
+            .ok_or(Error::InvalidResponse)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| rusthinq_protocol::mqtt::valid_filter(s))
+                    .map(String::from)
+                    .ok_or(Error::InvalidResponse)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "x-country-code", &self.country)?;
+        header(&mut headers, "x-service-phase", "OP")?;
+        let response = crate::pairing::iot(self, append(&route, "route")?, headers, None).await?;
+        let api = endpoint(
+            response["apiServer"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?,
+        )?;
+        let mut ca_url = append(&api, "route/certificate")?;
+        ca_url.query_pairs_mut().append_pair("name", "aws-iot");
+        let ca = crate::pairing::iot(self, ca_url, HeaderMap::new(), None).await?;
+        let material = crate::pairing::Material::ThinQ2 {
+            country: self.country.clone(),
+            api_server: api.to_string(),
+            mqtt_server: response["mqttServer"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?
+                .into(),
+            ca_certificate: ca["certificatePem"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?
+                .into(),
+            private_key,
+            certificate: certificate["certificatePem"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?
+                .into(),
+            pub_topic: "observer/unused".into(),
+            prov_topic: "observer/unused".into(),
+            sub_topic: filters[0].clone(),
+        };
+        material.validate()?;
+        Ok(crate::notifications::Subscription {
+            client_id,
+            filters,
+            material,
+        })
+    }
     pub async fn certificate_otp(&self) -> Result<(String, String), Error> {
         if !self.authenticated() {
             return Err(Error::NotAuthenticated);
@@ -819,6 +909,53 @@ mod tests {
             ok(Value::Null),
             ok(json!({"item":[{"homeId":"h/a","currentHomeYn":"Y"}]})),
         ]
+    }
+    #[tokio::test]
+    async fn observer_certificate_uses_isolated_identity_and_never_sends_private_key() {
+        let mut replies = auth_replies();
+        replies.push(ok(Value::Null));
+        replies.push(ok(json!({"certificatePem":"invalid","subscriptions":[]})));
+        let (mut client, task) = mock(replies).await;
+        client.authenticate("refresh").await.unwrap();
+        let account_id = client.account.as_ref().unwrap().headers["x-client-id"].clone();
+        let (key, csr) = crate::notifications::identity().unwrap();
+        assert_eq!(
+            client
+                .notification_subscription_at(
+                    key.clone(),
+                    csr.clone(),
+                    endpoint("https://route.example").unwrap()
+                )
+                .await
+                .unwrap_err(),
+            Error::InvalidResponse
+        );
+        assert_eq!(
+            client.account.as_ref().unwrap().headers["x-client-id"],
+            account_id
+        );
+        let requests = task.await.unwrap();
+        assert!(requests[4].starts_with("POST /service/users/client "));
+        assert!(requests[5].starts_with("POST /service/users/client/certificate "));
+        let id = |request: &str| {
+            request
+                .lines()
+                .find_map(|line| line.strip_prefix("x-client-id: "))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(id(&requests[2]), id(&requests[4]));
+        assert_eq!(id(&requests[4]), id(&requests[5]));
+        assert!(!requests.iter().any(|value| value.contains(&key)));
+        let body: Value =
+            serde_json::from_str(requests[5].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["csr"], csr);
+        let request = openssl::x509::X509Req::from_pem(csr.as_bytes()).unwrap();
+        assert!(
+            request
+                .verify(&openssl::pkey::PKey::private_key_from_pem(key.as_bytes()).unwrap())
+                .unwrap()
+        );
     }
     #[tokio::test]
     async fn account_registration_listing_and_confirmed_removal() {

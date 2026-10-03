@@ -217,6 +217,16 @@ impl From<crate::cloud_account::Error> for CloudError {
     }
 }
 impl AppHandle {
+    pub fn diagnostics(&self) -> Value {
+        self.0.diagnostics()
+    }
+    pub fn publications(&self, id: &str, session: SessionKey, generation: u64) -> Value {
+        self.0.publications(id, session, generation)
+    }
+    #[cfg(feature = "bridge")]
+    pub(crate) fn account_handle(&self) -> Option<crate::cloud_account::Handle> {
+        self.0.cloud_account()
+    }
     pub fn snapshot(&self) -> Vec<rusthinq_lifecycle::Device> {
         self.0.snapshot()
     }

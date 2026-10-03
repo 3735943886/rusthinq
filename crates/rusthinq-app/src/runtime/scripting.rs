@@ -184,6 +184,14 @@ impl Runtime {
                 (context.session, context.generation, outcome.error.is_some()),
             );
         for output in outcome.outputs {
+            if let rusthinq_scripting::Output::Publish(payload) = &output {
+                self.shared.observations.publish(
+                    &context.device,
+                    context.session,
+                    context.generation,
+                    payload,
+                );
+            }
             let result = match output {
                 rusthinq_scripting::Output::Publish(payload) => self
                     .script_sink

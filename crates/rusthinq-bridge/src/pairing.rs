@@ -326,7 +326,7 @@ pub(crate) struct ResultMaterial {
     pub material: Material,
     pub registration_ciphertext: String,
 }
-async fn iot(
+pub(crate) async fn iot(
     client: &Client,
     url: Url,
     headers: HeaderMap,

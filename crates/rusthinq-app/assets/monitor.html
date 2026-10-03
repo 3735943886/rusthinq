@@ -18,6 +18,7 @@
     <link rel="icon" href="favicon.png" />
     <link rel="stylesheet" href="dark.css" />
     <script src="ui.js" defer></script>
+    <script src="cloud-feed.js" defer></script>
     <script src="monitor.js" defer></script>
   </head>
   <body>
@@ -28,6 +29,15 @@
           ><span data-icon="back"></span>Back to workspace</a
         >
         <div class="packet-tools">
+          <span id="studio-cloud-status" class="badge neutral"
+            >LG feed disabled</span
+          ><button
+            id="studio-cloud-toggle"
+            class="button secondary small"
+            disabled
+          >
+            Start LG feed
+          </button>
           <span id="monitor-connection" class="badge neutral">Connecting</span
           ><button
             id="theme-toggle"
@@ -62,7 +72,10 @@
                   All</button
                 ><button data-direction="rx" aria-pressed="false">
                   Received</button
-                ><button data-direction="tx" aria-pressed="false">Sent</button>
+                ><button data-direction="tx" aria-pressed="false">Sent</button
+                ><button data-direction="cloud" aria-pressed="false">
+                  LG cloud
+                </button>
               </div>
               <button
                 id="pause-stream"
@@ -78,7 +91,8 @@
             </div>
           </div>
           <div class="packet-counts">
-            <span><strong id="rx-count">0</strong> received</span
+            <span><strong id="cloud-count">0</strong> LG notifications</span
+            ><span><strong id="rx-count">0</strong> received</span
             ><span><strong id="tx-count">0</strong> sent</span
             ><span><strong id="loss-count">0</strong> missed events</span
             ><span id="buffer-count">0 buffered</span>

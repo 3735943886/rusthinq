@@ -14,4 +14,5 @@ pub mod transport;
 
 pub mod rti;
 
+pub mod notifications;
 pub mod session;

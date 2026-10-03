@@ -133,7 +133,7 @@ window.UI = (() => {
         ws.onclose = ws.onmessage = ws.onopen = null;
         ws.close();
       }
-      const endpoint = url(path);
+      const endpoint = url(typeof path === "function" ? path() : path);
       endpoint.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(endpoint);
       ws.onopen = () => {

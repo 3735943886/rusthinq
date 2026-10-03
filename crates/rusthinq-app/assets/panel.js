@@ -3,7 +3,8 @@
   const { $, icon, api, toast, confirm, busy, text, relative } = UI;
   let snapshot = { devices: {}, features: {} },
     connected = false,
-    received = false;
+    received = false,
+    diagnostics = {};
   let account = { enabled: false, account: {} },
     filter = "all",
     selected = null,
@@ -13,6 +14,79 @@
     polling = false;
   const pending = new Set(),
     cards = new Map();
+  const controls = new DeviceControls.Panel(
+    $("device-controls"),
+    async (target, prop, value) =>
+      operate(target.id, "invoke", {
+        ...target,
+        id: undefined,
+        function: "__command",
+        input: JSON.stringify({ prop, value }),
+      }),
+  );
+  new CloudFeed({
+    badge: $("cloud-feed-status"),
+    button: $("cloud-feed-toggle"),
+    container: $("cloud-feed"),
+    history: true,
+  });
+  let presentationPending = false,
+    presentationRevision = 0;
+  async function refreshPresentation() {
+    if (!selected || presentationPending || !connected) return;
+    const target = { ...selected },
+      revision = presentationRevision;
+    if (!target.generation || !target.script_generation) {
+      controls.render([], target, true);
+      return;
+    }
+    presentationPending = true;
+    try {
+      const query = new URLSearchParams({
+        incarnation: target.incarnation,
+        generation: target.generation,
+        script_generation: target.script_generation,
+      });
+      const result = await api(
+        devicePath(target.id, "presentation") + "?" + query,
+      );
+      if (
+        revision !== presentationRevision ||
+        JSON.stringify(selected) !== JSON.stringify(target)
+      )
+        return;
+      const current = snapshot.devices[target.id];
+      controls.render(
+        result.publications,
+        target,
+        !connected ||
+          pending.has(target.id) ||
+          !current?.online ||
+          current.scriptFaulted ||
+          current.generation !== target.generation ||
+          current.scriptGeneration !== target.script_generation,
+      );
+    } catch (error) {
+      if (revision === presentationRevision && selected?.id === target.id) {
+        controls.fence(true);
+        $("device-controls").dataset.error = error.message;
+      }
+    } finally {
+      presentationPending = false;
+    }
+  }
+  setInterval(() => {
+    if (!document.hidden && $("device-dialog").open) refreshPresentation();
+  }, 2000);
+  $("download-diagnostics").onclick = () =>
+    busy($("download-diagnostics"), async () => {
+      const report = await api("api/diagnostics");
+      UI.download(
+        `rusthinq-diagnostics-${Date.now()}.json`,
+        JSON.stringify(report, null, 2),
+        "application/json",
+      );
+    });
   const attention = (device) =>
     !!(
       device.scriptFaulted ||
@@ -180,6 +254,9 @@
       "View device",
       async () => {
         selected = { id, ...scope(device) };
+        presentationRevision++;
+        controls.reset(selected);
+        refreshPresentation();
         renderDetail();
         $("device-dialog").showModal();
       },
@@ -359,7 +436,29 @@
         "danger",
       ),
     );
+    const signals = diagnostics.devices?.[selected.id];
+    $("device-diagnostics").replaceChildren();
+    detailRows($("device-diagnostics"), [
+      ["Local connections", signals?.connections ?? "—"],
+      [
+        "Received / sent",
+        signals ? `${signals.received} / ${signals.sent}` : "—",
+      ],
+      [
+        "Last received",
+        signals?.lastReceivedMs
+          ? new Date(signals.lastReceivedMs).toLocaleString()
+          : "—",
+      ],
+      [
+        "Last sent",
+        signals?.lastSentMs
+          ? new Date(signals.lastSentMs).toLocaleString()
+          : "—",
+      ],
+    ]);
     $("device-actions").replaceChildren(...actions);
+    controls.fence(blocked || !device?.online || !!device?.scriptFaulted);
     $("property-form").hidden = !device?.mapped;
     $("property-submit").disabled =
       blocked || !device?.online || !!device?.scriptFaulted;
@@ -467,10 +566,24 @@
       }
       if (results[2].status === "fulfilled") {
         const health = results[2].value;
+        diagnostics = health.diagnostics || {};
+        renderDetail();
         detailRows($("runtime-details"), [
           ["Status", health.running ? "Running" : "Stopped"],
           ["Version", health.version],
           ["Retained cleanup", health.retainedCleanup],
+          [
+            "Uptime",
+            health.diagnostics?.uptimeSeconds === undefined
+              ? "—"
+              : `${health.diagnostics.uptimeSeconds}s`,
+          ],
+          [
+            "Received / sent",
+            `${health.diagnostics?.counters?.received || 0} / ${health.diagnostics?.counters?.sent || 0}`,
+          ],
+          ["Driver faults", health.diagnostics?.counters?.scriptFault || 0],
+          ["Rejected operations", health.diagnostics?.counters?.rejected || 0],
         ]);
       }
     } finally {
@@ -653,6 +766,8 @@
   };
   $("device-dialog").addEventListener("close", () => {
     selected = null;
+    presentationRevision++;
+    controls.fence(true);
     $("property-result").textContent = "";
     $("property-form").reset();
   });
@@ -689,6 +804,7 @@
   };
   let lastEvent = "";
   function activity(event) {
+    controls.event(event);
     // Packet bytes and script publications belong in the studio, not the event list.
     if (["data", "sent", "scriptOutput"].includes(event.type)) return;
     const summary =

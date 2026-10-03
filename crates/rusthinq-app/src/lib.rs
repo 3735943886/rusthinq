@@ -45,3 +45,7 @@ pub mod cloud_account;
 
 #[cfg(feature = "bridge")]
 pub mod cloud_devices;
+
+pub mod observability;
+
+pub mod cloud_observer;

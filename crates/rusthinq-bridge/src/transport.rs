@@ -78,6 +78,12 @@ fn roots(pem: &str) -> io::Result<X509StoreBuilder> {
 }
 impl Connector {
     pub fn new(material: &Material, config: Config) -> io::Result<Self> {
+        Self::prepare(material, config, false)
+    }
+    pub fn notifications(material: &Material, config: Config) -> io::Result<Self> {
+        Self::prepare(material, config, true)
+    }
+    fn prepare(material: &Material, config: Config, notifications: bool) -> io::Result<Self> {
         if config.timeout.is_zero() || config.timeout > Duration::from_secs(60) {
             return Err(invalid());
         }
@@ -85,6 +91,10 @@ impl Connector {
         let mut tls = SslConnector::builder(SslMethod::tls_client()).map_err(|_| invalid())?;
         let mut client_certificate = None;
         tls.set_verify(SslVerifyMode::PEER);
+        if notifications {
+            tls.set_alpn_protos(b"\x0ex-amzn-mqtt-ca")
+                .map_err(|_| invalid())?;
+        }
         tls.set_min_proto_version(Some(SslVersion::TLS1_2))
             .map_err(|_| invalid())?;
         let (protocol, endpoint) = match material {

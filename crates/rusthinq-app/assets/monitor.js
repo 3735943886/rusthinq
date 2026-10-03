@@ -13,6 +13,7 @@
     analysisRevision = 0;
   let rx = 0,
     tx = 0,
+    cloud = 0,
     loss = 0,
     evicted = 0,
     nextRecord = 0,
@@ -50,6 +51,7 @@
     applyInjection();
   }
   function render() {
+    $("cloud-count").textContent = cloud;
     $("rx-count").textContent = rx;
     $("tx-count").textContent = tx;
     $("loss-count").textContent = loss;
@@ -59,7 +61,8 @@
     if (paused) return;
     const visible = records.filter(
       (record) =>
-        record.k !== "lost" && (direction === "all" || record.k === direction),
+        !["lost", "note"].includes(record.k) &&
+        (direction === "all" || record.k === direction),
     );
     const active = new Set(visible.map((record) => record.key));
     for (const [key, node] of nodes)
@@ -76,7 +79,7 @@
       if (!nodes.has(record.key)) {
         const row = document.createElement("button");
         row.type = "button";
-        row.className = `packet-row${record.injected ? " injected" : ""}`;
+        row.className = `packet-row${record.k === "cloud" ? " cloud-packet" : ""}${record.injected ? " injected" : ""}`;
         row.setAttribute(
           "aria-label",
           `${record.k === "rx" ? "Received" : "Sent"} packet at ${new Date(record.t).toLocaleTimeString()}`,
@@ -85,10 +88,15 @@
           text("time", new Date(record.t).toLocaleTimeString()),
           text(
             "span",
-            record.k === "rx" ? "RX" : "TX",
+            record.k === "cloud" ? "LG" : record.k === "rx" ? "RX" : "TX",
             `badge ${record.k === "rx" ? "good" : "neutral"}`,
           ),
-          text("code", record.hex),
+          text(
+            "code",
+            record.k === "cloud"
+              ? `${record.topic} · ${record.raw}`
+              : record.hex,
+          ),
         );
         row.onclick = () => inspect(record);
         nodes.set(record.key, row);
@@ -101,6 +109,42 @@
     if ($("autoscroll").checked)
       $("messages").scrollTop = $("messages").scrollHeight;
   }
+  function recordBytes(record) {
+    return record.k === "rx" || record.k === "tx"
+      ? (record.hex?.length || 0) * 2
+      : JSON.stringify(record).length * 2;
+  }
+  new CloudFeed({
+    badge: $("studio-cloud-status"),
+    button: $("studio-cloud-toggle"),
+    device: id,
+    onReset: () => {
+      for (let index = records.length - 1; index >= 0; index--)
+        if (records[index].k === "cloud") {
+          bufferedBytes -= recordBytes(records[index]);
+          nodes.get(records[index].key)?.remove();
+          nodes.delete(records[index].key);
+          records.splice(index, 1);
+        }
+      cloud = 0;
+      if (selected?.k === "cloud") {
+        selected = analysis = null;
+        analysisRevision++;
+        $("analysis-empty").hidden = false;
+        $("analysis-content").hidden = true;
+      }
+      render();
+    },
+    onRecord: (record) => {
+      const value = { ...record, key: ++nextRecord };
+      records.push(value);
+      bufferedBytes += recordBytes(value);
+      if (value.k === "cloud") cloud++;
+      if (value.k === "lost") loss += Number(value.events) || 1;
+      trim();
+      render();
+    },
+  });
   function recordPacket(k, hex, injected = false) {
     if (typeof hex !== "string") return;
     const record = { key: ++nextRecord, k, t: Date.now(), hex, injected };
@@ -113,7 +157,7 @@
   }
   function trim() {
     while (records.length > 500 || bufferedBytes > 8 * 1024 * 1024) {
-      bufferedBytes -= (records.shift().hex?.length || 0) * 2;
+      bufferedBytes -= recordBytes(records.shift());
       evicted++;
     }
   }
@@ -137,6 +181,35 @@
     analysis = null;
     const revision = ++analysisRevision;
     render();
+    $("use-packet").disabled = record.k === "cloud";
+    if (record.k === "cloud") {
+      $("analysis-empty").hidden = true;
+      $("analysis-content").hidden = false;
+      $("analysis-direction").textContent =
+        "LG notification · " +
+        (record.correlation === "device"
+          ? record.devices.join(", ")
+          : "Account event; device unknown");
+      $("packet-hex").textContent = record.raw;
+      $("analysis-summary").replaceChildren(
+        text("span", record.topic, "badge neutral"),
+      );
+      $("analysis-fields").replaceChildren();
+      $("analysis-notes").replaceChildren(
+        text(
+          "p",
+          "Time-aligned observation; temporal proximity does not prove a packet caused this notification.",
+          "muted",
+        ),
+      );
+      $("analysis-export").textContent = JSON.stringify(
+        record.payload,
+        null,
+        2,
+      );
+      analysis = { exportText: JSON.stringify(record.payload, null, 2) };
+      return;
+    }
     $("analysis-empty").hidden = true;
     $("analysis-content").hidden = false;
     $("analysis-direction").textContent =
@@ -218,12 +291,14 @@
   $("copy-packet").onclick = () =>
     busy($("copy-packet"), async () => {
       if (selected) {
-        await navigator.clipboard.writeText(selected.hex);
-        toast("Hex copied.");
+        await navigator.clipboard.writeText(
+          selected.k === "cloud" ? selected.raw : selected.hex,
+        );
+        toast("Packet content copied.");
       }
     });
   $("use-packet").onclick = () => {
-    if (!selected) return;
+    if (!selected || selected.k === "cloud") return;
     $("inject-hex").value = selected.hex;
     $("inject-direction").value =
       selected.k === "rx" ? "fromDevice" : "toDevice";
@@ -247,7 +322,7 @@
       });
     output.push(
       ...records.map(({ key, ...record }) => {
-        if (record.k === "lost") return record;
+        if (["lost", "note", "cloud"].includes(record.k)) return record;
         let type = "packet",
           hex = record.hex;
         try {
@@ -295,7 +370,7 @@
     bufferedBytes = 0;
     nodes.clear();
     $("messages").replaceChildren();
-    rx = tx = loss = evicted = 0;
+    rx = tx = cloud = loss = evicted = 0;
     selected = analysis = null;
     analysisRevision++;
     $("analysis-empty").hidden = false;

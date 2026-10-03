@@ -356,3 +356,24 @@ fn staged_full_legacy_configuration_loads_in_the_daemon_and_flags_retired_settin
         original
     );
 }
+
+#[test]
+fn cloud_capture_records_keep_observation_time_and_cannot_be_replayed_as_device_packets() {
+    let event = json!({"type":"cloudNotification","t":123,"sequence":"9007199254740993","topic":"account/state","payload":{"did":"d"},"raw":"{\"did\":\"d\"}","devices":["d"]});
+    let record = rusthinq_tools::notification_capture(&event).unwrap();
+    assert_eq!(record["k"], "cloud");
+    assert_eq!(record["observedAt"], 123);
+    assert_eq!(record["sequence"], "9007199254740993");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.jsonl");
+    std::fs::write(
+        &path,
+        format!("{{\"k\":\"session\",\"cloud\":true}}\n{record}\n{{\"k\":\"rx\",\"type\":\"packet\",\"hex\":\"0102\"}}\n"),
+    )
+    .unwrap();
+    assert_eq!(rusthinq_tools::replay::plan(&path).unwrap(), vec!["0102"]);
+    assert_eq!(
+        rusthinq_tools::notification_capture(&json!({"type":"cloudLoss","events":3})).unwrap()["k"],
+        "lost"
+    );
+}

@@ -238,6 +238,27 @@ async fn automatic_driver(external: bool) {
     .unwrap();
     assert_eq!(handle.snapshot().len(), 1);
     assert!(handle.snapshot()[0].online);
+    let (session, generation, _) = handle.script_states()["dishwasher"];
+    let presentation = handle.publications("dishwasher", session, generation);
+    assert!(
+        presentation
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value["topic"] == "il/dishwasher")
+    );
+    assert!(
+        presentation
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value["topic"] == "rusthinq/dishwasher/status"
+                && value["payload"] == "running")
+    );
+    assert_eq!(
+        handle.publications("dishwasher", session, generation + 1),
+        json!([])
+    );
     assert_eq!(handle.external_mqtt().is_some(), external);
     let owner = rusthinq_app::lifecycle_cleanup::device_owner(
         "dishwasher",

@@ -1,5 +1,16 @@
 use super::*;
 impl Handle {
+    pub fn diagnostics(&self) -> serde_json::Value {
+        self.0.observations.diagnostics()
+    }
+    pub fn publications(
+        &self,
+        id: &str,
+        session: SessionKey,
+        generation: u64,
+    ) -> serde_json::Value {
+        self.0.observations.publications(id, session, generation)
+    }
     #[cfg(feature = "bridge")]
     pub(crate) fn cloud_changed(&self, device: String) {
         let _ = self.0.events.send(Event::CloudChanged { device });

@@ -9,7 +9,7 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         .unwrap_or("rusthinqctl");
     if args.first().is_some_and(|a| a == "--help" || a == "-h") || args.is_empty() {
         println!(
-            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl adopt DEVICE device_DEVICE.json\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl raw-inject on|off|status\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
+            "rusthinqctl devices|health|mqtt|cloud|cloud-devices\nrusthinqctl forget|reload|enable|disable|unpair DEVICE\nrusthinqctl pair DEVICE DEVICE_TYPE [ALIAS]\nrusthinqctl adopt DEVICE device_DEVICE.json\nrusthinqctl set DEVICE PROPERTY VALUE\nrusthinqctl send DEVICE JSON\nrusthinqctl inject DEVICE HEX --inject-ok [--from-device]\nrusthinqctl raw-inject on|off|status\nrusthinqctl retained-delete JSON\nrusthinqctl capture DEVICE OUTPUT.jsonl\nrusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok\npacket-parser [-message|-message-raw] HEX\npacket-sender DEVICE HEX --inject-ok [--from-device]\nrusthinq-capture DEVICE OUTPUT.jsonl [--cloud]\nlgcloud-monitor [--inventory]\nrusthinqctl cloud-watch\nRUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication."
         );
         return Ok(());
     }
@@ -26,7 +26,14 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
         }
         "packet-sender" => args.insert(0, "inject".into()),
         "rusthinq-capture" => args.insert(0, "capture".into()),
-        "lgcloud-monitor" => args.insert(0, "cloud-inventory".into()),
+        "lgcloud-monitor" => {
+            if args.first().is_some_and(|v| v == "--inventory") {
+                args.remove(0);
+                args.insert(0, "cloud-inventory".into());
+            } else {
+                args.insert(0, "cloud-watch".into());
+            }
+        }
         "rusthinq-retained-gc" => args.insert(0, "retained-delete".into()),
         _ => {}
     }
@@ -67,7 +74,8 @@ pub async fn run(mut args: Vec<String>) -> io::Result<()> {
             client.request(&format!("api/devices/{}/bridge/adopt",segment(&id)),Some(&scope)).await?
         },
         "replay"=>crate::replay::replay(&client,&required(1)?,Path::new(&required(2)?),args.iter().any(|a|a=="--inject-ok")).await?,
-        "capture"=>{crate::capture(client,required(1)?,Path::new(&required(2)?)).await?;json!({"captured":true})},
+        "cloud-watch"=>{crate::watch_cloud(client).await?;json!({"observed":true})},
+        "capture"=>{crate::capture_with_cloud(client,required(1)?,Path::new(&required(2)?),args.iter().any(|a|a=="--cloud")).await?;json!({"captured":true})},
         _=>return Err(io::Error::new(io::ErrorKind::InvalidInput,"unknown command; use --help")),
     };
     println!("{result}");

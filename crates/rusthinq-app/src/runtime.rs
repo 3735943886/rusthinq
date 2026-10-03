@@ -113,6 +113,7 @@ struct AttachCleanup {
     result: oneshot::Sender<io::Result<()>>,
 }
 struct Shared {
+    observations: crate::observability::Observability,
     driver_reload_configured: std::sync::atomic::AtomicBool,
     driver_watch: std::sync::atomic::AtomicBool,
     cloud: Mutex<Option<crate::cloud_account::Handle>>,
@@ -400,6 +401,7 @@ impl Runtime {
         let (attach, attachments) = mpsc::channel(1);
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
         let shared = Arc::new(Shared {
+            observations: Default::default(),
             driver_reload_configured: std::sync::atomic::AtomicBool::new(false),
             driver_watch: std::sync::atomic::AtomicBool::new(false),
             cloud: Mutex::new(None),
@@ -1001,6 +1003,7 @@ impl Runtime {
         self
     }
     fn emit(&self, event: Event) {
+        self.shared.observations.observe(&event);
         let _ = self.shared.events.send(event);
     }
     fn input(&mut self, input: Input) {

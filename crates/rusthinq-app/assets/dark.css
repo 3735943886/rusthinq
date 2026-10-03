@@ -1382,3 +1382,85 @@ select:focus {
     scroll-behavior: auto !important;
   }
 }
+.device-controls {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+.control-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) minmax(90px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.control-row label {
+  margin: 0;
+}
+.control-value {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.control-row input,
+.control-row select {
+  grid-column: 1/3;
+  min-width: 0;
+}
+.control-result {
+  grid-column: 1/-1;
+  margin: 0;
+}
+.cloud-row {
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+}
+.cloud-row pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 200px;
+  overflow: auto;
+}
+.cloud-feed {
+  max-height: 450px;
+  overflow: auto;
+}
+.cloud-packet {
+  border-left: 3px solid var(--accent);
+}
+.control-row .badge {
+  justify-self: end;
+}
+.control-row input[role="switch"] {
+  appearance: none;
+  position: relative;
+  grid-column: 1/3;
+  width: 46px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: 20px;
+  background: #aebbb4;
+  cursor: pointer;
+}
+.control-row input[role="switch"]::after {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  top: 3px;
+  left: 3px;
+  background: white;
+  transition: transform 0.15s;
+}
+.control-row input[role="switch"]:checked {
+  background: #226b53;
+}
+.control-row input[role="switch"]:checked::after {
+  transform: translateX(20px);
+}
+.control-row input[role="switch"]:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

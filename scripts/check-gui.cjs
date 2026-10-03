@@ -96,6 +96,55 @@ const assert = require("node:assert/strict");
       },
     },
   };
+  let cloudStatus = {
+    available: true,
+    enabled: false,
+    status: "disabled",
+    cursor: "0",
+    events: [],
+    nextCursor: "0",
+    lost: false,
+  };
+  const descriptor = {
+    il: 0,
+    id: "washer-01",
+    "x-mqtt": { state: "rusthinq/{id}/{prop}" },
+    props: {
+      power: { type: "binary", rw: true, label: "Power" },
+      mode: { type: "select", rw: true, options: ["eco", "normal"] },
+      temperature: {
+        type: "number",
+        rw: true,
+        min: 10,
+        max: 80,
+        step: 5,
+        unit: "°C",
+      },
+      remaining: { type: "number", unit: "min" },
+      start: { type: "trigger", requires: "remote_start" },
+      remote_start: { type: "binary" },
+    },
+  };
+  let presentation = {
+    publications: [
+      {
+        topic: "il/washer-01",
+        payload: JSON.stringify(descriptor),
+        retain: true,
+      },
+      ...Object.entries({
+        power: "true",
+        mode: "eco",
+        temperature: "30",
+        remaining: "25",
+        remote_start: "false",
+      }).map(([prop, payload]) => ({
+        topic: "rusthinq/washer-01/" + prop,
+        payload,
+        retain: true,
+      })),
+    ],
+  };
   let monitorStatus = {
     status: "online",
     injectionEnabled: false,
@@ -112,6 +161,21 @@ const assert = require("node:assert/strict");
       result = {
         enabled: true,
         account: { loggedIn: true, stored: true, busy: false },
+      };
+    else if (url.pathname === "/api/cloud/notifications") {
+      if (body?.enabled !== undefined)
+        cloudStatus = {
+          ...cloudStatus,
+          enabled: body.enabled,
+          status: body.enabled ? "connected" : "disabled",
+        };
+      result = cloudStatus;
+    } else if (url.pathname.endsWith("/presentation")) result = presentation;
+    else if (url.pathname === "/api/diagnostics")
+      result = {
+        version: "0.2",
+        runtime: { counters: { received: 12 } },
+        privacy: "No credentials",
       };
     else if (url.pathname === "/api/mqtt")
       result = { status: "Connected", droppedTransient: 3 };
@@ -158,6 +222,16 @@ const assert = require("node:assert/strict");
     sockets.panel = ws;
     setTimeout(() => ws.send(JSON.stringify(fixture)), 30);
   });
+  await page.routeWebSocket("**/api/cloud/notifications/ws?*", (ws) => {
+    sockets.cloud = ws;
+    setTimeout(
+      () =>
+        ws.send(
+          JSON.stringify({ type: "cloudSnapshot", snapshot: cloudStatus }),
+        ),
+      20,
+    );
+  });
   await page.routeWebSocket("**/api/events", (ws) => {
     sockets.events = ws;
   });
@@ -185,6 +259,54 @@ const assert = require("node:assert/strict");
     .getByRole("button", { name: "View device", exact: true })
     .filter({ visible: true })
     .click();
+  await page.locator(".control-row").first().waitFor();
+  await page.screenshot({
+    path: path.join(artifacts, "controls-desktop.png"),
+    fullPage: true,
+  });
+  const power = page
+    .locator(".control-row")
+    .filter({ has: page.locator("label", { hasText: "Power" }) });
+  assert.equal(await power.getByRole("switch").isChecked(), true);
+  const start = page
+    .locator(".control-row")
+    .filter({ has: page.locator("label", { hasText: /^start$/ }) });
+  assert.equal(await start.locator("button").isDisabled(), true);
+  const remaining = page
+    .locator(".control-row")
+    .filter({ has: page.locator("label", { hasText: /^remaining$/ }) });
+  assert.equal(await remaining.locator(".badge").textContent(), "Read only");
+  await power.getByRole("switch").uncheck();
+  await power.locator("button").click();
+  await page.waitForFunction(() =>
+    document.querySelector(".control-result").textContent.includes("Queued"),
+  );
+  const widget = requests.filter((r) => r.path.endsWith("/invoke")).at(-1);
+  assert.deepEqual(JSON.parse(widget.body.input), {
+    prop: "power",
+    value: "false",
+  });
+  sockets.events.send(
+    JSON.stringify({
+      type: "scriptExecuted",
+      context: {
+        device: "washer-01",
+        incarnation: "9007199254740993",
+        generation: "11",
+        scriptGeneration: "1",
+      },
+      sequence: "123",
+    }),
+  );
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".control-result")
+      .textContent.includes("Driver executed"),
+  );
+  requests.length = 0;
+  await page
+    .locator("#advanced-command")
+    .evaluate((node) => (node.open = true));
   await page.locator("#property-name").fill("power");
   await page.locator("#property-value").fill("on");
   await page.locator("#property-submit").click();
@@ -201,6 +323,7 @@ const assert = require("node:assert/strict");
     () => !document.querySelector("#detail-status").hidden,
   );
   assert.equal(await page.locator("#property-submit").isDisabled(), true);
+  assert.equal(await power.locator("button").isDisabled(), true);
   await page.locator("#device-dialog [data-close]").click();
   await page.locator("#device-search").fill("");
   await page.locator("[data-filter=attention]").click();
@@ -224,6 +347,12 @@ const assert = require("node:assert/strict");
     fullPage: true,
   });
   await page.locator("[data-view=system]").click();
+  const diagnosis = page.waitForEvent("download");
+  await page.locator("#download-diagnostics").click();
+  const report = JSON.parse(
+    fs.readFileSync(await (await diagnosis).path(), "utf8"),
+  );
+  assert.equal(report.privacy, "No credentials");
   await page.locator("#cleanup-scope").selectOption("all");
   await page.locator("#cleanup-submit").click();
   assert.equal(await page.locator("#confirm-dialog").isVisible(), true);
@@ -239,7 +368,12 @@ const assert = require("node:assert/strict");
     sockets.events.send(
       JSON.stringify({
         type: "scriptExecuted",
-        context: { device: "washer-01" },
+        context: {
+          device: "washer-01",
+          incarnation: "9007199254740993",
+          generation: "11",
+          scriptGeneration: "1",
+        },
         sequence: i,
         error: null,
       }),
@@ -286,6 +420,36 @@ const assert = require("node:assert/strict");
       .textContent.includes("500 buffered"),
   );
   assert.ok((await page.locator(".packet-row").count()) <= 500);
+  await page.locator("#studio-cloud-toggle").click();
+  sockets.cloud.send(
+    JSON.stringify({ type: "cloudStatus", enabled: true, status: "connected" }),
+  );
+  sockets.cloud.send(
+    JSON.stringify({
+      type: "cloudNotification",
+      k: "cloud",
+      sequence: "1",
+      t: Date.now(),
+      topic: "account/state",
+      raw: '{"deviceId":"washer-01","power":true}',
+      payload: { deviceId: "washer-01", power: true },
+      devices: ["washer-01"],
+      correlation: "device",
+    }),
+  );
+  await page.waitForFunction(
+    () => document.querySelector("#cloud-count").textContent === "1",
+  );
+  await page.locator('[data-direction="cloud"]').click();
+  assert.equal(await page.locator(".packet-row").count(), 1);
+  await page.locator(".packet-row").click();
+  assert.ok(
+    (await page.locator("#analysis-direction").textContent()).includes(
+      "LG notification",
+    ),
+  );
+  assert.equal(await page.locator("#use-packet").isDisabled(), true);
+  await page.locator('[data-direction="all"]').click();
   const wire = (value) => Buffer.from(JSON.stringify(value)).toString("hex");
   sockets.monitor.send(
     JSON.stringify({
@@ -325,6 +489,11 @@ const assert = require("node:assert/strict");
     ),
   );
   assert.ok(lines.some((value) => value.k === "lost"));
+  assert.ok(
+    lines.some(
+      (value) => value.k === "cloud" && value.payload.deviceId === "washer-01",
+    ),
+  );
   const huge = "ab".repeat(1050000);
   for (let i = 0; i < 3; i++)
     sockets.monitor.send(JSON.stringify({ rx: huge }));
@@ -344,7 +513,7 @@ const assert = require("node:assert/strict");
   });
   assert.deepEqual(errors, []);
   console.log(
-    "Browser checks passed: dashboard/mobile/dark, search/filter, hostile text, precision-safe scope, stale session, confirmation, activity/packet bounds and inspector.",
+    "Browser checks passed: typed controls/read-only/conditions, driver execution feedback, diagnostics, dashboard/mobile/dark, scope fencing, LG timeline/filter, correlated export and bounded buffers.",
   );
   await browser.close();
 })().catch((error) => {

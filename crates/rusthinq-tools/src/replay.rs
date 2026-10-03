@@ -52,7 +52,7 @@ pub fn plan(path: &Path) -> io::Result<Vec<String>> {
                     return Err(invalid("capture replay exceeds 1000 packets"));
                 }
             }
-            Some("rx" | "tx" | "note") => {}
+            Some("rx" | "tx" | "note" | "session" | "cloud" | "marker") => {}
             _ => return Err(invalid("unknown capture record kind")),
         }
     }
