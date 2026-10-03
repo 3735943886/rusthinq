@@ -957,3 +957,36 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
     broker.stop();
     task.await.unwrap();
 }
+
+/// 0.1 logged every client's CONNECT and close reason. Connections that never identify a
+/// device are reported on the diagnostics channel, outside the exact event stream.
+#[tokio::test]
+async fn unidentified_connections_are_reported_as_diagnostics() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let mut diagnostics = broker.handle().mqtt_diagnostics();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await });
+    peer.write_all(&[
+        0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'x',
+    ])
+    .await
+    .unwrap();
+    let connected = timeout(Duration::from_secs(2), diagnostics.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(connected, rusthinq_server::MqttDiagnostic::Connected { ref client, .. } if client == "x")
+    );
+    drop(peer);
+    let closed = timeout(Duration::from_secs(2), diagnostics.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(closed, rusthinq_server::MqttDiagnostic::Closed { client: Some(ref client), session: None, ready: false, .. } if client == "x"),
+        "{closed:?}"
+    );
+    let _ = task.await;
+}

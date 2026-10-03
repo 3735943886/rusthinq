@@ -395,5 +395,6 @@ fn legacy_pairing_aliases_preserve_keys_and_expired_material_stays_cleanup_only(
     .unwrap();
     t1.validate().unwrap();
     assert!(Material::from_legacy(serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","platform":"thinq2"})).is_err());
-    assert!(Material::from_legacy(serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","privateKey":"secret"})).is_err());
+    // Unused keys are ignored, as 0.1 read these files (real archives carry `httpsServer`).
+    assert!(Material::from_legacy(serde_json::json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","privateKey":"secret"})).is_ok());
 }

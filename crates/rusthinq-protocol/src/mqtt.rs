@@ -115,44 +115,35 @@ pub fn decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
     let flags = bytes[0] & 15;
     let packet = match bytes[0] >> 4 {
         1 if flags == 0 => {
-            if body.string()? != "MQTT" || body.byte()? != 4 {
-                return Err(Error::Unsupported);
-            }
+            // As 0.1's broker: protocol name/level, the clean-session and reserved flags and
+            // credentials are not checked, so MQTT 3.1 (`MQIsdp`/3) and appliances asking for
+            // a persistent session still connect. Sessions are always clean; the CONNACK
+            // reports no session present. A will that does not parse is dropped, not fatal.
+            body.string()?;
+            body.byte()?;
             let flags = body.byte()?;
-            if flags & 1 != 0 || flags & 0x40 != 0 && flags & 0x80 == 0 {
-                return Err(Error::Malformed);
-            }
-            if flags & 2 == 0 {
-                return Err(Error::Unsupported);
-            } // persistent sessions require an explicit store
-            let will_qos = (flags >> 3) & 3;
-            if will_qos == 3 || flags & 4 == 0 && flags & 0x38 != 0 {
-                return Err(Error::Malformed);
-            }
             let keep_alive = body.number()?;
             let client = body.string()?;
+            let will_qos = (flags >> 3) & 3;
             let will = if flags & 4 != 0 {
-                let topic = body.string()?;
-                if topic.is_empty() || topic.contains(['+', '#']) {
-                    return Err(Error::Malformed);
-                }
-                let size = body.number()? as usize;
-                Some(Will {
-                    topic,
-                    payload: body.take(size)?.to_vec(),
-                    qos: will_qos,
-                    retain: flags & 0x20 != 0,
-                })
+                (|| {
+                    let topic = body.string().ok()?;
+                    let size = body.number().ok()? as usize;
+                    let payload = body.take(size).ok()?.to_vec();
+                    (!topic.is_empty() && !topic.contains(['+', '#']) && will_qos != 3).then_some(
+                        Will {
+                            topic,
+                            payload,
+                            qos: will_qos,
+                            retain: flags & 0x20 != 0,
+                        },
+                    )
+                })()
             } else {
                 None
             };
-            if flags & 0x80 != 0 {
-                body.string()?;
-            }
-            if flags & 0x40 != 0 {
-                let n = body.number()? as usize;
-                body.take(n)?;
-            }
+            // Credentials and anything after them are ignored, as 0.1 did.
+            body.0 = &[];
             Packet::Connect {
                 client,
                 keep_alive,

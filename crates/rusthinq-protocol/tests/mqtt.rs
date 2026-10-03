@@ -30,13 +30,14 @@ fn binary_will_and_flags_are_validated() {
     assert!(
         matches!(mqtt::decode(&mqtt::frame(0x10, &body, 1024).unwrap(), 1024), Ok(Packet::Connect {will: Some(mqtt::Will {topic, payload, qos:1, retain:true}), ..}) if topic == "t" && payload == [0,255])
     );
+    // Inconsistent will flags connect without a will, as 0.1's broker accepted them.
     for flags in [0x22, 0x0a, 0x1e] {
-        let mut invalid = body;
-        invalid[7] = flags;
-        assert_eq!(
-            mqtt::decode(&mqtt::frame(0x10, &invalid, 1024).unwrap(), 1024),
-            Err(Error::Malformed)
-        );
+        let mut lenient = body;
+        lenient[7] = flags;
+        assert!(matches!(
+            mqtt::decode(&mqtt::frame(0x10, &lenient, 1024).unwrap(), 1024),
+            Ok(Packet::Connect { will: None, .. })
+        ));
     }
 }
 #[test]
@@ -73,9 +74,13 @@ fn bounded_framing_and_packet_validation() {
             will: None
         })
     );
-    let mut unsupported = connect;
-    unsupported[9] = 0;
-    assert_eq!(mqtt::decode(&unsupported, 1024), Err(Error::Unsupported));
+    // As 0.1's broker, the protocol level is not checked.
+    let mut level = connect;
+    level[8] = 3;
+    assert!(matches!(
+        mqtt::decode(&level, 1024),
+        Ok(Packet::Connect { .. })
+    ));
     for offset in 0..connect.len() {
         let mut corrupt = connect;
         corrupt[offset] = 255;
@@ -122,7 +127,7 @@ fn qos1_duplicate_flags_and_packet_identifiers_are_validated() {
 }
 
 #[test]
-fn empty_client_id_is_valid_only_for_supported_clean_sessions() {
+fn connect_is_accepted_as_leniently_as_the_0_1_broker() {
     let body = [0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 0];
     assert_eq!(
         mqtt::decode(&mqtt::frame(0x10, &body, 1024).unwrap(), 1024),
@@ -132,10 +137,48 @@ fn empty_client_id_is_valid_only_for_supported_clean_sessions() {
             will: None
         })
     );
-    let mut persistent = body;
-    persistent[7] = 0;
+    let connect = |body: &[u8]| mqtt::decode(&mqtt::frame(0x10, body, 1024).unwrap(), 1024);
+    // A persistent-session request, the reserved bit, and a password without a user name
+    // all connect, as they did with 0.1; the session is clean regardless.
+    for flags in [0, 1, 0x40 | 2] {
+        let mut lenient = body;
+        lenient[7] = flags;
+        if flags & 0x40 != 0 {
+            let mut with_password = lenient.to_vec();
+            with_password.extend_from_slice(&[0, 2, b'p', b'w']);
+            assert!(matches!(
+                connect(&with_password),
+                Ok(Packet::Connect { .. })
+            ));
+        } else {
+            assert!(
+                matches!(connect(&lenient), Ok(Packet::Connect { .. })),
+                "{flags:#x}"
+            );
+        }
+    }
+    // MQTT 3.1 (`MQIsdp`, level 3).
+    let legacy = [
+        0, 6, b'M', b'Q', b'I', b's', b'd', b'p', 3, 2, 0, 60, 0, 1, b'd',
+    ];
     assert_eq!(
-        mqtt::decode(&mqtt::frame(0x10, &persistent, 1024).unwrap(), 1024),
-        Err(Error::Unsupported)
+        connect(&legacy),
+        Ok(Packet::Connect {
+            client: "d".into(),
+            keep_alive: 60,
+            will: None
+        })
+    );
+    // A will that does not parse is dropped without refusing the connection.
+    let broken_will = [
+        0, 4, b'M', b'Q', b'T', b'T', 4, 0x1e, 0, 60, 0, 1, b'd', 0, 1, b'#', 0, 0,
+    ];
+    assert_eq!(
+        connect(&broken_will),
+        Ok(Packet::Connect {
+            client: "d".into(),
+            keep_alive: 60,
+            will: None
+        })
     );
 }

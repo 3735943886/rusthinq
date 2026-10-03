@@ -92,6 +92,11 @@ impl Service {
         Ok(self)
     }
     /// Add bounded L3 HTTPS services (e.g. ThinQ1 metadata or provisioning).
+    pub fn mqtt_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<rusthinq_server::MqttDiagnostic> {
+        self.server.handle().mqtt_diagnostics()
+    }
     pub fn with_local_service(
         mut self,
         front: FrontDoor,

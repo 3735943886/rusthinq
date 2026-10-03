@@ -90,6 +90,23 @@ pub enum Event {
         message: rusthinq_protocol::mqtt::Will,
     },
 }
+/// MQTT connection diagnostics, on their own channel so the event stream stays exact.
+/// 0.1 logged each client's CONNECT and close reason; an appliance failing before it is
+/// identified is otherwise invisible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MqttDiagnostic {
+    Connected {
+        generation: u64,
+        client: String,
+    },
+    Closed {
+        generation: u64,
+        client: Option<String>,
+        session: Option<SessionId>,
+        ready: bool,
+        reason: Disconnect,
+    },
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disconnect {
     Eof,
@@ -152,6 +169,7 @@ struct Shared {
     state: Mutex<State>,
     completions: Mutex<HashMap<u64, watch::Receiver<bool>>>,
     events: broadcast::Sender<Event>,
+    diagnostics: broadcast::Sender<MqttDiagnostic>,
     config: Config,
 }
 impl Shared {
@@ -168,6 +186,9 @@ pub enum Protocol {
     ThinQ2,
 }
 impl ServerHandle {
+    pub fn mqtt_diagnostics(&self) -> broadcast::Receiver<MqttDiagnostic> {
+        self.0.diagnostics.subscribe()
+    }
     pub fn protocol(&self, session: &SessionId) -> Result<Protocol, Reject> {
         self.0
             .lock()
@@ -312,6 +333,7 @@ impl Server {
             state: Mutex::new(state),
             completions: Mutex::new(HashMap::new()),
             events,
+            diagnostics: broadcast::channel(config.event_capacity).0,
             config,
         }));
         Ok(Self {

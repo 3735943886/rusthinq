@@ -141,6 +141,8 @@ impl Material {
                 _ => Err(Error::InvalidInput),
             }
         };
+        // Other keys are ignored, as 0.1 read these files: real archives carry fields such
+        // as `httpsServer` that the bridge does not use.
         let thinq1 = object.contains_key("rtiServer") || object.contains_key("rti_server");
         if object
             .get("platform")
@@ -149,48 +151,11 @@ impl Material {
             return Err(Error::InvalidInput);
         }
         let material = if thinq1 {
-            if object.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "rtiServer" | "rti_server" | "httpServer" | "http_server" | "platform"
-                )
-            }) {
-                return Err(Error::InvalidInput);
-            }
             Self::ThinQ1 {
                 http_server: field("httpServer", "http_server")?,
                 rti_server: field("rtiServer", "rti_server")?,
             }
         } else {
-            if object.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "countryCode"
-                        | "platform"
-                        | "country_code"
-                        | "apiServer"
-                        | "api_server"
-                        | "mqttServer"
-                        | "mqtt_server"
-                        | "caCertificate"
-                        | "ca_certificate"
-                        | "privateKey"
-                        | "private_key"
-                        | "certificate"
-                        | "pubTopic"
-                        | "pub_topic"
-                        | "provTopic"
-                        | "prov_topic"
-                        | "subTopic"
-                        | "sub_topic"
-                        | "deployAppInfo"
-                        | "deploy_app_info"
-                        | "deployPlatformInfo"
-                        | "deploy_platform_info"
-                )
-            }) {
-                return Err(Error::InvalidInput);
-            }
             Self::ThinQ2 {
                 country: field("countryCode", "country_code")?,
                 api_server: field("apiServer", "api_server")?,

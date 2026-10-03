@@ -377,6 +377,7 @@ pub struct Daemon {
     mqtt: Option<(FrontDoor, TcpListener)>,
     plain: Vec<(https::Service, TcpListener)>,
     /// Device TLS refusals, reported on stderr as 0.1 warned about failed handshakes.
+    mqtt_diagnostics: tokio::sync::broadcast::Receiver<rusthinq_server::MqttDiagnostic>,
     rejections: Vec<(
         &'static str,
         tokio::sync::broadcast::Receiver<rusthinq_server::tls::Rejection>,
@@ -618,6 +619,7 @@ impl Daemon {
         if let Some(drivers) = drivers {
             service = service.with_drivers(drivers)?;
         }
+        let mqtt_diagnostics = service.mqtt_diagnostics();
         let external_mqtt = if let Some((handle, runtime)) = external {
             service = service.with_external_mqtt(handle);
             Some(runtime)
@@ -648,6 +650,7 @@ impl Daemon {
             thin: thin.map(|listener| (thin_front, listener)),
             mqtt: mqtt.map(|listener| (mqtt_front, listener)),
             plain,
+            mqtt_diagnostics,
             rejections,
             endpoints,
             #[cfg(feature = "bridge")]
@@ -687,6 +690,25 @@ impl Daemon {
         let mut tasks = tokio::task::JoinSet::new();
         let handle = self.service.handle();
         let external_handle = handle.external_mqtt();
+        {
+            let mut diagnostics = self.mqtt_diagnostics;
+            let mut stop = services_stopped.clone();
+            tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => return Ok(()),
+                        diagnostic = diagnostics.recv() => match diagnostic {
+                            Ok(diagnostic) => eprintln!("MQTTS: {diagnostic:?}"),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => eprintln!("MQTTS: {lost} diagnostics not shown"),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                let _ = stop.wait_for(|stopped| *stopped).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
         for (label, mut rejections) in self.rejections {
             let mut stop = services_stopped.clone();
             tasks.spawn(async move {

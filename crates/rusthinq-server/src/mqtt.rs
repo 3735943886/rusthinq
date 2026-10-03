@@ -1,7 +1,7 @@
 //! Local ThinQ2 device MQTT service. No external broker, cloud dial, or device semantics.
 use crate::{
-    Command, Config, Delivery, Disconnect, Entry, Event, Guard, Protocol, Receipt, Reject,
-    ServerHandle, SessionId, Shared, State,
+    Command, Config, Delivery, Disconnect, Entry, Event, Guard, MqttDiagnostic, Protocol, Receipt,
+    Reject, ServerHandle, SessionId, Shared, State,
     tls::{LocalFuture, LocalService, Transport},
     write_frame,
 };
@@ -87,6 +87,9 @@ impl Handle {
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.shared.events.subscribe()
+    }
+    pub fn mqtt_diagnostics(&self) -> broadcast::Receiver<MqttDiagnostic> {
+        self.shared.diagnostics.subscribe()
     }
     pub fn snapshot(&self) -> Vec<SessionId> {
         ServerHandle(self.shared.clone()).snapshot()
@@ -199,6 +202,7 @@ impl Broker {
             completions: Mutex::new(HashMap::new()),
             config: config.clone(),
             events,
+            diagnostics: broadcast::channel(config.event_capacity).0,
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 generation: config.generation_floor,
@@ -318,6 +322,8 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     let (bridge_commands, mut bridge_inputs) =
         mpsc::channel::<BridgeCommand>(config.outbound_capacity);
     let mut connected = false;
+    let mut client_id = None;
+    let mut ready = false;
     let mut will = None;
     let mut clean_disconnect = false;
     let mut idle = config.idle_timeout;
@@ -395,10 +401,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         let mut replies = Vec::new();
         match packet {
             Packet::Connect {
+                client,
                 keep_alive,
                 will: message,
-                ..
             } if !connected => {
+                let _ = broker.shared.diagnostics.send(MqttDiagnostic::Connected {
+                    generation: guard.generation,
+                    client: client.clone(),
+                });
+                client_id = Some(client);
                 will = message;
                 connected = true;
                 // Preserve the appliance-tested grace floor from the 0.1 broker.
@@ -731,6 +742,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                             break 'connection Disconnect::Closed;
                         };
                         entry.ready = true;
+                        ready = true;
                         let _ = broker.shared.events.send(Event::Up(id.clone()));
                         let _ = broker.shared.events.send(Event::Ready(id, deploy));
                     }
@@ -828,6 +840,13 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
             });
         }
     }
+    let _ = broker.shared.diagnostics.send(MqttDiagnostic::Closed {
+        generation: guard.generation,
+        client: client_id,
+        session: guard.id.clone(),
+        ready,
+        reason: reason.clone(),
+    });
     guard.reason = reason;
     drop(reader);
     drop(writer);
