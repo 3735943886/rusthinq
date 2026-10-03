@@ -19,20 +19,42 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::watch};
 
+/// 0.1 `advertise`: what `/route` tells devices instead of the bound endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Advertise {
+    /// `scheme://<hostname>:<port>`.
+    Port(u16),
+    /// Used verbatim, e.g. a reverse proxy on its own hostname.
+    Url(String),
+}
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub thinq1_bind: SocketAddr,
-    pub mqtt_bind: SocketAddr,
-    pub https_bind: SocketAddr,
+    /// Absent listeners are not bound (0.1 port without `bind`).
+    pub thinq1_bind: Option<SocketAddr>,
+    pub mqtt_bind: Option<SocketAddr>,
+    pub https_bind: Option<SocketAddr>,
+    pub https_advertise: Option<Advertise>,
+    pub mqtt_advertise: Option<Advertise>,
+    /// Plain HTTP with the HTTPS routes, behind a TLS-terminating proxy (0.1 `http_port`).
+    pub http_bind: Option<SocketAddr>,
+    /// Plain HTTP ThinQ1 provisioning (0.1 `thinq1_https_port`).
+    pub thinq1_http_bind: Option<SocketAddr>,
+    /// Served by `/route/certificate` instead of the CA (0.1 `custom_root_cert_file`).
+    pub custom_root_certificate: Option<PathBuf>,
     pub hostname: String,
     pub ca_certificate: PathBuf,
     pub ca_key: PathBuf,
     pub device_ledger: PathBuf,
     pub legacy_tls: bool,
+    /// Answer `/route` with the hostname the appliance requested (DNAT setups), as 0.1.
+    pub advertise_requested_host: bool,
     pub management: Option<crate::management::Config>,
     pub drivers: Option<crate::drivers::Config>,
     pub external_mqtt: Option<crate::external_mqtt::Config>,
     pub cloud_account: Option<PathBuf>,
+    /// Resolvers for outbound LG cloud connections (0.1 `[bridge] dns`): DoH URLs or
+    /// plain DNS servers, tried in order. Empty means the system resolver.
+    pub bridge_dns: Vec<String>,
 }
 impl Config {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -54,15 +76,22 @@ impl Config {
                 "thinq1_bind",
                 "mqtt_bind",
                 "https_bind",
+                "https_advertise",
+                "mqtt_advertise",
+                "http_bind",
+                "thinq1_http_bind",
+                "custom_root_certificate",
                 "hostname",
                 "ca_certificate",
                 "ca_key",
                 "device_ledger",
                 "legacy_tls",
+                "advertise_requested_host",
                 "management",
                 "drivers",
                 "external_mqtt",
                 "cloud_account",
+                "bridge_dns",
             ]
             .contains(&key.as_str())
             {
@@ -78,10 +107,28 @@ impl Config {
         };
         let parent = path.parent().unwrap_or(Path::new("."));
         let file = |key| -> io::Result<PathBuf> { Ok(parent.join(string(key)?)) };
-        let address = |key| -> io::Result<SocketAddr> {
-            string(key)?
-                .parse()
-                .map_err(|_| invalid("invalid bind address"))
+        let address = |key: &str| -> io::Result<Option<SocketAddr>> {
+            match value.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(_) => string(key)?
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| invalid("invalid bind address")),
+            }
+        };
+        let advertise = |key: &str| -> io::Result<Option<Advertise>> {
+            match value.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(url)) if !url.is_empty() => {
+                    Ok(Some(Advertise::Url(url.clone())))
+                }
+                Some(port) => port
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0)
+                    .map(|port| Some(Advertise::Port(port)))
+                    .ok_or_else(|| invalid("advertise must be a port or URL")),
+            }
         };
         let hostname = string("hostname")?;
         if !valid_hostname(&hostname) {
@@ -91,6 +138,12 @@ impl Config {
             Some(value) => value
                 .as_bool()
                 .ok_or_else(|| invalid("legacy_tls must be boolean"))?,
+            None => false,
+        };
+        let advertise_requested_host = match value.get("advertise_requested_host") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| invalid("advertise_requested_host must be boolean"))?,
             None => false,
         };
         let management = match value.get("management") {
@@ -253,15 +306,40 @@ impl Config {
                 Some(config)
             }
         };
+        let bridge_dns = match value.get("bridge_dns") {
+            None => Vec::new(),
+            Some(entries) => entries
+                .as_array()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| invalid("bridge_dns must be a list of strings"))?,
+        };
+        if !bridge_dns.is_empty() && !cfg!(feature = "bridge") {
+            return Err(invalid("bridge feature is disabled"));
+        }
         Ok(Self {
+            bridge_dns,
             thinq1_bind: address("thinq1_bind")?,
             mqtt_bind: address("mqtt_bind")?,
             https_bind: address("https_bind")?,
+            https_advertise: advertise("https_advertise")?,
+            mqtt_advertise: advertise("mqtt_advertise")?,
+            http_bind: address("http_bind")?,
+            thinq1_http_bind: address("thinq1_http_bind")?,
+            custom_root_certificate: match value.get("custom_root_certificate") {
+                None => None,
+                Some(_) => Some(file("custom_root_certificate")?),
+            },
             hostname,
             ca_certificate: file("ca_certificate")?,
             ca_key: file("ca_key")?,
             device_ledger: file("device_ledger")?,
             legacy_tls,
+            advertise_requested_host,
             management,
             drivers,
             external_mqtt,
@@ -288,9 +366,10 @@ impl Config {
 pub struct Daemon {
     service: tls_runtime::Service,
     signer: Signer,
-    thin: (FrontDoor, TcpListener),
-    mqtt: (FrontDoor, TcpListener),
-    endpoints: (SocketAddr, SocketAddr, SocketAddr),
+    thin: Option<(FrontDoor, TcpListener)>,
+    mqtt: Option<(FrontDoor, TcpListener)>,
+    plain: Vec<(https::Service, TcpListener)>,
+    endpoints: Endpoints,
     #[cfg(feature = "bridge")]
     firmware: rusthinq_bridge::passthrough::Relay,
     management: Option<(crate::management::Config, TcpListener)>,
@@ -319,9 +398,13 @@ impl Daemon {
         if let Some(external) = &config.external_mqtt {
             external.validate()?;
         }
-        if config.cloud_account.is_some() && !cfg!(feature = "bridge") {
+        if (config.cloud_account.is_some() || !config.bridge_dns.is_empty())
+            && !cfg!(feature = "bridge")
+        {
             return Err(invalid("bridge feature is disabled"));
         }
+        #[cfg(feature = "bridge")]
+        rusthinq_bridge::resolver::set_servers(&config.bridge_dns)?;
         #[cfg(feature = "bridge")]
         let pairing_path = config.cloud_account.as_ref().map(|path| {
             let mut name = path.as_os_str().to_os_string();
@@ -357,9 +440,11 @@ impl Daemon {
             .transpose()?;
         #[cfg(feature = "scripting")]
         let drivers = config.drivers.clone();
-        let thin = TcpListener::bind(config.thinq1_bind).await?;
-        let mqtt = TcpListener::bind(config.mqtt_bind).await?;
-        let http = TcpListener::bind(config.https_bind).await?;
+        let thin = listen(config.thinq1_bind).await?;
+        let mqtt = listen(config.mqtt_bind).await?;
+        let http = listen(config.https_bind).await?;
+        let plain_http = listen(config.http_bind).await?;
+        let thinq1_http = listen(config.thinq1_http_bind).await?;
         let management = if let Some(management) = config.management.clone() {
             management.validate()?;
             let listener = TcpListener::bind(management.bind).await?;
@@ -367,26 +452,51 @@ impl Daemon {
         } else {
             None
         };
-        let endpoints = (thin.local_addr()?, mqtt.local_addr()?, http.local_addr()?);
-        let https_port = http.local_addr()?.port();
-        let mqtt_port = mqtt.local_addr()?.port();
+        let endpoints = Endpoints {
+            thinq1: local(&thin)?,
+            mqtt: local(&mqtt)?,
+            https: local(&http)?,
+            http: local(&plain_http)?,
+            thinq1_http: local(&thinq1_http)?,
+        };
+        // As 0.1: an explicit advertise wins, else the bound port, else the LG default.
+        let (https_port, api_server) = match &config.https_advertise {
+            Some(Advertise::Port(port)) => (*port, None),
+            Some(Advertise::Url(url)) => (443, Some(url.clone())),
+            None => (endpoints.https.map_or(443, |a| a.port()), None),
+        };
+        let (mqtt_port, mqtt_server) = match &config.mqtt_advertise {
+            Some(Advertise::Port(port)) => (*port, None),
+            Some(Advertise::Url(url)) => (8883, Some(url.clone())),
+            None => (endpoints.mqtt.map_or(8883, |a| a.port()), None),
+        };
         let name = config.hostname.clone();
-        let (ca, storage, block, identities) = tokio::task::spawn_blocking(move || {
-            let ca = Arc::new(Authority::load(&config.ca_certificate, &config.ca_key)?);
-            let policy = if config.legacy_tls {
-                TlsPolicy::RtkRtl8711am
-            } else {
-                TlsPolicy::Baseline
-            };
-            let identities = (0..3)
-                .map(|_| ca.server_identity(&config.hostname, policy))
-                .collect::<io::Result<Vec<_>>>()?;
-            let mut storage = Storage::open(&config.device_ledger, 256)?;
-            let block = storage.reserve_generations(1_000_000)?;
-            Ok::<_, io::Error>((ca, storage, block, identities))
-        })
-        .await
-        .map_err(io::Error::other)??;
+        let advertise_requested_host = config.advertise_requested_host;
+        let (ca, storage, block, identities, custom_root) =
+            tokio::task::spawn_blocking(move || {
+                let ca = Arc::new(Authority::load(&config.ca_certificate, &config.ca_key)?);
+                let custom_root = match &config.custom_root_certificate {
+                    None => None,
+                    Some(path) => {
+                        let mut bytes = Vec::new();
+                        File::open(path)?.take(262145).read_to_end(&mut bytes)?;
+                        Some(bytes)
+                    }
+                };
+                let policy = if config.legacy_tls {
+                    TlsPolicy::RtkRtl8711am
+                } else {
+                    TlsPolicy::Baseline
+                };
+                let identities = (0..3)
+                    .map(|_| ca.server_identity(&config.hostname, policy))
+                    .collect::<io::Result<Vec<_>>>()?;
+                let mut storage = Storage::open(&config.device_ledger, 256)?;
+                let block = storage.reserve_generations(1_000_000)?;
+                Ok::<_, io::Error>((ca, storage, block, identities, custom_root))
+            })
+            .await
+            .map_err(io::Error::other)??;
         let mut identities = identities.into_iter();
         let thin_front = FrontDoor::new(
             TlsConfig::default(),
@@ -419,7 +529,11 @@ impl Daemon {
         let mut provisioning_config = provisioning::Config::new(name);
         provisioning_config.https_port = https_port;
         provisioning_config.mqtts_port = mqtt_port;
-        let provisioning = provisioning::Service::new(provisioning_config, &ca, signing, None)?;
+        provisioning_config.advertise_requested_host = advertise_requested_host;
+        provisioning_config.api_server = api_server;
+        provisioning_config.mqtt_server = mqtt_server;
+        let provisioning =
+            provisioning::Service::new(provisioning_config, &ca, signing, custom_root.as_deref())?;
         let (xml, metadata) = thinq1_http::Service::new(Default::default(), Arc::new(SystemClock))?;
         let https = https::Service::new(
             xml,
@@ -439,8 +553,15 @@ impl Daemon {
             256,
             Some((1_000_000, 10_000)),
         )?
-        .with_metadata(metadata)
-        .with_local_service(http_front, http, Arc::new(https))?;
+        .with_metadata(metadata);
+        let plain = [plain_http, thinq1_http]
+            .into_iter()
+            .flatten()
+            .map(|listener| (https.clone(), listener))
+            .collect();
+        if let Some(http) = http {
+            service = service.with_local_service(http_front, http, Arc::new(https))?;
+        }
         #[cfg(feature = "bridge")]
         {
             service = service.with_firmware(firmware.clone());
@@ -478,8 +599,9 @@ impl Daemon {
         Ok(Self {
             service,
             signer,
-            thin: (thin_front, thin),
-            mqtt: (mqtt_front, mqtt),
+            thin: thin.map(|listener| (thin_front, listener)),
+            mqtt: mqtt.map(|listener| (mqtt_front, listener)),
+            plain,
             endpoints,
             #[cfg(feature = "bridge")]
             firmware,
@@ -499,7 +621,7 @@ impl Daemon {
     pub fn firmware(&self) -> rusthinq_bridge::passthrough::Relay {
         self.firmware.clone()
     }
-    pub fn endpoints(&self) -> (SocketAddr, SocketAddr, SocketAddr) {
+    pub fn endpoints(&self) -> Endpoints {
         self.endpoints
     }
     pub fn management_endpoint(&self) -> Option<SocketAddr> {
@@ -518,7 +640,14 @@ impl Daemon {
         let mut tasks = tokio::task::JoinSet::new();
         let handle = self.service.handle();
         let external_handle = handle.external_mqtt();
-        let mut core = tokio::spawn(self.service.serve(self.thin, self.mqtt, core_stopped));
+        for (service, listener) in self.plain {
+            tasks.spawn(service.serve_plain(listener, 64, core_stop.subscribe()));
+        }
+        let mut core = tokio::spawn(self.service.serve_listeners(
+            self.thin,
+            self.mqtt,
+            core_stopped,
+        ));
         #[cfg(feature = "scripting")]
         if let Some(config) = self.driver_watch {
             tasks.spawn(crate::driver_watch::run(
@@ -627,6 +756,24 @@ impl Daemon {
             None => Ok(()),
         }
     }
+}
+/// Bound device-facing endpoints; `None` where the configuration binds nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Endpoints {
+    pub thinq1: Option<SocketAddr>,
+    pub mqtt: Option<SocketAddr>,
+    pub https: Option<SocketAddr>,
+    pub http: Option<SocketAddr>,
+    pub thinq1_http: Option<SocketAddr>,
+}
+async fn listen(address: Option<SocketAddr>) -> io::Result<Option<TcpListener>> {
+    match address {
+        Some(address) => TcpListener::bind(address).await.map(Some),
+        None => Ok(None),
+    }
+}
+fn local(listener: &Option<TcpListener>) -> io::Result<Option<SocketAddr>> {
+    listener.as_ref().map(TcpListener::local_addr).transpose()
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)

@@ -22,6 +22,9 @@ pub struct Config {
     pub https_port: u16,
     pub mqtts_port: u16,
     pub advertise_requested_host: bool,
+    /// Verbatim `/route` endpoints (0.1 `advertise = "<url>"`), e.g. a reverse proxy.
+    pub api_server: Option<String>,
+    pub mqtt_server: Option<String>,
     pub max_body: usize,
     pub request_timeout: Duration,
     pub connection_timeout: Duration,
@@ -33,6 +36,8 @@ impl Config {
             https_port: 443,
             mqtts_port: 8883,
             advertise_requested_host: false,
+            api_server: None,
+            mqtt_server: None,
             max_body: 65536,
             request_timeout: Duration::from_secs(10),
             connection_timeout: Duration::from_secs(30),
@@ -64,6 +69,10 @@ impl Service {
             || config.max_body > 65536
             || config.request_timeout.is_zero()
             || config.connection_timeout.is_zero()
+            || [&config.api_server, &config.mqtt_server]
+                .into_iter()
+                .flatten()
+                .any(|url| url.is_empty() || url.len() > 2048 || url.chars().any(char::is_control))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -119,8 +128,8 @@ impl Service {
                 json_response(
                     StatusCode::OK,
                     json!({"resultCode":"0000","result":{
-                        "apiServer": endpoint("https", name, config.https_port),
-                        "mqttServer": endpoint("ssl", name, config.mqtts_port)
+                        "apiServer": config.api_server.clone().unwrap_or_else(|| endpoint("https", name, config.https_port)),
+                        "mqttServer": config.mqtt_server.clone().unwrap_or_else(|| endpoint("ssl", name, config.mqtts_port))
                     }}),
                 )
             }

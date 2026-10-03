@@ -125,6 +125,15 @@ impl Service {
         self,
         thinq1: (FrontDoor, TcpListener),
         mqtt: (FrontDoor, TcpListener),
+        stop: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        self.serve_listeners(Some(thinq1), Some(mqtt), stop).await
+    }
+    /// As `serve`; an absent listener is simply not served (0.1 port without `bind`).
+    pub async fn serve_listeners(
+        self,
+        thinq1: Option<(FrontDoor, TcpListener)>,
+        mqtt: Option<(FrontDoor, TcpListener)>,
         mut stop: watch::Receiver<bool>,
     ) -> io::Result<()> {
         let Self {
@@ -138,10 +147,17 @@ impl Service {
         let mut app = tokio::spawn(runtime.run(app_stopped));
         let mut app_result = None;
         let mut fronts = JoinSet::new();
-        let (front, listener) = thinq1;
-        fronts.spawn(front.serve(listener, server, front_stopped.clone()));
-        let (front, listener) = mqtt;
-        fronts.spawn(front.serve_service(listener, Arc::new(broker.clone()), front_stopped));
+        // Dropping the transport server stops the state it shares with the broker, so an
+        // unserved ThinQ1 listener keeps it alive until the fronts are joined.
+        let mut unserved = None;
+        if let Some((front, listener)) = thinq1 {
+            fronts.spawn(front.serve(listener, server, front_stopped.clone()));
+        } else {
+            unserved = Some(server);
+        }
+        if let Some((front, listener)) = mqtt {
+            fronts.spawn(front.serve_service(listener, Arc::new(broker.clone()), front_stopped));
+        }
         for (front, listener, service) in local {
             fronts.spawn(front.serve_service(listener, service, front_stop.subscribe()));
         }
@@ -157,8 +173,8 @@ impl Service {
                         failure=Some(io::Error::other("lifecycle runtime stopped"));
                         break;
                     }
-                    result=fronts.join_next()=>{
-                        failure=Some(match result.expect("two front doors") {
+                    Some(result)=fronts.join_next(), if !fronts.is_empty()=>{
+                        failure=Some(match result {
                             Ok(Err(error))=>error,
                             Err(error)=>io::Error::other(error),
                             Ok(Ok(()))=>io::Error::other("TLS listener stopped unexpectedly"),
@@ -179,6 +195,9 @@ impl Service {
             if failure.is_none() {
                 failure = error;
             }
+        }
+        if let Some(server) = unserved {
+            server.shutdown().await;
         }
         app_stop.send_replace(true);
         let app_result = match app_result {

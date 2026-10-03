@@ -27,7 +27,9 @@ subtle = "2"
 url = "2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
-openssl = "0.10"
+# vendored: builds OpenSSL from source instead of linking the build host's libssl, as 0.1
+# did. Needed for musl release targets and keeps the static build independent of the host.
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 
 [dev-dependencies]

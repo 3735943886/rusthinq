@@ -103,13 +103,141 @@ fn migration_stages_preserves_secrets_and_refuses_unsupported_cutover() {
             0o600
         );
     }
+    // Settings 0.1 itself rejects are still refused, and nothing is staged.
+    for bad in [
+        "https_port={bind=4433,advertise=true}\n",
+        "https_port={bind=4433,unknown=1}\n",
+        "[mqtt]\nmqtt_url='ws://broker'\nrusthinq_prefix='p'\n",
+        "[bridge]\nstorage_path='state'\ndns=['system']\n",
+    ] {
+        std::fs::write(&source, format!("hostname='rusthinq.lan'\n{bad}")).unwrap();
+        assert!(
+            rusthinq_tools::migration::migrate(&source, &dir.path().join("bad")).is_err(),
+            "{bad}"
+        );
+        assert!(!dir.path().join("bad").exists());
+    }
+}
+
+/// Every 0.1 setting with a 0.2 equivalent is carried over, so nothing a working 0.1
+/// installation uses is refused or silently dropped.
+#[test]
+fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
+    use rusthinq_app::daemon::Advertise;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("state")).unwrap();
+    let source = dir.path().join("config.toml");
     std::fs::write(
         &source,
-        "hostname='rusthinq.lan'\nhttps_port={bind=4433,advertise=443}\n",
+        "hostname='rusthinq.lan'\nadvertise_requested_host=true\ncustom_root_cert_file='root.cert'\n\
+         https_port={bind=4433,address='192.168.0.111',advertise=443}\n\
+         mqtts_port={advertise='ssl://proxy.example:8883'}\nhttp_port={bind=80,address='127.0.0.1'}\n\
+         thinq1_https_port=46031\nthinq1_port={bind=47879,advertise=1}\n\
+         [mqtt]\nmqtt_url='mqtts://broker.lan'\nmqtt_user='u'\nmqtt_pass='p'\nrusthinq_prefix='home'\n\
+         raw_prefix='home'\nraw=['rx','inject']\n\
+         [bridge]\nstorage_path='state'\ndns=['https://1.1.1.1/dns-query','9.9.9.9:53']\n\
+         [gui]\ngui_port={bind=8080,address='192.168.0.111'}\ngui_user='admin'\ngui_pass='secret'\n",
     )
     .unwrap();
-    assert!(rusthinq_tools::migration::migrate(&source, &dir.path().join("bad")).is_err());
-    assert!(!dir.path().join("bad").exists());
+    let dest = dir.path().join("new");
+    rusthinq_tools::migration::migrate(&source, &dest).unwrap();
+    let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
+    assert_eq!(
+        config.https_bind,
+        Some("192.168.0.111:4433".parse().unwrap())
+    );
+    assert_eq!(config.https_advertise, Some(Advertise::Port(443)));
+    assert_eq!(config.mqtt_bind, None);
+    assert_eq!(
+        config.mqtt_advertise,
+        Some(Advertise::Url("ssl://proxy.example:8883".into()))
+    );
+    assert_eq!(config.http_bind, Some("127.0.0.1:80".parse().unwrap()));
+    assert_eq!(
+        config.thinq1_http_bind,
+        Some("0.0.0.0:46031".parse().unwrap())
+    );
+    assert_eq!(config.thinq1_bind, Some("0.0.0.0:47879".parse().unwrap()));
+    assert_eq!(
+        config.custom_root_certificate.unwrap(),
+        dir.path().canonicalize().unwrap().join("root.cert")
+    );
+    assert_eq!(
+        config.bridge_dns,
+        ["https://1.1.1.1/dns-query", "9.9.9.9:53"]
+    );
+    let mqtt = config.external_mqtt.unwrap();
+    assert_eq!(
+        (mqtt.host.as_str(), mqtt.port, mqtt.tls),
+        ("broker.lan", 8883, true)
+    );
+    std::fs::write(dir.path().join("mqtt_state.json"), br#"{"d":["power"]}"#).unwrap();
+    assert_eq!(mqtt.username.as_deref(), Some("u"));
+    assert_eq!(mqtt.password.as_deref(), Some("p"));
+    let management = config.management.unwrap();
+    assert_eq!(management.bind, "192.168.0.111:8080".parse().unwrap());
+    assert_eq!(management.credentials.unwrap().user, "admin");
+    assert!(management.raw_inject);
+
+    // An unauthenticated LAN GUI cannot be served by 0.2; it moves to loopback, loudly.
+    std::fs::write(
+        &source,
+        "hostname='rusthinq.lan'\n[mqtt]\nmqtt_url='mqtt://broker.lan:1884'\nrusthinq_prefix='home'\n\
+         [gui]\ngui_port=8080\n",
+    )
+    .unwrap();
+    let dest = dir.path().join("open-gui");
+    let report = rusthinq_tools::migration::migrate(&source, &dest).unwrap();
+    assert!(
+        report["warnings"]
+            .to_string()
+            .contains("without authentication on 0.0.0.0:8080")
+    );
+    let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
+    assert_eq!(
+        config.management.unwrap().bind,
+        "127.0.0.1:8080".parse().unwrap()
+    );
+    let mqtt = config.external_mqtt.unwrap();
+    assert_eq!(
+        (mqtt.port, mqtt.tls, mqtt.username.clone()),
+        (1884, false, None)
+    );
+    // The imported 0.1 inventory is the adapter's durable ledger, not a side file.
+    assert!(mqtt.inventory.ends_with("retained-import.json"));
+    let mut ledger = rusthinq_app::retained_cleanup::Ledger::open(&mqtt.inventory, 16384).unwrap();
+    assert!(ledger.requested().is_empty());
+    let imported = rusthinq_server::retained::Tombstone {
+        owner: format!("{}d", rusthinq_app::retained_cleanup::IMPORTED_OWNER),
+        topic: "home/d/power".into(),
+    };
+    assert_eq!(ledger.pending(), std::slice::from_ref(&imported));
+    // 0.2's driver republishing a 0.1 topic takes it over instead of failing...
+    ledger
+        .inventory_topic("device:d:1".into(), "home/d/power".into())
+        .unwrap();
+    assert_eq!(ledger.pending()[0].owner, "device:d:1");
+    // ...but two live owners still conflict, and a requested deletion is not overridden.
+    assert!(
+        ledger
+            .inventory_topic("device:d:2".into(), "home/d/power".into())
+            .is_err()
+    );
+    let dest = dir.path().join("requested");
+    rusthinq_tools::migration::migrate(&source, &dest).unwrap();
+    let mut ledger =
+        rusthinq_app::retained_cleanup::Ledger::open(&dest.join("retained-import.json"), 16384)
+            .unwrap();
+    ledger.request_delete(&[imported]).unwrap();
+    assert!(
+        ledger
+            .inventory_topic("device:d:1".into(), "home/d/power".into())
+            .is_err()
+    );
+    assert_eq!(
+        config.thinq1_http_bind,
+        Some("0.0.0.0:46030".parse().unwrap())
+    );
 }
 
 #[test]
@@ -192,7 +320,7 @@ fn staged_full_legacy_configuration_loads_in_the_daemon_and_flags_retired_settin
     let scripts = dir.path().join("rusthinq-scripts");
     std::fs::create_dir(&scripts).unwrap();
     let source = dir.path().join("config.toml");
-    let original = "hostname='rusthinq.lan'\nca_key_file='ca.key'\nca_cert_file='ca.cert'\n\
+    let original = "hostname='rusthinq.lan'\nadvertise_requested_host=true\nca_key_file='ca.key'\nca_cert_file='ca.cert'\n\
         https_port=443\nmqtts_port=8883\nthinq1_port=47878\nlog=['status']\n\
         [mqtt]\nmqtt_url='mqtt://localhost:1883'\nrusthinq_prefix='home'\nraw_prefix='home-raw'\n\
         [scripting]\nrhai_dir='rusthinq-scripts'\nwatch=true\nil_prefix='il'\n\
@@ -201,7 +329,12 @@ fn staged_full_legacy_configuration_loads_in_the_daemon_and_flags_retired_settin
     let dest = dir.path().join("new");
     let report = rusthinq_tools::migration::migrate(&source, &dest).unwrap();
     let warnings = report["warnings"].to_string();
-    for retired in ["il_prefix", "raw bus", "log categories", "Management binds"] {
+    for retired in [
+        "il_prefix = \\\"il\\\"",
+        "il_common.rhai",
+        "raw observation streams",
+        "log categories",
+    ] {
         assert!(warnings.contains(retired), "{retired}: {warnings}");
     }
     let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
@@ -213,6 +346,9 @@ fn staged_full_legacy_configuration_loads_in_the_daemon_and_flags_retired_settin
         scripts.canonicalize().unwrap()
     );
     assert!(config.management.is_some());
+    // 0.1's DNAT mode and its always-on legacy device TLS profile carry over.
+    assert!(config.advertise_requested_host);
+    assert!(config.legacy_tls);
     // The original installation is untouched: rollback is restarting 0.1 on it.
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
     assert_eq!(

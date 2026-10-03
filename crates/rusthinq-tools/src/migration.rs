@@ -33,38 +33,108 @@ fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn absolute(base: &Path, value: &str) -> PathBuf {
     base.join(value)
 }
-fn bind(value: Option<&toml::Value>, default: u16) -> io::Result<String> {
-    let (address, port) = match value {
-        None => ("0.0.0.0".to_owned(), i64::from(default)),
-        Some(toml::Value::Integer(n)) => ("0.0.0.0".to_owned(), *n),
+/// A 0.1 `PortSpec`: a port, or `{ bind?, address?, advertise? }`. Returns the 0.2 bind
+/// (`None` when 0.1 bound nothing) and the advertise override (a port or a URL).
+fn listener(
+    value: Option<&toml::Value>,
+    default: u16,
+) -> io::Result<(Option<String>, Option<Value>)> {
+    let (address, port, advertise) = match value {
+        None => (None, Some(i64::from(default)), None),
+        Some(toml::Value::Integer(n)) => (None, Some(*n), None),
         Some(toml::Value::Table(t)) => {
-            if t.contains_key("advertise") {
-                return Err(invalid(
-                    "advertised endpoint overrides require manual migration",
-                ));
+            if t.keys()
+                .any(|k| !["bind", "address", "advertise"].contains(&k.as_str()))
+            {
+                return Err(invalid("unsupported listener configuration"));
             }
-            let port = t
-                .get("bind")
-                .and_then(toml::Value::as_integer)
-                .ok_or_else(|| invalid("listener bind missing"))?;
-            (
-                t.get("address")
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or("0.0.0.0")
-                    .to_owned(),
-                port,
-            )
+            let advertise = match t.get("advertise") {
+                None => None,
+                Some(toml::Value::Integer(n)) => Some(json!(port_number(*n)?)),
+                Some(toml::Value::String(url)) if !url.is_empty() => Some(json!(url)),
+                Some(_) => return Err(invalid("invalid listener advertise")),
+            };
+            let port = match t.get("bind") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_integer()
+                        .ok_or_else(|| invalid("invalid listener bind"))?,
+                ),
+            };
+            let address = match t.get("address") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid listener address"))?,
+                ),
+            };
+            (address, port, advertise)
         }
         _ => return Err(invalid("unsupported listener configuration")),
     };
-    let port = u16::try_from(port).map_err(|_| invalid("invalid port"))?;
-    if port == 0 {
-        return Err(invalid("invalid port"));
+    let bind = port.map(|port| socket(address, port)).transpose()?;
+    Ok((bind, advertise))
+}
+/// A 0.1 `PlainPortSpec`: a port, or `{ bind, address? }`.
+fn plain_listener(value: &toml::Value) -> io::Result<String> {
+    match value {
+        toml::Value::Integer(n) => socket(None, *n),
+        toml::Value::Table(t) => {
+            if t.keys().any(|k| !["bind", "address"].contains(&k.as_str())) {
+                return Err(invalid("unsupported listener configuration"));
+            }
+            socket(
+                match t.get("address") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| invalid("invalid listener address"))?,
+                    ),
+                },
+                t.get("bind")
+                    .and_then(toml::Value::as_integer)
+                    .ok_or_else(|| invalid("listener bind missing"))?,
+            )
+        }
+        _ => Err(invalid("unsupported listener configuration")),
     }
+}
+fn port_number(port: i64) -> io::Result<u16> {
+    u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| invalid("invalid port"))
+}
+fn socket(address: Option<&str>, port: i64) -> io::Result<String> {
     let address = address
+        .unwrap_or("0.0.0.0")
         .parse::<std::net::IpAddr>()
         .map_err(|_| invalid("listener address must be an IP"))?;
-    Ok(std::net::SocketAddr::new(address, port).to_string())
+    Ok(std::net::SocketAddr::new(address, port_number(port)?).to_string())
+}
+/// 0.1 `parse_mqtt_url`: `mqtt://` plain, `mqtts://`/`ssl://` TLS, default ports.
+fn mqtt_url(value: &str) -> io::Result<(String, u16, bool)> {
+    let url = url::Url::parse(value).map_err(|_| invalid("invalid [mqtt] mqtt_url"))?;
+    let tls = match url.scheme() {
+        "mqtt" => false,
+        "mqtts" | "ssl" => true,
+        _ => return Err(invalid("unsupported [mqtt] mqtt_url scheme")),
+    };
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| invalid("[mqtt] mqtt_url requires a host"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    Ok((
+        host,
+        url.port().unwrap_or(if tls { 8883 } else { 1883 }),
+        tls,
+    ))
 }
 pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
     if destination.exists() {
@@ -109,29 +179,40 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
     {
         return Err(invalid("invalid legacy scripting settings"));
     }
-    for key in [
-        "custom_root_cert_file",
-        "http_port",
-        "advertise_requested_host",
+    let advertise_requested_host = match legacy.get("advertise_requested_host") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("advertise_requested_host must be boolean"))?,
+    };
+    // 0.1 always served the legacy RTL8711am TLS profile (TLS1.0+, SECLEVEL=0) to devices.
+    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","legacy_tls":true,"advertise_requested_host":advertise_requested_host,"management":{"bind":"127.0.0.1:8080","gui":true,"raw_inject":false}});
+    // Listeners keep 0.1's addresses; a port without `bind` stays unbound. As in 0.1,
+    // `advertise` only reaches devices for HTTPS and MQTTS (`/route`).
+    for (key, bind, advertise, default) in [
+        ("https_port", "https_bind", Some("https_advertise"), 443),
+        ("mqtts_port", "mqtt_bind", Some("mqtt_advertise"), 8883),
+        ("thinq1_port", "thinq1_bind", None, 47878),
+        ("thinq1_https_port", "thinq1_http_bind", None, 46030),
     ] {
-        if legacy.get(key).is_some() {
-            return Err(invalid(
-                "proxy/root/advertised host settings require manual migration",
-            ));
+        let (address, advertised) = listener(legacy.get(key), default)?;
+        if let Some(address) = address {
+            config[bind] = json!(address);
+        }
+        if let (Some(field), Some(advertised)) = (advertise, advertised) {
+            config[field] = advertised;
         }
     }
-    if legacy
-        .get("thinq1_https_port")
-        .is_some_and(|v| v.as_integer() != Some(46030))
-    {
-        return Err(invalid(
-            "custom ThinQ1 HTTPS endpoint requires manual migration",
-        ));
+    if let Some(http) = legacy.get("http_port") {
+        config["http_bind"] = json!(plain_listener(http)?);
     }
-    if legacy.get("bridge").and_then(|b| b.get("dns")).is_some() {
-        return Err(invalid("custom outbound DNS requires manual migration"));
+    if let Some(root) = legacy.get("custom_root_cert_file") {
+        let root = root
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("invalid custom_root_cert_file"))?;
+        config["custom_root_certificate"] = json!(absolute(base, root));
     }
-    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"thinq1_bind":bind(legacy.get("thinq1_port"),47878)?,"mqtt_bind":bind(legacy.get("mqtts_port"),8883)?,"https_bind":bind(legacy.get("https_port"),443)?,"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","management":{"bind":"127.0.0.1:8080","gui":true,"raw_inject":false}});
     let prefix = legacy
         .get("mqtt")
         .and_then(|v| v.get("rusthinq_prefix"))
@@ -162,8 +243,10 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .and_then(toml::Value::as_str)
             .unwrap_or("mqtt_state.json"),
     );
+    let mut retained_imported = false;
     let retained_topics = match read(&retained_path) {
         Ok(bytes) => {
+            retained_imported = true;
             let inventory = legacy_retained(&bytes, prefix)?;
             write(&stage.path().join("mqtt-state.0.1.json"), &bytes)?;
             write(
@@ -189,11 +272,12 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         Err(error) => return Err(error),
     };
     let mut archived = Vec::new();
-    let mut warnings = vec![
-        "Review external MQTT host, credentials, retained inventory and raw ACLs before enabling the adapter.",
+    let mut warnings: Vec<String> = [
         "Legacy device pairing files remain archived; reconcile account identity and registration before enabling cloud sessions.",
         "Rollback: stop 0.2 and restart 0.1 with the untouched original configuration and state.",
-    ];
+    ]
+    .map(str::to_owned)
+    .to_vec();
     if let Some(bridge) = legacy.get("bridge") {
         let storage = absolute(
             base,
@@ -248,24 +332,124 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
                 config["cloud_account"] = json!("account.json");
             }
         }
+        if let Some(dns) = bridge.get("dns") {
+            let servers = dns
+                .as_array()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| invalid("invalid [bridge] dns"))?;
+            // 0.1 accepted a DoH URL or a plain DNS server address, nothing else.
+            if !servers.iter().all(|entry| {
+                if entry.starts_with("https://") {
+                    url::Url::parse(entry).is_ok()
+                } else {
+                    entry.parse::<std::net::SocketAddr>().is_ok()
+                        || entry.parse::<std::net::IpAddr>().is_ok()
+                }
+            }) {
+                return Err(invalid("invalid [bridge] dns server"));
+            }
+            if !servers.is_empty() {
+                config["bridge_dns"] = json!(servers);
+            }
+        }
     }
-    if legacy
+    let mqtt_enabled = match legacy.get("mqtt_enabled") {
+        None => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("mqtt_enabled must be boolean"))?,
+    };
+    if let Some(mqtt) = legacy.get("mqtt") {
+        let url = mqtt
+            .get("mqtt_url")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid("[mqtt] mqtt_url missing"))?;
+        let (host, port, tls) = mqtt_url(url)?;
+        let inventory = if retained_imported {
+            "retained-import.json"
+        } else {
+            "retained.json"
+        };
+        let mut external = json!({"host":host,"port":port,"tls":tls,"inventory":inventory});
+        for (from, to) in [("mqtt_user", "username"), ("mqtt_pass", "password")] {
+            if let Some(value) = mqtt.get(from) {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid [mqtt] credentials"))?;
+                if !value.is_empty() {
+                    external[to] = json!(value);
+                }
+            }
+        }
+        if mqtt_enabled {
+            config["external_mqtt"] = external;
+        } else {
+            warnings.push("0.1 mqtt_enabled = false: [external_mqtt] was not written. Add it to connect to the broker.".to_owned());
+        }
+        // 0.1 raw injection streams map to 0.2's identity-checked $raw routes.
+        let raw: Vec<&str> = mqtt
+            .get("raw")
+            .and_then(toml::Value::as_array)
+            .map(|names| names.iter().filter_map(toml::Value::as_str).collect())
+            .unwrap_or_default();
+        if mqtt.get("raw_prefix").is_some()
+            && raw
+                .iter()
+                .any(|name| ["inject", "inject_clip", "emit"].contains(name))
+        {
+            config["management"]["raw_inject"] = json!(true);
+        }
+    }
+    if let Some(gui) = legacy.get("gui") {
+        let bind = plain_listener(
+            gui.get("gui_port")
+                .ok_or_else(|| invalid("[gui] gui_port missing"))?,
+        )?;
+        let credential = |key: &str| -> io::Result<Option<String>> {
+            match gui.get(key) {
+                None => Ok(None),
+                Some(value) => Ok(value
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid [gui] credentials"))?
+                    .to_owned())
+                .map(|value: String| (!value.is_empty()).then_some(value)),
+            }
+        };
+        let address: std::net::SocketAddr = bind.parse().map_err(io::Error::other)?;
+        config["management"]["bind"] = json!(bind);
+        match (credential("gui_user")?, credential("gui_pass")?) {
+            (Some(user), Some(password)) => {
+                config["management"]["user"] = json!(user);
+                config["management"]["password"] = json!(password);
+            }
+            _ if address.ip().is_loopback() => {}
+            _ => {
+                let local = std::net::SocketAddr::new([127, 0, 0, 1].into(), address.port());
+                config["management"]["bind"] = json!(local.to_string());
+                warnings.push(format!("0.1 served the GUI without authentication on {address}. 0.2 requires a user and password off loopback, so the management endpoint binds {local}. Set [management] user, password and bind = \"{address}\" to serve it on the LAN again."));
+            }
+        }
+    }
+    if let Some(prefix) = legacy
         .get("scripting")
-        .is_some_and(|s| s.get("il_prefix").is_some())
+        .and_then(|s| s.get("il_prefix"))
+        .and_then(toml::Value::as_str)
     {
-        warnings.push("0.1 [scripting] il_prefix is not a host setting in 0.2; the scripts choose their own topics (rusthinq-scripts: il_common.rhai prefix()).");
+        warnings.push(format!("0.1 [scripting] il_prefix = \"{prefix}\" is not a host setting in 0.2 and was dropped. The scripts choose their own topics: to keep publishing descriptors under {prefix}/<id>, return \"{prefix}\" from prefix() in rusthinq-scripts il_common.rhai."));
     }
     if legacy
         .get("mqtt")
         .is_some_and(|m| m.get("raw_prefix").is_some() || m.get("raw").is_some())
     {
-        warnings.push("0.1 MQTT raw bus (raw_prefix/raw) is retired; use the management device monitor, rusthinq-capture, or the $raw control routes.");
+        warnings.push("0.1 MQTT raw observation streams (raw/rx, raw/tx, clip, lg) are retired; use the management device monitor or rusthinq-capture. Raw injection, if 0.1 enabled it, moves to the $raw/{inject,emit}/set routes.".to_owned());
     }
     if legacy.get("log").is_some() {
-        warnings.push("0.1 log categories are not migrated; 0.2 writes application events to stderr without categories.");
-    }
-    if legacy.get("gui").is_some() {
-        warnings.push("Management binds to loopback with raw injection disabled; review old GUI bind and authentication explicitly.");
+        warnings.push("0.1 log categories are not migrated; 0.2 writes application events to stderr without categories.".to_owned());
     }
     let config: toml::Value = serde_json::from_value(config).map_err(io::Error::other)?;
     write(
@@ -348,6 +532,7 @@ pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
             if topic.len() > 1024 {
                 return Err(invalid("legacy retained topic exceeded"));
             }
+            // rusthinq_app::retained_cleanup::IMPORTED_OWNER: new owners adopt these.
             topics.insert(topic, format!("legacy/0.1:{device}"));
             if topics.len() > 16384 {
                 return Err(invalid("legacy retained inventory exceeded"));

@@ -16,7 +16,9 @@ url = "2"
 base64 = "0.22"
 anyhow = "1"
 chrono = "0.4"
-openssl = "0.10"
+# vendored: builds OpenSSL from source instead of linking the build host's libssl, as 0.1
+# did. Needed for musl release targets and keeps the static build independent of the host.
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 
 toml = "0.8"
@@ -24,5 +26,5 @@ tempfile = "3"
 
 [dev-dependencies]
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
-rusthinq-app = { path = "../rusthinq-app", default-features = false, features = ["scripting", "gui"] }
+rusthinq-app = { path = "../rusthinq-app", default-features = false, features = ["scripting", "gui", "bridge"] }
 rusthinq-server = { path = "../rusthinq-server" }

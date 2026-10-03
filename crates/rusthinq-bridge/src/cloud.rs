@@ -165,6 +165,7 @@ impl Client {
         }
         let http = Http::builder()
             .https_only(true)
+            .dns_resolver(crate::resolver::dns_resolver())
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(15))

@@ -175,7 +175,7 @@ impl Connector {
             }
         }
         timeout(self.timeout, async {
-            let tcp = TcpStream::connect((self.host.as_str(), self.port)).await?;
+            let tcp = crate::resolver::connect_tcp(&self.host, self.port).await?;
             let ssl = self
                 .tls
                 .configure()
@@ -223,6 +223,7 @@ pub async fn prepare_thinq1(
         .replace('"', "&quot;")
         .replace('\'', "&apos;");
     let client = reqwest::Client::builder()
+        .dns_resolver(crate::resolver::dns_resolver())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()

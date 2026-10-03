@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Owner prefix of retained topics imported from a 0.1 inventory.
+pub const IMPORTED_OWNER: &str = "legacy/0.1:";
+
 pub struct Ledger {
     path: PathBuf,
     parent: PathBuf,
@@ -88,7 +91,21 @@ impl Ledger {
         }
     }
     /// Record publication ownership without exposing the lower-layer cleanup model.
+    /// A topic imported from 0.1 (`rusthinq-migrate`) passes to the first new owner that
+    /// publishes it, as 0.1 simply republished; unpublished imports stay for cleanup.
     pub fn inventory_topic(&mut self, owner: String, topic: String) -> io::Result<()> {
+        if let Some(imported) = self
+            .cleanup
+            .owner(&topic)
+            .filter(|current| *current != owner && current.starts_with(IMPORTED_OWNER))
+            .map(str::to_owned)
+        {
+            let mut candidate = self.cleanup.clone();
+            candidate
+                .transfer(&imported, Tombstone { owner, topic })
+                .map_err(policy)?;
+            return self.commit(candidate);
+        }
         self.enqueue(&[Tombstone { owner, topic }])
     }
     pub fn enqueue(&mut self, deletions: &[Tombstone]) -> io::Result<()> {

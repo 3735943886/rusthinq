@@ -188,6 +188,17 @@ async fn https_routes_advertise_default_and_explicit_ports_and_root_list() {
         let (_, body) = harness.request("GET", "/route", host, b"").await;
         assert_eq!(body["result"]["apiServer"], "https://local.example:9443");
     }
+    harness.shutdown().await; // 0.1 `advertise = "<url>"`: verbatim, regardless of the requested host.
+    let mut config = Config::new("local.example".into());
+    config.advertise_requested_host = true;
+    config.api_server = Some("https://proxy.example".into());
+    config.mqtt_server = Some("ssl://proxy.example:18883".into());
+    let harness = Harness::start(config, None).await;
+    let (_, body) = harness
+        .request("GET", "/route", "redirect.example:443", b"")
+        .await;
+    assert_eq!(body["result"]["apiServer"], "https://proxy.example");
+    assert_eq!(body["result"]["mqttServer"], "ssl://proxy.example:18883");
     harness.shutdown().await;
 }
 #[tokio::test]

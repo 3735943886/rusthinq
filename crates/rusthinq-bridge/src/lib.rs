@@ -2,6 +2,7 @@
 pub mod devices;
 pub mod firmware;
 pub mod passthrough;
+pub mod resolver;
 
 pub mod cloud;
 

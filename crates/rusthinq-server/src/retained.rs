@@ -218,6 +218,27 @@ impl Cleanup {
         self.pending = staged;
         Ok(())
     }
+    /// Hand an inventoried topic from `from` to a new owner. Refused while a deletion of
+    /// the topic is requested or in flight, or when `from` does not own it.
+    pub fn transfer(&mut self, from: &str, to: Tombstone) -> Result<(), Error> {
+        let mut validation = Store::new(1, 1)?;
+        validation.put(&to.owner, &to.topic, &[])?;
+        if self.deleting.contains(&to.topic)
+            || self
+                .pending
+                .get(&to.topic)
+                .is_none_or(|(owned, _)| owned.owner != from)
+        {
+            return Err(Error::OwnerConflict);
+        }
+        self.pending.insert(to.topic.clone(), (to, None));
+        Ok(())
+    }
+    pub fn owner(&self, topic: &str) -> Option<&str> {
+        self.pending
+            .get(topic)
+            .map(|(deletion, _)| deletion.owner.as_str())
+    }
     /// Allocate a fresh token, including retries. Commit checkpoint before send.
     pub fn begin(&mut self, topic: &str) -> Result<Attempt, Error> {
         let (deletion, attempt) = self.pending.get_mut(topic).ok_or(Error::Invalid)?;

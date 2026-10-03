@@ -22,14 +22,21 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
     std::fs::write(&cert_path, ca.certificate_pem()).unwrap();
     std::fs::write(&key_path, ca.private_key_pem().unwrap()).unwrap();
     let config = Config {
-        thinq1_bind: "127.0.0.1:0".parse().unwrap(),
-        mqtt_bind: "127.0.0.1:0".parse().unwrap(),
-        https_bind: "127.0.0.1:0".parse().unwrap(),
+        thinq1_bind: Some("127.0.0.1:0".parse().unwrap()),
+        mqtt_bind: Some("127.0.0.1:0".parse().unwrap()),
+        https_bind: Some("127.0.0.1:0".parse().unwrap()),
         hostname: "local.example".into(),
         ca_certificate: cert_path,
         ca_key: key_path,
         device_ledger: dir.path().join("devices.json"),
         legacy_tls: false,
+        https_advertise: None,
+        mqtt_advertise: None,
+        http_bind: None,
+        thinq1_http_bind: None,
+        custom_root_certificate: None,
+        bridge_dns: Vec::new(),
+        advertise_requested_host: false,
         management: Some(rusthinq_app::management::Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             gui: cfg!(feature = "gui"),
@@ -41,7 +48,8 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
         cloud_account: cfg!(feature = "bridge").then(|| dir.path().join("account.json")),
     };
     let daemon = Daemon::prepare(config).await.unwrap();
-    let (_, mqtt, http) = daemon.endpoints();
+    let endpoints = daemon.endpoints();
+    let (mqtt, http) = (endpoints.mqtt.unwrap(), endpoints.https.unwrap());
     let management = daemon.management_endpoint().unwrap();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(daemon.serve(stopped));
@@ -180,14 +188,21 @@ async fn bind_failure_does_not_create_lifecycle_checkpoint() {
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ledger = dir.path().join("devices.json");
     let config = Config {
-        thinq1_bind: "127.0.0.1:0".parse().unwrap(),
-        mqtt_bind: occupied.local_addr().unwrap(),
-        https_bind: "127.0.0.1:0".parse().unwrap(),
+        thinq1_bind: Some("127.0.0.1:0".parse().unwrap()),
+        mqtt_bind: Some(occupied.local_addr().unwrap()),
+        https_bind: Some("127.0.0.1:0".parse().unwrap()),
         hostname: "local.example".into(),
         ca_certificate: dir.path().join("not-loaded.pem"),
         ca_key: dir.path().join("not-loaded-key.pem"),
         device_ledger: ledger.clone(),
         legacy_tls: false,
+        https_advertise: None,
+        mqtt_advertise: None,
+        http_bind: None,
+        thinq1_http_bind: None,
+        custom_root_certificate: None,
+        bridge_dns: Vec::new(),
+        advertise_requested_host: false,
         management: None,
         drivers: None,
         external_mqtt: None,
@@ -278,14 +293,21 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
         assert!(subscriber.unwrap().read_u8().await.is_err());
     });
     let daemon = Daemon::prepare(Config {
-        thinq1_bind: "127.0.0.1:0".parse().unwrap(),
-        mqtt_bind: "127.0.0.1:0".parse().unwrap(),
-        https_bind: "127.0.0.1:0".parse().unwrap(),
+        thinq1_bind: Some("127.0.0.1:0".parse().unwrap()),
+        mqtt_bind: Some("127.0.0.1:0".parse().unwrap()),
+        https_bind: Some("127.0.0.1:0".parse().unwrap()),
         hostname: "local.example".into(),
         ca_certificate: certificate,
         ca_key: key,
         device_ledger: dir.path().join("devices.json"),
         legacy_tls: false,
+        https_advertise: None,
+        mqtt_advertise: None,
+        http_bind: None,
+        thinq1_http_bind: None,
+        custom_root_certificate: None,
+        bridge_dns: Vec::new(),
+        advertise_requested_host: false,
         management: None,
         drivers: Some(rusthinq_app::drivers::Config {
             directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -308,7 +330,7 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
     })
     .await
     .unwrap();
-    let endpoint = daemon.endpoints().0;
+    let endpoint = daemon.endpoints().thinq1.unwrap();
     let handle = daemon.handle();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(daemon.serve(stopped));
@@ -383,4 +405,80 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
     let ledger = rusthinq_app::retained_cleanup::Ledger::open(&inventory, 4).unwrap();
     assert_eq!(ledger.pending().len(), 1);
     assert!(ledger.requested().is_empty());
+}
+
+async fn plain_request(address: std::net::SocketAddr, method: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: redirect.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+/// 0.1 listener surface: a port without `bind`, `advertise` (port and URL), `http_port`
+/// behind a TLS-terminating proxy, plain ThinQ1 HTTP and `custom_root_cert_file`.
+#[tokio::test]
+async fn legacy_listener_options_serve_plain_http_advertise_and_custom_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Authority::generate("daemon-tests.example", 2048).unwrap();
+    let custom = Authority::generate("proxy-root.example", 2048).unwrap();
+    std::fs::write(dir.path().join("ca.pem"), ca.certificate_pem()).unwrap();
+    std::fs::write(dir.path().join("key.pem"), ca.private_key_pem().unwrap()).unwrap();
+    std::fs::write(dir.path().join("root.pem"), custom.certificate_pem()).unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "hostname='local.example'\nca_certificate='ca.pem'\nca_key='key.pem'\n\
+         device_ledger='devices.json'\nmqtt_bind='127.0.0.1:0'\nhttp_bind='127.0.0.1:0'\n\
+         thinq1_http_bind='127.0.0.1:0'\nhttps_advertise='https://proxy.example'\n\
+         mqtt_advertise=18883\nadvertise_requested_host=true\n\
+         custom_root_certificate='root.pem'\n",
+    )
+    .unwrap();
+    let config = Config::load(&dir.path().join("config.toml")).unwrap();
+    let daemon = Daemon::prepare(config).await.unwrap();
+    let endpoints = daemon.endpoints();
+    assert!(endpoints.https.is_none() && endpoints.thinq1.is_none());
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(daemon.serve(stopped));
+    let route = plain_request(endpoints.http.unwrap(), "GET", "/route").await;
+    let body: serde_json::Value =
+        serde_json::from_str(route.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["result"]["apiServer"], "https://proxy.example");
+    assert_eq!(body["result"]["mqttServer"], "ssl://redirect.example:18883");
+    let root = plain_request(
+        endpoints.http.unwrap(),
+        "GET",
+        "/route/certificate?name=aws-iot",
+    )
+    .await;
+    assert!(root.contains("200 OK"), "{root}");
+    let root: serde_json::Value =
+        serde_json::from_str(root.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let served = serde_json::to_string(&root).unwrap();
+    let custom_pem = serde_json::to_string(custom.certificate_pem()).unwrap();
+    assert!(served.contains(custom_pem.trim_matches('"')), "{served}");
+    let thinq1 = plain_request(
+        endpoints.thinq1_http.unwrap(),
+        "POST",
+        "/lgehadm/api/Grid/PowerSavingInfoSvc",
+    )
+    .await;
+    assert!(thinq1.contains("<returnCd>0108</returnCd>"), "{thinq1}");
+    stop.send_replace(true);
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

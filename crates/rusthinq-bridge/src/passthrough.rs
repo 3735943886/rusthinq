@@ -22,7 +22,7 @@ pub trait Connector: Send + Sync {
 pub struct HttpsConnector;
 impl Connector for HttpsConnector {
     fn connect(&self, name: String) -> ConnectFuture {
-        Box::pin(async move { TcpStream::connect((name.as_str(), 443)).await })
+        Box::pin(async move { crate::resolver::connect_tcp(&name, 443).await })
     }
 }
 
