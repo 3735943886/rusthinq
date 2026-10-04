@@ -84,7 +84,7 @@ window.DeviceControls = (() => {
           this.container.append(
             text(
               "p",
-              "This driver has not published a control description. Advanced commands remain available.",
+              "No control description is available for this device. Device controls require a driver that publishes a control description.",
               "muted",
             ),
           );
