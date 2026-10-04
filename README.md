@@ -4,13 +4,6 @@ rusthinq is a local LG ThinQ device server and optional LG cloud bridge written 
 Rust. It accepts appliance connections, runs Rhai device drivers, and exposes a
 management API, web dashboard and MQTT output.
 
-**0.2 is an independent runtime under development (`0.2.0-dev`).** The fixed 0.1
-workspace remains in [`legacy/0.1`](legacy/0.1) for reference and migration; 0.2
-does not depend on it or fall back to it. Protocol and integration tests provide
-local evidence, but real-appliance and live LG-account validation have not been
-performed for this release. See the [milestones](docs/0.2-validation.md#milestones) for the
-remaining release work.
-
 ## How 0.2 differs
 
 | Area | TypeScript rethink | Rust 0.1 | Rust 0.2 |
