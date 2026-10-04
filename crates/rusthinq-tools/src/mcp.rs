@@ -1,5 +1,17 @@
 //! Newline JSON-RPC MCP adapter. Notifications do not receive responses.
 use crate::Client;
+mod live;
+/// MCP process state; owns live observers and cancels them when dropped.
+#[derive(Default)]
+pub struct Session {
+    client: Option<Client>,
+    live: live::Captures,
+}
+impl Session {
+    pub async fn dispatch(&mut self, request: Value) -> Option<Value> {
+        dispatch_inner(&mut self.client, &mut self.live, request).await
+    }
+}
 use serde_json::{Value, json};
 use std::io;
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -37,6 +49,24 @@ pub fn tools() -> Value {
             json!({"cursor":{"type":"string"},"limit":{"type":"integer"},"device_id":{"type":"string"}}),
             &[]
         ),
+        tool(
+            "device_start",
+            "Start bounded live wire observation; repeated starts preserve history",
+            json!({"device_id":{"type":"string"}}),
+            &["device_id"]
+        ),
+        tool(
+            "device_stop",
+            "Stop observation; preserve history unless clear is true",
+            json!({"device_id":{"type":"string"},"clear":{"type":"boolean"}}),
+            &["device_id"]
+        ),
+        tool(
+            "read_device",
+            "Read live events with decimal cursors; lost marks eviction or stream loss",
+            json!({"device_id":{"type":"string"},"cursor":{"type":"string"},"limit":{"type":"integer"},"direction":{"type":"string","enum":["rx","tx"]}}),
+            &["device_id"]
+        ),
         tool("health", "Read daemon health", json!({}), &[]),
         tool(
             "decode_packet",
@@ -64,7 +94,15 @@ pub fn tools() -> Value {
         ),
     ])
 }
+/// One-shot compatibility helper. Use `Session::dispatch` for live observation.
 pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Value> {
+    dispatch_inner(client, &mut live::Captures::default(), request).await
+}
+async fn dispatch_inner(
+    client: &mut Option<Client>,
+    live: &mut live::Captures,
+    request: Value,
+) -> Option<Value> {
     let id = request.get("id")?.clone();
     if request["jsonrpc"] != "2.0" {
         return Some(
@@ -91,6 +129,7 @@ pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Val
                         std::env::var("RUSTHINQ_PASSWORD").ok().as_deref(),
                     )
                     .map(|value| {
+                        live.clear();
                         *client = Some(value);
                         json!({"configured":true})
                     }),
@@ -99,8 +138,10 @@ pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Val
                         "endpoint required",
                     )),
                 },
-                "list_devices" | "health" | "inject" | "cloud_start" | "cloud_stop"
-                | "read_cloud" => {
+                "device_stop" => live.stop(args).await,
+                "read_device" => live.read(args),
+                "device_start" | "list_devices" | "health" | "inject" | "cloud_start"
+                | "cloud_stop" | "read_cloud" => {
                     if client.is_none() {
                         match Client::environment() {
                             Ok(value) => *client = Some(value),
@@ -109,6 +150,7 @@ pub async fn dispatch(client: &mut Option<Client>, request: Value) -> Option<Val
                     }
                     let client = client.as_ref().expect("configured");
                     match name {
+                        "device_start" => live.start(client, args).await,
                         "list_devices" => client.request("api/devices", None).await,
                         "health" => client.request("api/health", None).await,
                         "cloud_start" => {
@@ -179,7 +221,7 @@ pub async fn run() -> io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
-    let mut client = None;
+    let mut session = Session::default();
     loop {
         let mut bytes = Vec::new();
         let n = (&mut reader)
@@ -196,7 +238,7 @@ pub async fn run() -> io::Result<()> {
             ));
         }
         let response = match serde_json::from_slice(&bytes) {
-            Ok(value) => dispatch(&mut client, value).await,
+            Ok(value) => session.dispatch(value).await,
             Err(_) => Some(
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}),
             ),

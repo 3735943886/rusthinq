@@ -377,3 +377,68 @@ fn cloud_capture_records_keep_observation_time_and_cannot_be_replayed_as_device_
         "lost"
     );
 }
+
+#[tokio::test]
+async fn mcp_live_tools_keep_session_history_and_endpoint_changes_release_it() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        socket
+            .send(Message::Text(
+                json!({"type":"snapshot","state":{"devices":{"d":{"generation":"2"}}}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        // Endpoint replacement drops the owned stream, rather than detaching it.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .unwrap();
+    });
+    let mut session = mcp::Session::default();
+    async fn call(
+        session: &mut mcp::Session,
+        name: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        session.dispatch(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap()["result"].clone()
+    }
+    assert_eq!(
+        call(
+            &mut session,
+            "set_api_endpoint",
+            json!({"endpoint":endpoint})
+        )
+        .await["isError"],
+        false
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            call(&mut session, "device_start", json!({"device_id":"d"})).await["isError"],
+            false
+        );
+    }
+    let page = call(&mut session, "read_device", json!({"device_id":"d"})).await;
+    let page: serde_json::Value =
+        serde_json::from_str(page["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        call(
+            &mut session,
+            "set_api_endpoint",
+            json!({"endpoint":endpoint})
+        )
+        .await["isError"],
+        false
+    );
+    assert_eq!(
+        call(&mut session, "read_device", json!({"device_id":"d"})).await["isError"],
+        true
+    );
+    server.await.unwrap();
+}
