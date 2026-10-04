@@ -1,5 +1,50 @@
 /* Shared interface primitives. Device/account data is always rendered as text. */
 window.UI = (() => {
+  // Safari can still smart-zoom text/cards despite touch-action: manipulation.
+  // Cancel only the second stationary tap on non-interactive content.
+  // Leave native control activation, text editing, scrolling and pinch zoom alone.
+  let tapStart = null;
+  let previousTap = null;
+  const nativeTarget =
+    'a, button, input, select, textarea, label, summary, [role="button"], [role="switch"], [contenteditable]:not([contenteditable="false"])';
+  document.addEventListener("touchstart", (event) => {
+    tapStart = null;
+    if (event.touches.length !== 1 || event.target.closest(nativeTarget)) {
+      previousTap = null;
+      return;
+    }
+    const touch = event.touches[0];
+    tapStart = { x: touch.clientX, y: touch.clientY, time: event.timeStamp };
+  }, { passive: true, capture: true });
+  document.addEventListener("touchmove", () => {
+    tapStart = null;
+    previousTap = null;
+  }, { passive: true, capture: true });
+  document.addEventListener("touchcancel", () => {
+    tapStart = null;
+    previousTap = null;
+  }, { passive: true, capture: true });
+  document.addEventListener("touchend", (event) => {
+    const start = tapStart;
+    tapStart = null;
+    if (!start || event.touches.length || event.changedTouches.length !== 1) {
+      previousTap = null;
+      return;
+    }
+    const touch = event.changedTouches[0];
+    const tap = { x: touch.clientX, y: touch.clientY, time: event.timeStamp };
+    if (tap.time - start.time > 350 ||
+        Math.hypot(tap.x - start.x, tap.y - start.y) > 20) {
+      previousTap = null;
+      return;
+    }
+    if (previousTap && tap.time - previousTap.time < 350 &&
+        Math.hypot(tap.x - previousTap.x, tap.y - previousTap.y) < 30 &&
+        event.cancelable) {
+      event.preventDefault();
+    }
+    previousTap = tap;
+  }, { passive: false, capture: true });
   const $ = (id) => document.getElementById(id);
   const paths = {
     grid: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/>',
