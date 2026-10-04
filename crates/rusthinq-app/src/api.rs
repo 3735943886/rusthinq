@@ -456,6 +456,7 @@ impl AppHandle {
                 .ok_or(CloudError::Unavailable)?
                 .list_devices()
                 .await
+                .map(|inventory| inventory["devices"].clone())
                 .map_err(Into::into)
         }
         #[cfg(not(feature = "bridge"))]

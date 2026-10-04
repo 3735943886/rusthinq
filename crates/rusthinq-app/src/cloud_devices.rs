@@ -559,6 +559,8 @@ impl Runtime {
                 .map_err(|_| io::Error::other("account inventory unavailable"))
         })
         .await?;
+        self.account
+            .publish_inventory(&identity, epoch, serde_json::json!(inventory));
         if inventory.is_empty() && empty.as_ref() != Some(&identity) {
             *empty = Some(identity);
             return Ok(true);

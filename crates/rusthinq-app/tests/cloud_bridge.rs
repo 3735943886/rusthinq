@@ -128,7 +128,7 @@ async fn lg_http(listener: TcpListener, inventory_id: &str) {
             "/api/service/homes" => {
                 json!({"resultCode":"0000","result":{"item":[{"homeId":"h","currentHomeYn":"Y"}]}})
             }
-            "/api/service/homes/h" => json!({"resultCode":"0000","result":{"devices":[{"deviceId":inventory_id}]}}),
+            "/api/service/homes/h" => json!({"resultCode":"0000","result":{"devices":[{"deviceId":inventory_id,"alias":"LG room"}]}}),
             other => panic!("unexpected LG request {other}"),
         }
         .to_string();
@@ -422,6 +422,11 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
     })
     .await
     .unwrap();
+    let inventory = app.cloud_inventory().await.unwrap();
+    assert!(inventory.is_array());
+    assert_eq!(inventory[0]["deviceId"], "d");
+    assert_eq!(inventory[0]["alias"], "LG room");
+    assert_eq!(account.inventory_snapshot().unwrap(), inventory);
     timeout(
         Duration::from_secs(5),
         app.cloud_device("d".into(), 1, "enable", json!({})),
@@ -521,6 +526,7 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
 
     // Logout ends cloud access: no further LG connection is attempted.
     account.logout().await.unwrap();
+    assert!(account.inventory_snapshot().is_none());
     assert!(
         timeout(Duration::from_millis(2500), cloud_listener.accept())
             .await
@@ -607,7 +613,7 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
         passthrough::Relay::new(Default::default(), Arc::new(passthrough::HttpsConnector)).unwrap();
     let (handle, cloud, _) = rusthinq_app::cloud_devices::Runtime::open(
         path.clone(),
-        account,
+        account.clone(),
         runtime.handle(),
         server.handle(),
         broker.handle(),
@@ -634,6 +640,15 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
     })
     .await
     .unwrap();
+    // Reconciliation publishes its existing read; snapshots issue no additional LG I/O.
+    let inventory = account.inventory_snapshot().unwrap();
+    assert_eq!(inventory[0]["alias"], "LG room");
+    let mut updates = account.inventory_updates();
+    account.publish_inventory("wrong-account", 0, json!([]));
+    account.publish_inventory("user-1", u64::MAX, json!([]));
+    assert!(!updates.has_changed().unwrap());
+    assert_eq!(account.inventory_snapshot().unwrap(), inventory);
+    updates.borrow_and_update();
     stop.send_replace(true);
     for task in [account_task, cloud_task] {
         timeout(Duration::from_secs(5), task)

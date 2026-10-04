@@ -247,7 +247,7 @@ const assert = require("node:assert/strict");
   await page.goto(base);
   await page.locator(".device-card").first().waitFor();
   assert.equal(await page.locator(".device-card").count(), 6);
-  assert.equal(await page.locator("h1").first().textContent(), "Devices");
+  assert.equal(await page.locator("h1").first().textContent(), "Devices.");
   const beforeNameRefresh = requests.filter(request => request.path === "/api/cloud/inventory").length;
   await page.locator("#refresh-devices").click();
   await page.waitForFunction(() => !document.getElementById("refresh-devices").disabled);

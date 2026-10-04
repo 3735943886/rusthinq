@@ -71,6 +71,7 @@ pub struct Handle {
     admission: Arc<Mutex<Admission>>,
     status: watch::Receiver<Status>,
     client: watch::Receiver<Option<Arc<Client>>>,
+    inventory: Arc<watch::Sender<Option<(String, u64, serde_json::Value)>>>,
 }
 type ClientFactory = Arc<dyn Fn(&str) -> Result<Client, crate::cloud::Error> + Send + Sync>;
 pub struct Runtime {
@@ -107,6 +108,7 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
             })),
             status: watched,
             client: clients,
+            inventory: Arc::new(watch::channel(None).0),
         },
         Runtime {
             store,
@@ -120,6 +122,34 @@ pub fn new(store: Arc<dyn CredentialStore>) -> (Handle, Runtime) {
     )
 }
 impl Handle {
+    /// Share successful account inventory reads without issuing another LG request.
+    pub fn publish_inventory(&self, account: &str, epoch: u64, devices: serde_json::Value) {
+        let admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if devices.is_array()
+            && *admission.epoch.borrow() == epoch
+            && admission.client.borrow().as_ref().is_some_and(|client| {
+                client.authenticated() && client.account_identity() == Some(account)
+            })
+        {
+            self.inventory
+                .send_replace(Some((account.to_owned(), epoch, devices)));
+        }
+    }
+    pub fn inventory_updates(&self) -> watch::Receiver<Option<(String, u64, serde_json::Value)>> {
+        self.inventory.subscribe()
+    }
+    /// Refuse results belonging to a logged-out or replaced account lease.
+    pub fn inventory_snapshot(&self) -> Option<serde_json::Value> {
+        let admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = self.inventory.borrow();
+        let (account, epoch, devices) = saved.as_ref()?;
+        (*admission.epoch.borrow() == *epoch
+            && admission.client.borrow().as_ref().is_some_and(|client| {
+                client.authenticated() && client.account_identity() == Some(account.as_str())
+            }))
+        .then(|| devices.clone())
+    }
+
     /// Composition-only authenticated client snapshots. Never expose through adapters.
     /// Logout admission cancels existing leases before its checkpoint completes.
     pub fn clients(&self) -> watch::Receiver<Option<Arc<Client>>> {
@@ -144,6 +174,7 @@ impl Handle {
     /// Read-only cloud inventory, bound to the captured authenticated account lease.
     pub async fn list_devices(&self) -> Result<serde_json::Value, Error> {
         let mut cancelled = self.cancellation();
+        let epoch = *cancelled.borrow();
         let client = self.authenticated_client()?;
         let mut clients = self.clients();
         let account = client
@@ -163,7 +194,11 @@ impl Handle {
                 changed = clients.changed() => {
                     if changed.is_err() || !clients.borrow().as_ref().is_some_and(|c| c.authenticated() && c.account_identity() == Some(account.as_str())) { return Err(Error::Cancelled); }
                 }
-                result = &mut request => return result.map(|devices|serde_json::json!({"devices":devices})).map_err(|_|Error::Remote),
+                result = &mut request => {
+                    let devices = result.map_err(|_| Error::Remote)?;
+                    self.publish_inventory(&account, epoch, serde_json::json!(devices));
+                    return Ok(serde_json::json!({"devices":devices}));
+                },
             }
         }
     }
@@ -597,6 +632,7 @@ mod tests {
             })),
             status: watched,
             client: watch::channel(None).1,
+            inventory: Arc::new(watch::channel(None).0),
         };
         assert!(handle.status().logged_in);
         tokio::time::advance(std::time::Duration::from_secs(5)).await;

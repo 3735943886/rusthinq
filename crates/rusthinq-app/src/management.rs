@@ -590,6 +590,18 @@ async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<b
     let mut account_changes = handle
         .account_handle()
         .map(|account| account.status_updates());
+    #[cfg(feature = "bridge")]
+    let account = handle.account_handle();
+    #[cfg(feature = "bridge")]
+    let mut inventory_changes = account.as_ref().map(|account| account.inventory_updates());
+    #[cfg(feature = "bridge")]
+    if let Some(inventory) = account
+        .as_ref()
+        .and_then(|account| account.inventory_snapshot())
+    {
+        names.inventory(&inventory);
+        names.query_finished();
+    }
     loop {
         if *stop.borrow() {
             return;
@@ -618,6 +630,21 @@ async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<b
             tokio::select! {
                 _ = stop.changed() => return,
                 _ = names.wanted.notified() => break,
+                _ = async {
+                    #[cfg(feature = "bridge")]
+                    if let Some(changes) = inventory_changes.as_mut()
+                        && changes.changed().await.is_ok()
+                    {
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                } => {
+                    #[cfg(feature = "bridge")]
+                    if let Some(inventory) = account.as_ref().and_then(|account| account.inventory_snapshot()) {
+                        names.inventory(&inventory);
+                        names.query_finished();
+                    }
+                },
                 _ = async {
                     #[cfg(feature = "bridge")]
                     if let Some(changes) = account_changes.as_mut()
