@@ -8,7 +8,6 @@ members = [
     "crates/rusthinq-scripting",
     "crates/rusthinq-tools",
 ]
-exclude = ["legacy/0.1"]
 resolver = "2"
 
 [workspace.package]
