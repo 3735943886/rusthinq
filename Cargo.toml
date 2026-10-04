@@ -19,3 +19,11 @@ license = "GPL-2.0-or-later"
 [workspace.dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+# Keep unwind: script/native callback panics are isolated with catch_unwind.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

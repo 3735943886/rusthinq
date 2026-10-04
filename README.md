@@ -8,7 +8,7 @@ management API, web dashboard and MQTT output.
 workspace remains in [`legacy/0.1`](legacy/0.1) for reference and migration; 0.2
 does not depend on it or fall back to it. Protocol and integration tests provide
 local evidence, but real-appliance and live LG-account validation have not been
-performed for this release. See the [milestones](docs/0.2-milestones.md) for the
+performed for this release. See the [milestones](docs/0.2-validation.md#milestones) for the
 remaining release work.
 
 ## How 0.2 differs
@@ -57,8 +57,8 @@ see [operations](docs/0.2-operations.md) for its limits and delivery semantics.
 ## Build and run
 
 ```sh
-cargo build -p rusthinq-app --bin rusthinq
-cargo run -p rusthinq-app --bin rusthinq -- ./config.toml
+cargo build --release -p rusthinq-app --bin rusthinq
+cargo run --release -p rusthinq-app --bin rusthinq -- ./config.toml
 ```
 
 A local configuration example:
@@ -81,7 +81,7 @@ gui = true
 Prepare an existing valid CA and its private key before starting. Paths are
 relative to the configuration file, and parent directories must exist. This
 loopback example is for local use; connecting appliances also requires reachable
-listeners and device hostname routing. Follow the [runtime guide](docs/0.2-runtime.md)
+listeners and device hostname routing. Follow the [runtime guide](docs/0.2-runtime.md#runtime)
 for endpoint configuration.
 
 Open `http://127.0.0.1:44401/` for the dashboard. Its Devices, LG cloud, Activity
@@ -93,29 +93,32 @@ Add `drivers`, `external_mqtt` and `cloud_account` as needed using
 local script-output observation continue without it. LG authentication is also
 optional for local device service.
 
+For deployment use `--release`; the [build guide](docs/0.2-runtime.md#build) explains
+size optimization and debugging tradeoffs.
+
 ### Build variants
 
 The default build enables `bridge`, `scripting` and `gui`.
 
 ```sh
 # LG bridge and Rhai, without dashboard assets
-cargo build -p rusthinq-app --bin rusthinq --no-default-features --features bridge,scripting
+cargo build --release -p rusthinq-app --bin rusthinq --no-default-features --features bridge,scripting
 
 # Local transports and management, without LG bridge or Rhai
-cargo build -p rusthinq-app --bin rusthinq --no-default-features
+cargo build --release -p rusthinq-app --bin rusthinq --no-default-features
 ```
 
 ## Tools and diagnostics
 
 ```sh
-cargo build -p rusthinq-tools --bins
+cargo build --release -p rusthinq-tools --bins
 ```
 
 The tool suite includes CLI management, an MCP server, device/cloud capture,
 packet encode/decode, replay, SoftAP setup, migration and retained-output cleanup.
 MCP supports live device observation through `device_start`, `read_device` and
 `device_stop`, with bounded capture buffers, cursors, loss reporting and session
-snapshots. See [tool migration](docs/0.2-tools-migration.md) for commands and
+snapshots. See [tool migration](docs/0.2-tools-migration.md#tools-migration) for commands and
 configuration.
 
 ```sh
@@ -132,9 +135,9 @@ management events expose them separately where supported.
 
 ## Upgrading from 0.1
 
-Read the [release notes](docs/0.2-release-notes.md),
-[compatibility inventory](docs/0.2-compatibility.md) and
-[tool migration guide](docs/0.2-tools-migration.md) before switching runtimes.
+Read the [release notes](docs/0.2-tools-migration.md#release-notes),
+[compatibility inventory](docs/0.2-validation.md#compatibility) and
+[tool migration guide](docs/0.2-tools-migration.md#tools-migration) before switching runtimes.
 Configuration, management contracts and script host APIs have changed; this is
 not a drop-in binary replacement.
 
@@ -147,6 +150,9 @@ modifying the 0.1 source. Follow the migration guide for validation and rollback
 Model porting and deployment packaging are deferred until the host is complete;
 they are separate from the runtime architecture work.
 
+The [documentation index](docs/README.md) separates operating guides, architecture
+contracts and dated implementation evidence.
+
 ## Development and verification
 
 ```sh
@@ -157,8 +163,8 @@ scripts/check-0.2.sh
 
 The check script runs formatting, workspace tests, strict Clippy, eight feature
 combinations and GUI JavaScript checks. These checks do not establish live
-appliance compatibility. [Refactoring](docs/0.2-refactoring.md),
-[milestones](docs/0.2-milestones.md) and the
+appliance compatibility. [Refactoring](docs/0.2-runtime-implementation.md#refactoring),
+[milestones](docs/0.2-validation.md#milestones) and the
 [polling audit](docs/0.2-polling-audit.md) record implementation decisions,
 verification evidence and outstanding work.
 
