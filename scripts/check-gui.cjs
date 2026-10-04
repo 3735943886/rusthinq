@@ -41,6 +41,7 @@ const assert = require("node:assert/strict");
       "climate-01": {
         name: "Living room",
         model: "AIR_910604_WW",
+        deviceType: "401",
         platform: "ThinQ2",
         online: true,
         mapped: true,
@@ -246,6 +247,27 @@ const assert = require("node:assert/strict");
   await page.goto(base);
   await page.locator(".device-card").first().waitFor();
   assert.equal(await page.locator(".device-card").count(), 6);
+  assert.equal(await page.locator("h1").first().textContent(), "Devices");
+  const beforeNameRefresh = requests.filter(request => request.path === "/api/cloud/inventory").length;
+  await page.locator("#refresh-devices").click();
+  await page.waitForFunction(() => !document.getElementById("refresh-devices").disabled);
+  assert.ok(requests.filter(request => request.path === "/api/cloud/inventory").length > beforeNameRefresh);
+  const typeCatalog = await page.evaluate(() => Object.entries(UI.applianceTypes));
+  assert.equal(typeCatalog.filter(([type]) => /^\d+$/.test(type)).length, 40);
+  assert.equal(await page.locator("#device-types option").count(), 40);
+  for (const [deviceType, info] of typeCatalog) {
+    const rendered = await page.evaluate(type => ({name: UI.applianceIcon({deviceType: type}), svg: UI.icon(UI.applianceIcon({deviceType: type}))}), deviceType);
+    assert.equal(rendered.name, info.icon);
+    assert.ok(rendered.svg.includes("<svg"));
+    assert.notEqual(rendered.svg, await page.evaluate(() => UI.icon("device")));
+  }
+  const applianceIcons = await page.locator(".device-card .device-symbol").evaluateAll(nodes => nodes.map(node => node.innerHTML));
+  assert.ok(new Set(applianceIcons).size >= 3);
+  assert.equal(await page.evaluate(() => UI.applianceIcon({deviceType: "unknown", model: "Washer"})), "device");
+  for (const [deviceType, expected] of Object.entries({101:"refrigerator",103:"water",201:"washer",202:"dryer",203:"styler",204:"dishwasher",223:"tower",301:"oven",302:"microwave",303:"cooktop",401:"air",402:"purifier",403:"dehumidifier"})) {
+    assert.equal(await page.evaluate(type => UI.applianceIcon({deviceType: type}), deviceType), expected);
+  }
+
   assert.equal(await page.locator("#stat-online").textContent(), "4");
   assert.equal(await page.evaluate(() => !!window.bad), false);
   await page.waitForTimeout(400);

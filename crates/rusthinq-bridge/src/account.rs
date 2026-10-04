@@ -167,6 +167,10 @@ impl Handle {
             }
         }
     }
+    /// Read-only account status changes for application observers.
+    pub fn status_updates(&self) -> watch::Receiver<Status> {
+        self.status.clone()
+    }
     pub fn status(&self) -> Status {
         let mut status = self.status.borrow().clone();
         if status

@@ -74,12 +74,64 @@ impl Config {
     }
 }
 /// LG account aliases by device id, read from the account inventory (0.1 showed them).
-#[derive(Default)]
 struct NameCache {
     names: std::sync::Mutex<std::collections::HashMap<String, String>>,
     wanted: tokio::sync::Notify,
+    last_query: std::sync::Mutex<Option<tokio::time::Instant>>,
+    forced: std::sync::atomic::AtomicBool,
+    changed: watch::Sender<u64>,
+}
+impl Default for NameCache {
+    fn default() -> Self {
+        Self {
+            names: Default::default(),
+            wanted: Default::default(),
+            last_query: Default::default(),
+            forced: Default::default(),
+            changed: watch::channel(0).0,
+        }
+    }
 }
 impl NameCache {
+    fn begin_query(&self, force: bool) -> bool {
+        let mut last = self.last_query.lock().unwrap_or_else(|e| e.into_inner());
+        if !force && last.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return false;
+        }
+        *last = Some(tokio::time::Instant::now());
+        true
+    }
+    fn query_finished(&self) {
+        *self.last_query.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(tokio::time::Instant::now());
+    }
+    fn force_refresh(&self) {
+        self.forced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.refresh();
+    }
+    fn replace(&self, names: std::collections::HashMap<String, String>) {
+        let mut current = self.lock();
+        if *current != names {
+            *current = names;
+            self.changed
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+    fn inventory(&self, inventory: &Value) {
+        self.replace(
+            inventory
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| {
+                    let id = d["deviceId"].as_str()?;
+                    let alias = d["alias"].as_str().filter(|a| !a.trim().is_empty())?;
+                    Some((id.to_owned(), alias.to_owned()))
+                })
+                .collect(),
+        );
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, String>> {
         self.names.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -524,26 +576,70 @@ async fn health(State(app): State<App>) -> Json<Value> {
         json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow()),"diagnostics":app.handle.diagnostics()}),
     )
 }
-/// Refresh on explicit account changes and periodically for changes in the LG app.
+/// Device state and account changes only request reads; one owner performs LG I/O.
+fn name_refresh_scope(handle: &Handle) -> std::collections::BTreeMap<String, (u64, bool)> {
+    handle
+        .snapshot()
+        .into_iter()
+        .map(|device| (device.entry.id, (device.entry.incarnation, device.online)))
+        .collect()
+}
 async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<bool>) {
+    let mut events = handle.adapter_events();
+    #[cfg(feature = "bridge")]
+    let mut account_changes = handle
+        .account_handle()
+        .map(|account| account.status_updates());
     loop {
-        if handle.cloud_status()["account"]["loggedIn"] != true {
-            names.lock().clear();
-        } else if let Ok(inventory) = handle.cloud_inventory().await {
-            *names.lock() = inventory
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|d| {
-                    let id = d["deviceId"].as_str()?;
-                    let alias = d["alias"].as_str().filter(|a| !a.is_empty())?;
-                    Some((id.to_owned(), alias.to_owned()))
-                })
-                .collect();
+        if *stop.borrow() {
+            return;
         }
-        tokio::select! {_=stop.changed()=>{if *stop.borrow() {return;}},_=names.wanted.notified()=>{},_=tokio::time::sleep(Duration::from_secs(900))=>{}}
+        let scope = name_refresh_scope(&handle);
+        let logged_in = handle.cloud_status()["account"]["loggedIn"] == true;
+        let force = names
+            .forced
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !logged_in {
+            names.replace(Default::default());
+            *names.last_query.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        } else if names.begin_query(force) {
+            let inventory = tokio::select! {
+                _ = stop.changed() => return,
+                result = handle.cloud_inventory() => result,
+            };
+            names.query_finished();
+            if handle.cloud_status()["account"]["loggedIn"] != true {
+                names.replace(Default::default());
+            } else if let Ok(inventory) = inventory {
+                names.inventory(&inventory);
+            }
+        }
+        loop {
+            tokio::select! {
+                _ = stop.changed() => return,
+                _ = names.wanted.notified() => break,
+                _ = async {
+                    #[cfg(feature = "bridge")]
+                    if let Some(changes) = account_changes.as_mut()
+                        && changes.changed().await.is_ok()
+                    {
+                        return;
+                    }
+                    std::future::pending::<()>().await;
+                } => break,
+                event = events.recv() => {
+                    match event {
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Ok(event) if event["type"] != "stateChanged" => continue,
+                        _ => {}
+                    }
+                    if name_refresh_scope(&handle) != scope { break; }
+                },
+            }
+        }
     }
 }
+
 fn snapshot(handle: &Handle, names: &Names) -> Value {
     let names = names.lock().clone();
     let metadata = handle.metadata_snapshot();
@@ -909,6 +1005,7 @@ async fn panel(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
     app.names.refresh();
+    let mut names_changed = app.names.changed.subscribe();
     let mut events = app.handle.adapter_events(); // subscribe before snapshot
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket| async move {
         let _permit = permit;
@@ -917,6 +1014,9 @@ async fn panel(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
         if !write(&mut socket,snapshot(&app.handle, &app.names)).await {return;}
         loop {tokio::select! {
             _=stop.changed()=>break,
+            changed=names_changed.changed()=> {
+                if changed.is_err() || !write(&mut socket,snapshot(&app.handle, &app.names)).await {break;}
+            },
             message=socket.recv()=>if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;},
             event=events.recv()=> {
                 let lost = match event {Ok(value) if value["type"]=="lost"=>value["events"].as_u64().unwrap_or(0), Err(broadcast::error::RecvError::Lagged(count))=>count,Err(broadcast::error::RecvError::Closed)=>break,_=>0};
@@ -942,6 +1042,8 @@ async fn monitor(
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
     };
+    app.names.refresh();
+    let mut names_changed = app.names.changed.subscribe();
     let mut events = app.handle.adapter_events();
     upgrade.max_message_size(1_000_000).on_upgrade(move |mut socket| async move {
         let _permit = permit;
@@ -956,6 +1058,9 @@ async fn monitor(
         if !write(&mut socket,status(&app.handle)).await {return;}
         loop {tokio::select! {
             _=stop.changed()=>break,
+            changed=names_changed.changed()=> {
+                if changed.is_err() || !write(&mut socket,status(&app.handle)).await {break;}
+            },
             message=socket.recv()=>match message {
                 Some(Ok(Message::Text(text)))=>{
                     let result=tokio::select! {_=stop.changed()=>break,value=monitor_message(&app,&query.id,captured,&text)=>value};
@@ -991,7 +1096,13 @@ async fn write(socket: &mut WebSocket, value: Value) -> bool {
 
 /// Own HTTP tasks and drain upgraded sockets through their stop receiver/permits.
 async fn cloud_inventory(State(app): State<App>) -> Response {
-    cloud_result(app.handle.cloud_inventory().await)
+    app.names.begin_query(true); // Explicit user read bypasses the automatic refractory period.
+    let result = app.handle.cloud_inventory().await;
+    app.names.query_finished();
+    if let Ok(inventory) = &result {
+        app.names.inventory(inventory);
+    }
+    cloud_result(result)
 }
 async fn cloud_devices(State(app): State<App>) -> Json<Value> {
     Json(app.handle.cloud_devices())
@@ -1049,7 +1160,9 @@ async fn cloud_login(State(app): State<App>, Json(input): Json<CloudLogin>) -> R
 }
 async fn cloud_complete(State(app): State<App>, Json(input): Json<CloudComplete>) -> Response {
     let result = app.handle.cloud_complete(input.url).await;
-    app.names.refresh();
+    if result.is_ok() {
+        app.names.force_refresh();
+    }
     cloud_result(result)
 }
 async fn cloud_logout(State(app): State<App>) -> Response {
@@ -1058,7 +1171,11 @@ async fn cloud_logout(State(app): State<App>) -> Response {
     cloud_result(result)
 }
 async fn cloud_refresh(State(app): State<App>) -> Response {
-    cloud_result(app.handle.cloud_refresh().await)
+    let result = app.handle.cloud_refresh().await;
+    if result.is_ok() {
+        app.names.force_refresh();
+    }
+    cloud_result(result)
 }
 pub async fn serve(
     listener: TcpListener,
@@ -1141,6 +1258,205 @@ mod tests {
     use super::*;
     use crate::{lifecycle_storage::Storage, runtime::Runtime};
     use futures_util::StreamExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn names_do_not_refresh_merely_because_fifteen_minutes_passed() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let runtime = Runtime::new(
+            Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+            server.handle(),
+            Duration::ZERO,
+            128,
+        )
+        .unwrap();
+        let names = Names::default();
+        names.inventory(&json!([{"deviceId":"d","alias":"Initial"}]));
+        let mut changes = names.changed.subscribe();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(refresh_names(
+            runtime.handle().into(),
+            names.clone(),
+            stopped,
+        ));
+        changes.changed().await.unwrap();
+        names.inventory(&json!([{"deviceId":"d","alias":"No timer refresh"}]));
+        changes.borrow_and_update();
+        tokio::time::advance(Duration::from_secs(901)).await;
+        tokio::task::yield_now().await;
+        assert!(!changes.has_changed().unwrap());
+        names.refresh();
+        changes.changed().await.unwrap();
+        assert!(names.lock().is_empty());
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_name_reads_have_a_refractory_period_explicit_reads_bypass_it() {
+        let names = NameCache::default();
+        assert!(names.begin_query(false));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        names.query_finished();
+        assert!(!names.begin_query(false));
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(!names.begin_query(false));
+        assert!(names.begin_query(true));
+        names.query_finished();
+        assert!(!names.begin_query(false));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(names.begin_query(false));
+    }
+
+    #[tokio::test]
+    async fn names_refresh_on_start_online_and_offline_but_not_packet_traffic() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let mut server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let runtime = Runtime::new(
+            Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+            server.handle(),
+            Duration::ZERO,
+            128,
+        )
+        .unwrap();
+        let handle: Handle = runtime.handle().into();
+        let names = Names::default();
+        names.inventory(&json!([{"deviceId":"d","alias":"Previous account"}]));
+        let mut changes = names.changed.subscribe();
+        let (stop, stopped) = watch::channel(false);
+        let runtime_task = tokio::spawn(runtime.run(stopped.clone()));
+        let refresh_task = tokio::spawn(refresh_names(handle.clone(), names.clone(), stopped));
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(names.lock().is_empty()); // Startup clears names while logged out.
+        names.inventory(&json!([{"deviceId":"d","alias":"Pending online refresh"}]));
+        changes.borrow_and_update();
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        server.admit(stream).unwrap();
+        let payload = json!({"Header":{"x-lgedm-deviceId":"d"},"Body":{"Cmd":"Mon"}}).to_string();
+        let frame = rusthinq_protocol::thinq1::encode(payload.as_bytes(), 8192).unwrap();
+        peer.write_all(&frame).await.unwrap();
+        let size = timeout(Duration::from_secs(3), peer.read_u32())
+            .await
+            .unwrap()
+            .unwrap();
+        peer.read_exact(&mut vec![0; size as usize]).await.unwrap();
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(names.lock().is_empty());
+        assert!(handle.snapshot()[0].online);
+        names.inventory(&json!([{"deviceId":"d","alias":"Pending offline refresh"}]));
+        changes.borrow_and_update();
+        peer.write_all(&frame).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(1500), changes.changed())
+                .await
+                .is_err()
+        );
+        drop(peer);
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(names.lock().is_empty());
+        assert!(!handle.snapshot()[0].online);
+        stop.send_replace(true);
+        timeout(Duration::from_secs(3), refresh_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), runtime_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn alias_updates_push_dashboard_without_device_traffic() {
+        use futures_util::StreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        let server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let runtime = Runtime::new(
+            Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+            server.handle(),
+            Duration::ZERO,
+            2,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let names = Names::default();
+        let routes = build(App {
+            handle: runtime.handle().into(),
+            names: names.clone(),
+            config: Config {
+                bind: address,
+                gui: true,
+                credentials: None,
+                raw_inject_toggle: false,
+                raw_inject: Default::default(),
+            },
+            stop: stopped.clone(),
+            sockets: Arc::new(Semaphore::new(64)),
+            analysis: Arc::new(Semaphore::new(2)),
+            observer: crate::cloud_observer::Observer::new(false),
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, routes)
+                .with_graceful_shutdown(async move {
+                    let mut stopped = stopped;
+                    let _ = stopped.changed().await;
+                })
+                .await
+                .unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        let initial = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(initial.to_text().unwrap()).unwrap()["devices"]
+                .is_object()
+        );
+        names.inventory(
+            &json!([{"deviceId":"d","alias":"Laundry room"},{"deviceId":"blank","alias":" "}]),
+        );
+        assert_eq!(names.lock().get("d").unwrap(), "Laundry room");
+        assert!(!names.lock().contains_key("blank"));
+        let update = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(update.to_text().unwrap()).unwrap()["devices"]
+                .is_object()
+        );
+        let mut changes = names.changed.subscribe();
+        names.inventory(&json!([{"deviceId":"d","alias":"Laundry room"}]));
+        assert!(!changes.has_changed().unwrap());
+        names.replace(Default::default());
+        changes.changed().await.unwrap();
+        assert!(names.lock().is_empty());
+        stop.send_replace(true);
+        drop(socket);
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn websocket_consumers_report_loss_then_resume_and_join_shutdown() {

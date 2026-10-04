@@ -1,6 +1,6 @@
 /* Dashboard state, device operations and service health. */
 (() => {
-  const { $, icon, api, toast, confirm, busy, text, relative } = UI;
+  const { $, icon, applianceIcon, api, toast, confirm, busy, text, relative } = UI;
   let snapshot = { devices: {}, features: {} },
     connected = false,
     received = false,
@@ -174,7 +174,7 @@
     $("device-empty").hidden = visible.length > 0 || !received;
     $("device-empty").querySelector("h2").textContent = entries.length
       ? "No matching devices"
-      : "Your workspace is ready";
+      : "Device data loaded";
     $("device-empty").querySelector("p").textContent = entries.length
       ? "Try a different search or filter."
       : "Devices will appear here as soon as they connect to rusthinq.";
@@ -213,7 +213,7 @@
     top.className = "card-top";
     const symbol = document.createElement("span");
     symbol.className = "device-symbol";
-    symbol.innerHTML = icon("device");
+    symbol.innerHTML = icon(applianceIcon(device));
     top.append(
       symbol,
       badge(
@@ -264,13 +264,15 @@
     );
     details.insertAdjacentHTML("beforeend", icon("arrow"));
     footer.append(details);
-    const children = [
-      top,
-      text("h2", deviceName(id, device)),
-      text("p", device.model || "Model not reported", "device-model"),
-      text("p", id, "device-id"),
-      facts,
-    ];
+    const title = deviceName(id, device);
+    const model = device.modelName || device.model;
+    const children = [top, text("h2", title)];
+    if (model && model !== title && model !== id)
+      children.push(text("p", model, "device-model"));
+    else if (!model || model === id)
+      children.push(text("p", "Model not reported", "device-model"));
+    if (title !== id) children.push(text("p", id, "device-id"));
+    children.push(facts);
     if (device.bridgeError || device.removal)
       children.push(
         text("p", device.bridgeError || device.removal, "device-warning"),
@@ -376,7 +378,7 @@
             async () => {
               pairing = { id: selected.id, incarnation: selected.incarnation };
               $("pair-description").textContent =
-                `Register ${deviceName(selected.id, device)} with your LG account. Use the device type reported during setup.`;
+                `Register ${deviceName(selected.id, device)} with the LG account. Use the device type reported during setup.`;
               $("pair-type").value = device.deviceType || "";
               $("pair-alias").value = deviceName(selected.id, device);
               $("pair-dialog").showModal();
@@ -526,8 +528,8 @@
       ? "LG cloud is not configured for this runtime."
       : state.error ||
         (loggedIn
-          ? "Your account is ready. Manage individual bridges from each device."
-          : "Connect your account to pair devices and enable cloud bridges.");
+          ? "Signed in. Bridge controls are available on each device."
+          : "Sign in to pair devices and enable cloud bridges.");
     $("cloud-login").hidden = loggedIn;
     $("cloud-login").disabled = !connected || !account.enabled || !!state.busy;
     $("cloud-refresh").hidden = !state.stored;
@@ -537,7 +539,7 @@
     $("load-inventory").disabled = !connected || !loggedIn || !!state.busy;
     if (!loggedIn)
       $("cloud-inventory").replaceChildren(
-        text("p", "Connect your account to view its devices.", "muted"),
+        text("p", "Sign in to view LG account devices.", "muted"),
       );
     renderDevices();
     renderDetail();
@@ -635,7 +637,22 @@
   $("device-search").oninput = renderDevices;
   $("device-sort").onchange = renderDevices;
   $("refresh-devices").onclick = () =>
-    busy($("refresh-devices"), refreshDevices);
+    busy($("refresh-devices"), async () => {
+      await refreshDevices();
+      try {
+        account = await api("api/cloud");
+        renderAccount();
+        if (account.enabled && account.account?.loggedIn) {
+          const devices = await api("api/cloud/inventory");
+          await refreshDevices();
+          if (Object.keys(snapshot.devices).length && !devices.some(device =>
+            snapshot.devices[device.deviceId] && typeof device.alias === "string" && device.alias.trim()))
+            toast("No matching LG device names were found.");
+        }
+      } catch (error) {
+        toast(`LG device names could not be refreshed: ${error.message}`, "error");
+      }
+    });
   $("cloud-login").onclick = () => {
     $("login-dialog").showModal();
     $("country-code").focus();
@@ -651,14 +668,14 @@
       if (
         await confirm(
           "Sign out of LG?",
-          "Saved account credentials will be removed and cloud connections will stop. Your local devices remain available.",
+          "Saved account credentials will be removed and cloud connections will stop. Local devices remain available.",
           "Sign out",
         )
       ) {
         await api("api/cloud/logout", {});
         await refreshServices();
         $("cloud-inventory").replaceChildren(
-          text("p", "Connect your account to view its devices.", "muted"),
+          text("p", "Sign in to view LG account devices.", "muted"),
         );
         toast("Signed out of LG.");
       }
@@ -672,7 +689,7 @@
           row.className = "inventory-item";
           const symbol = document.createElement("span");
           symbol.className = "device-symbol";
-          symbol.innerHTML = icon("device");
+          symbol.innerHTML = icon(applianceIcon(device));
           const info = document.createElement("div");
           info.append(
             text("strong", device.alias || device.modelName || "LG device"),
