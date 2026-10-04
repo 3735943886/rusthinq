@@ -1,8 +1,0 @@
-.claude/
-target/
-*.pcap
-# Generated on first run per config.toml's ca_key_file/ca_cert_file defaults --
-# never commit a CA private key.
-ca.key
-ca.cert
-Cargo.lock
