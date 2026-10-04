@@ -47,6 +47,9 @@
 }
 * {
   box-sizing: border-box;
+  /* Apply directly: nested scroll containers can stop ancestor touch-action
+     handling in Safari. Preserve scrolling and pinch zoom everywhere. */
+  touch-action: manipulation;
 }
 body {
   margin: 0;
@@ -1463,4 +1466,13 @@ select:focus {
 .control-row input[role="switch"]:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+@media (max-width: 800px), (pointer: coarse) {
+  /* Keep focused controls above the mobile Safari auto-zoom threshold. */
+  :root input,
+  :root select,
+  :root textarea {
+    font-size: 16px;
+  }
 }
