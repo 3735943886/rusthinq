@@ -1,12 +1,7 @@
 //! Durable pairing intent inventory. Callers run filesystem operations off I/O tasks.
 use rusthinq_bridge::pairing::Material;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, io, path::Path};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Owner {
@@ -36,12 +31,9 @@ struct Checkpoint {
     records: BTreeMap<String, Record>,
 }
 pub struct Store {
-    path: PathBuf,
-    parent: PathBuf,
-    _lock: File,
+    file: crate::checkpoint::Checkpoint,
     checkpoint: Checkpoint,
     capacity: usize,
-    uncertain: bool,
 }
 fn invalid() -> io::Error {
     io::Error::new(
@@ -64,28 +56,10 @@ impl Store {
         if capacity == 0 || capacity > 256 || path.file_name().is_none() {
             return Err(invalid());
         }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let mut lock_path = path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(PathBuf::from(lock_path))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        let file = crate::checkpoint::Checkpoint::open(path)?;
         let maximum = capacity * 262144 + 1024;
-        let checkpoint = match File::open(path) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take((maximum + 1) as u64).read_to_end(&mut bytes)?;
-                if bytes.len() > maximum {
-                    return Err(invalid());
-                }
+        let checkpoint = match file.read(maximum)? {
+            Some(bytes) => {
                 let saved: Checkpoint = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
                 if saved.schema != 1 || saved.records.len() > capacity {
                     return Err(invalid());
@@ -104,20 +78,16 @@ impl Store {
                 }
                 saved
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Checkpoint {
+            None => Checkpoint {
                 schema: 1,
                 next: 0,
                 records: BTreeMap::new(),
             },
-            Err(error) => return Err(error),
         };
         Ok(Self {
-            path: path.into(),
-            parent,
-            _lock: lock,
+            file,
             checkpoint,
             capacity,
-            uncertain: false,
         })
     }
     pub fn snapshot(&self) -> Vec<Record> {
@@ -241,31 +211,19 @@ impl Store {
         Ok(())
     }
     fn commit(&mut self, next: Checkpoint) -> io::Result<()> {
-        if self.uncertain {
-            return Err(io::Error::other(
-                "pairing checkpoint uncertain; reopen required",
-            ));
-        }
+        self.file
+            .ensure_ready("pairing checkpoint uncertain; reopen required")?;
         let bytes = serde_json::to_vec(&next).map_err(|_| invalid())?;
         if bytes.len() > self.capacity * 262144 + 1024 {
             return Err(invalid());
         }
-        let result = (|| {
-            let mut file = tempfile::Builder::new()
-                .prefix(".pairing-")
-                .tempfile_in(&self.parent)?;
-            file.write_all(&bytes)?;
-            file.as_file().sync_all()?;
-            file.persist(&self.path).map_err(|error| error.error)?;
-            File::open(&self.parent)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.uncertain = true;
-        } else {
-            self.checkpoint = next;
-        }
-        result
+        self.file.replace(
+            &bytes,
+            ".pairing-",
+            "pairing checkpoint uncertain; reopen required",
+        )?;
+        self.checkpoint = next;
+        Ok(())
     }
 }
 #[cfg(test)]

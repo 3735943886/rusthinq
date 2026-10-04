@@ -71,7 +71,7 @@ pub enum CleanupStatus {
     Failed(String),
 }
 type CleanupState = watch::Receiver<(Vec<Device>, bool)>;
-type CleanupStart = Box<dyn FnOnce(CleanupState) -> JoinHandle<io::Result<()>> + Send>;
+type CleanupStart = Box<dyn FnOnce(CleanupState) -> crate::task::OwnedTask<io::Result<()>> + Send>;
 #[cfg(feature = "scripting")]
 struct ApplicationSink(
     broadcast::Sender<Event>,
@@ -307,7 +307,7 @@ pub struct Runtime {
     deadline: Option<Duration>,
     commands: mpsc::Receiver<ManagementCommand>,
     closes: JoinSet<Input>,
-    cleanup: Option<JoinHandle<io::Result<()>>>,
+    cleanup: Option<crate::task::OwnedTask<io::Result<()>>>,
     cleanup_state: watch::Sender<(Vec<Device>, bool)>,
     attach: mpsc::Receiver<AttachCleanup>,
     #[cfg(feature = "bridge")]
@@ -1458,7 +1458,9 @@ fn cleanup_start<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    Box::new(move |state| tokio::spawn(crate::lifecycle_cleanup::run(session, ledger, state)))
+    Box::new(move |state| {
+        crate::task::OwnedTask::spawn(crate::lifecycle_cleanup::run(session, ledger, state))
+    })
 }
 
 #[cfg(not(feature = "scripting"))]

@@ -5,12 +5,40 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::{broadcast, watch};
+const MAX_EVENT_BYTES: usize = 524288;
+const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HISTORY_EVENTS: usize = 1000;
+const MAX_PAGE_EVENTS: usize = 200;
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum Status {
+    Disabled,
+    #[cfg(feature = "bridge")]
+    WaitingForLogin,
+    #[cfg(feature = "bridge")]
+    Connecting,
+    #[cfg(feature = "bridge")]
+    IdentityFailed,
+    #[cfg(feature = "bridge")]
+    Subscribing,
+    #[cfg(feature = "bridge")]
+    Connected,
+    #[cfg(feature = "bridge")]
+    Reconnecting,
+}
+
+struct Recorded {
+    sequence: u64,
+    bytes: usize,
+    value: Value,
+}
 struct State {
-    status: &'static str,
+    status: Status,
     sequence: u64,
     evicted: u64,
     bytes: usize,
-    events: VecDeque<Value>,
+    events: VecDeque<Recorded>,
 }
 #[derive(Clone)]
 pub struct Observer {
@@ -25,7 +53,7 @@ impl Observer {
         let (events, _) = broadcast::channel(256);
         Self {
             state: Arc::new(Mutex::new(State {
-                status: "disabled",
+                status: Status::Disabled,
                 sequence: 0,
                 evicted: 0,
                 bytes: 0,
@@ -48,104 +76,102 @@ impl Observer {
         }
         self.wanted.send_replace(enabled);
         if !enabled {
-            self.status("disabled");
+            self.status(Status::Disabled);
         }
         Ok(())
     }
-    fn status(&self, status: &'static str) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).status = status;
+    fn status(&self, status: Status) {
+        let mut state = self.lock();
+        state.status = status;
         let _ = self
             .events
             .send(json!({"type":"cloudStatus","status":status,"enabled":self.enabled()}));
     }
     pub fn clear(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock();
         state.events.clear();
         state.bytes = 0;
         state.evicted = 0;
-        drop(state);
+        // Serialize reset with record + broadcast, so an old record cannot follow it.
         let _ = self.events.send(json!({"type":"cloudReset"}));
     }
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
     pub fn snapshot(&self, cursor: u64, limit: usize, device: Option<&str>) -> Value {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock();
         let first = state
             .events
             .front()
-            .and_then(|v| v["sequence"].as_str())
-            .and_then(|v| v.parse::<u64>().ok())
+            .map(|event| event.sequence)
             .unwrap_or(state.sequence.saturating_add(1));
         let mut bytes = 0;
-        let selected: Vec<_> = state
+        let mut next = cursor;
+        let mut selected = Vec::new();
+        // Advance over scanned records even if device filtering removes them.
+        for event in state
             .events
             .iter()
-            .filter(|v| {
-                v["sequence"]
-                    .as_str()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .is_some_and(|s| s > cursor)
-            })
-            .take(limit.min(200))
-            .take_while(|value| {
-                let size = value.to_string().len();
-                if bytes > 0 && bytes + size > 524288 {
-                    return false;
-                }
-                bytes += size;
-                true
-            })
-            .cloned()
-            .collect();
-        let next = selected
-            .last()
-            .and_then(|v| v["sequence"].as_str())
-            .unwrap_or("")
-            .to_string();
-        let selected: Vec<_> = selected
-            .into_iter()
-            .filter(|v| {
-                device.is_none_or(|id| {
-                    v["devices"]
-                        .as_array()
-                        .is_some_and(|ids| ids.is_empty() || ids.iter().any(|v| v == id))
-                })
-            })
-            .collect();
-        json!({"available":self.available,"enabled":self.enabled(),"status":state.status,"events":selected,"nextCursor":if cursor>state.sequence{"0".into()}else if next.is_empty(){cursor.to_string()}else{next},"cursor":state.sequence.to_string(),"evicted":state.evicted,"reset":cursor>state.sequence,"lost":cursor!=0&&cursor.saturating_add(1)<first,"buffered":state.events.len()})
+            .filter(|event| event.sequence > cursor)
+            .take(limit.min(MAX_PAGE_EVENTS))
+        {
+            if bytes > 0 && bytes + event.bytes > MAX_EVENT_BYTES {
+                break;
+            }
+            bytes += event.bytes;
+            next = event.sequence;
+            if device.is_none_or(|id| matches_device(&event.value, id)) {
+                selected.push(&event.value);
+            }
+        }
+        json!({
+            "available": self.available,
+            "enabled": self.enabled(),
+            "status": state.status,
+            "events": selected,
+            "nextCursor": if cursor > state.sequence { "0".into() } else { next.to_string() },
+            "cursor": state.sequence.to_string(),
+            "evicted": state.evicted,
+            "reset": cursor > state.sequence,
+            "lost": cursor != 0 && cursor.saturating_add(1) < first,
+            "buffered": state.events.len(),
+        })
     }
     pub fn record(&self, mut value: Value) {
-        let bytes = value.to_string().len();
-        if bytes > 524288 {
+        if !value.is_object() || value.to_string().len() > MAX_EVENT_BYTES {
             return;
         }
         let mut ids = Vec::new();
         collect_ids(&value["payload"], 0, &mut ids);
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let correlation = if ids.is_empty() { "account" } else { "device" };
+        let mut state = self.lock();
         let Some(sequence) = state.sequence.checked_add(1) else {
             return;
         };
-        state.sequence = sequence;
         value["type"] = json!("cloudNotification");
         value["k"] = json!("cloud");
         value["t"] = json!(crate::observability::now_ms());
         value["sequence"] = json!(sequence.to_string());
         value["devices"] = json!(ids);
-        value["correlation"] = json!(
-            if value["devices"].as_array().is_some_and(|v| v.is_empty()) {
-                "account"
-            } else {
-                "device"
-            }
-        );
+        value["correlation"] = json!(correlation);
         let bytes = value.to_string().len();
+        if bytes > MAX_EVENT_BYTES {
+            return;
+        }
+        state.sequence = sequence;
         state.bytes += bytes;
-        state.events.push_back(value.clone());
-        while state.events.len() > 1000 || state.bytes > 8 * 1024 * 1024 {
+        state.events.push_back(Recorded {
+            sequence,
+            bytes,
+            value: value.clone(),
+        });
+        while state.events.len() > MAX_HISTORY_EVENTS || state.bytes > MAX_HISTORY_BYTES {
             if let Some(old) = state.events.pop_front() {
-                state.bytes = state.bytes.saturating_sub(old.to_string().len());
+                state.bytes -= old.bytes;
                 state.evicted = state.evicted.saturating_add(1);
             }
         }
-        drop(state);
+        // Queue under the same lock as clear(): delivery order follows history order.
         let _ = self.events.send(value);
     }
     #[cfg(feature = "bridge")]
@@ -163,24 +189,37 @@ impl Observer {
         let mut epoch = account.cancellation();
         while !*stop.borrow() {
             if !self.enabled() {
-                tokio::select! {_=stop.changed()=>break,_=wanted.changed()=>{},_ = epoch.changed()=>{self.clear();}};
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = wanted.changed() => {},
+                    _ = epoch.changed() => self.clear(),
+                };
                 continue;
             }
             let client = clients.borrow_and_update().clone();
             let Some(client) = client else {
-                self.status("waitingForLogin");
+                self.status(Status::WaitingForLogin);
                 self.clear();
-                tokio::select! {_=stop.changed()=>break,_=wanted.changed()=>{},_=clients.changed()=>{},_=epoch.changed()=>{self.clear();}};
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = wanted.changed() => {},
+                    _ = clients.changed() => {},
+                    _ = epoch.changed() => self.clear(),
+                };
                 continue;
             };
             epoch.borrow_and_update();
-            self.status("connecting");
+            self.status(Status::Connecting);
             // Await pure key generation before cancellation so shutdown owns its worker.
             let identity =
                 tokio::task::spawn_blocking(rusthinq_bridge::notifications::identity).await;
             let Ok(Ok((key, csr))) = identity else {
-                self.status("identityFailed");
-                tokio::select! {_=stop.changed()=>break,_=wanted.changed()=>{},_=tokio::time::sleep(Duration::from_secs(5))=>{}};
+                self.status(Status::IdentityFailed);
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = wanted.changed() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                };
                 continue;
             };
             if *stop.borrow() || !self.enabled() {
@@ -199,28 +238,59 @@ impl Observer {
                 let stream = connector.connect().await?;
                 Ok::<_, std::io::Error>((stream, subscription.client_id, subscription.filters))
             };
-            let ready = tokio::select! {biased;_=stop.changed()=>break,_=wanted.changed()=>continue,_=epoch.changed()=>{self.clear();continue;},_=clients.changed()=>{self.clear();continue;},value=connection=>value};
+            let ready = tokio::select! {
+                biased;
+                _ = stop.changed() => break,
+                _ = wanted.changed() => continue,
+                _ = epoch.changed() => { self.clear(); continue; },
+                _ = clients.changed() => { self.clear(); continue; },
+                value = connection => value,
+            };
             if let Ok((stream, id, filters)) = ready {
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let session =
                     rusthinq_bridge::notifications::run(stream, &id, &filters, tx, stop.clone());
                 tokio::pin!(session);
                 // Connected transport; subscription completion is reported by the first event below.
-                self.status("subscribing");
+                self.status(Status::Subscribing);
                 loop {
-                    tokio::select! {biased;_=stop.changed()=>return,_=wanted.changed()=>break,_=epoch.changed()=>{self.clear();break;},_=clients.changed()=>{self.clear();break;},_=&mut session=>break,value=rx.recv()=>if let Some(value)=value {if value["type"]=="ready" {self.status("connected");}else {self.record(value);}}else{break;}}
+                    tokio::select! {
+                        biased;
+                        _ = stop.changed() => return,
+                        _ = wanted.changed() => break,
+                        _ = epoch.changed() => { self.clear(); break; },
+                        _ = clients.changed() => { self.clear(); break; },
+                        _ = &mut session => break,
+                        value = rx.recv() => {
+                            let Some(value) = value else { break; };
+                            if value["type"] == "ready" { self.status(Status::Connected); }
+                            else { self.record(value); }
+                        },
+                    }
                 }
             }
             if !self.enabled() {
-                self.status("disabled");
+                self.status(Status::Disabled);
                 continue;
             }
-            self.status("reconnecting");
-            tokio::select! {_=stop.changed()=>break,_=wanted.changed()=>{},_=epoch.changed()=>{self.clear();},_=clients.changed()=>{self.clear();},_=tokio::time::sleep(Duration::from_secs(5))=>{}}
+            self.status(Status::Reconnecting);
+            tokio::select! {
+                _ = stop.changed() => break,
+                _ = wanted.changed() => {},
+                _ = epoch.changed() => self.clear(),
+                _ = clients.changed() => self.clear(),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            }
         }
-        self.status("disabled");
+        self.status(Status::Disabled);
     }
 }
+pub(crate) fn matches_device(value: &Value, device: &str) -> bool {
+    value["devices"]
+        .as_array()
+        .is_some_and(|ids| ids.is_empty() || ids.iter().any(|id| id == device))
+}
+
 fn collect_ids(value: &Value, depth: usize, ids: &mut Vec<String>) {
     if depth > 8 || ids.len() >= 64 {
         return;
@@ -228,6 +298,9 @@ fn collect_ids(value: &Value, depth: usize, ids: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
+                if ids.len() >= 64 {
+                    break;
+                }
                 if matches!(key.as_str(), "deviceId" | "device_id" | "did") {
                     if let Some(id) = value
                         .as_str()
@@ -253,6 +326,36 @@ fn collect_ids(value: &Value, depth: usize, ids: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_or_oversized_envelopes_do_not_allocate_a_sequence() {
+        let observer = Observer::new(true);
+        observer.record(json!("invalid"));
+        observer.record(json!({"raw":"x".repeat(MAX_EVENT_BYTES - 15)}));
+        assert_eq!(observer.snapshot(0, 200, None)["cursor"], "0");
+        let payload: Vec<_> = (0..100).map(|id| json!({"did":id.to_string()})).collect();
+        observer.record(json!({"payload":payload}));
+        assert_eq!(
+            observer.snapshot(0, 200, None)["events"][0]["devices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+    #[test]
+    fn reset_and_notifications_are_broadcast_in_history_order() {
+        let observer = Observer::new(true);
+        let mut messages = observer.subscribe();
+        observer.record(json!({"payload":{"did":"before"}}));
+        observer.clear();
+        observer.record(json!({"payload":{"did":"after"}}));
+        assert_eq!(messages.try_recv().unwrap()["sequence"], "1");
+        assert_eq!(messages.try_recv().unwrap()["type"], "cloudReset");
+        assert_eq!(messages.try_recv().unwrap()["sequence"], "2");
+        let snapshot = observer.snapshot(0, 200, None);
+        assert_eq!(snapshot["events"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["events"][0]["sequence"], "2");
+    }
     #[test]
     fn bounded_history_exposes_gaps_filters_exact_ids_and_preserves_account_events() {
         let observer = Observer::new(true);

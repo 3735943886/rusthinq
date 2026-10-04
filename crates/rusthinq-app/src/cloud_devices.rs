@@ -25,7 +25,6 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    task::JoinHandle,
     time::timeout,
 };
 
@@ -129,8 +128,8 @@ impl Deregistration for Handle {
     }
 }
 struct Task {
-    stop: watch::Sender<bool>,
-    task: JoinHandle<io::Result<()>>,
+    stop: crate::task::Shutdown,
+    task: crate::task::OwnedTask<io::Result<()>>,
 }
 pub struct Runtime {
     store: Arc<Mutex<Store>>,
@@ -221,7 +220,7 @@ impl Runtime {
     }
     async fn stop_device(&mut self, id: &str) -> io::Result<()> {
         if let Some(task) = self.tasks.remove(id) {
-            task.stop.send_replace(true);
+            task.stop.stop();
             // A terminated session already reports its error in device status.
             // Disabling or retrying must still finish its cleanup.
             let _ = task
@@ -519,7 +518,7 @@ impl Runtime {
             .ok_or_else(stale)
     }
     fn start(&mut self, record: Record, registration: Registration) -> io::Result<()> {
-        let (stop, stopped) = watch::channel(false);
+        let (stop, stopped) = crate::task::Shutdown::new(false);
         let context = Context {
             app: self.app.clone(),
             account: self.account.clone(),
@@ -531,7 +530,7 @@ impl Runtime {
             statuses: self.handle.status.clone(),
         };
         let device = record.attempt.owner.device.clone();
-        let task = tokio::spawn(supervise(context, record, registration, stopped));
+        let task = crate::task::OwnedTask::spawn(supervise(context, record, registration, stopped));
         self.tasks.insert(device, Task { stop, task });
         Ok(())
     }

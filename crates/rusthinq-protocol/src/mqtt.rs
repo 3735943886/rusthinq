@@ -212,11 +212,15 @@ pub fn valid_filter(filter: &str) -> bool {
     if filter.is_empty() {
         return false;
     }
-    let levels: Vec<_> = filter.split('/').collect();
-    levels.iter().enumerate().all(|(i, level)| {
-        (!level.contains('#') || *level == "#" && i + 1 == levels.len())
-            && (!level.contains('+') || *level == "+")
-    })
+    let mut levels = filter.split('/').peekable();
+    while let Some(level) = levels.next() {
+        if (level.contains('#') && (level != "#" || levels.peek().is_some()))
+            || (level.contains('+') && level != "+")
+        {
+            return false;
+        }
+    }
+    true
 }
 pub fn matches(filter: &str, topic: &str) -> bool {
     if topic.starts_with('$') && !filter.starts_with('$') {

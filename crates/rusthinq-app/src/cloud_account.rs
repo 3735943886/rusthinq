@@ -3,8 +3,7 @@ use rusthinq_bridge::account::{CredentialStore, Credentials};
 pub use rusthinq_bridge::account::{Error, Handle, Runtime, Status};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -16,11 +15,8 @@ struct Checkpoint {
     credentials: Option<Credentials>,
 }
 struct Store {
-    path: PathBuf,
-    parent: PathBuf,
-    _lock: File,
+    file: crate::checkpoint::Checkpoint,
     credentials: Option<Credentials>,
-    uncertain: bool,
 }
 fn invalid() -> io::Error {
     io::Error::new(
@@ -33,27 +29,9 @@ impl Store {
         if path.file_name().is_none() {
             return Err(invalid());
         }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let mut lock_path = path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(PathBuf::from(lock_path))?;
-        lock.try_lock().map_err(io::Error::other)?;
-        let credentials = match File::open(path) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(32769).read_to_end(&mut bytes)?;
-                if bytes.len() > 32768 {
-                    return Err(invalid());
-                }
+        let file = crate::checkpoint::Checkpoint::open(path)?;
+        let credentials = match file.read(32768)? {
+            Some(bytes) => {
                 let saved: Checkpoint = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
                 if saved.schema != 1 {
                     return Err(invalid());
@@ -63,23 +41,13 @@ impl Store {
                 }
                 saved.credentials
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+            None => None,
         };
-        Ok(Self {
-            path: path.into(),
-            parent,
-            _lock: lock,
-            credentials,
-            uncertain: false,
-        })
+        Ok(Self { file, credentials })
     }
     fn save(&mut self, credentials: Option<Credentials>) -> io::Result<()> {
-        if self.uncertain {
-            return Err(io::Error::other(
-                "cloud checkpoint uncertain; restart required",
-            ));
-        }
+        self.file
+            .ensure_ready("cloud checkpoint uncertain; restart required")?;
         if let Some(credentials) = &credentials {
             validate(credentials)?;
         }
@@ -88,22 +56,13 @@ impl Store {
             credentials: credentials.clone(),
         })
         .map_err(|_| invalid())?;
-        let result = (|| {
-            let mut temporary = tempfile::Builder::new()
-                .prefix(".cloud-account-")
-                .tempfile_in(&self.parent)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file().sync_all()?;
-            temporary.persist(&self.path).map_err(|error| error.error)?;
-            File::open(&self.parent)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.uncertain = true;
-        } else {
-            self.credentials = credentials;
-        }
-        result
+        self.file.replace(
+            &bytes,
+            ".cloud-account-",
+            "cloud checkpoint uncertain; restart required",
+        )?;
+        self.credentials = credentials;
+        Ok(())
     }
 }
 fn validate(credentials: &Credentials) -> io::Result<()> {

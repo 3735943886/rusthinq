@@ -8,7 +8,7 @@ license.workspace = true
 rusthinq-scripting = { path = "../rusthinq-scripting" }
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["signal", "io-std"] }
+tokio = { workspace = true, features = ["signal", "io-std", "fs"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "json"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = "0.3"

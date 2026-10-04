@@ -147,9 +147,9 @@ impl Service {
             runtime,
             local,
         } = self;
-        let (front_stop, front_stopped) = watch::channel(false);
-        let (app_stop, app_stopped) = watch::channel(false);
-        let mut app = tokio::spawn(runtime.run(app_stopped));
+        let (front_stop, front_stopped) = crate::task::Shutdown::new(false);
+        let (app_stop, app_stopped) = crate::task::Shutdown::new(false);
+        let mut app = crate::task::OwnedTask::spawn(runtime.run(app_stopped));
         let mut app_result = None;
         let mut fronts = JoinSet::new();
         // Dropping the transport server stops the state it shares with the broker, so an
@@ -190,7 +190,7 @@ impl Service {
             }
         }
         broker.stop();
-        front_stop.send_replace(true);
+        front_stop.stop();
         while let Some(result) = fronts.join_next().await {
             let error = match result {
                 Ok(Ok(())) => None,
@@ -204,7 +204,7 @@ impl Service {
         if let Some(server) = unserved {
             server.shutdown().await;
         }
-        app_stop.send_replace(true);
+        app_stop.stop();
         let app_result = match app_result {
             Some(result) => result,
             None => app.await,

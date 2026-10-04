@@ -15,26 +15,18 @@ struct Owned {
 pub struct Call {
     owner: Arc<()>,
     binding: u64,
-    device: String,
-    session: SessionKey,
-    generation: u64,
+    context: Context,
     invocation: Invocation,
 }
 pub struct Completion {
     owner: Arc<()>,
     binding: u64,
-    device: String,
-    session: SessionKey,
-    generation: u64,
+    context: Context,
     outcome: Outcome,
 }
 impl Completion {
     pub fn context(&self) -> Context {
-        Context {
-            device: self.device.clone(),
-            session: self.session,
-            generation: self.generation,
-        }
+        self.context.clone()
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -57,15 +49,7 @@ impl DataEncoding {
     pub(crate) fn encode(&self, data: &[u8]) -> Result<String, String> {
         match self {
             Self::Utf8 => String::from_utf8(data.to_vec()).map_err(|error| error.to_string()),
-            Self::Hex => {
-                let mut result = String::with_capacity(data.len().saturating_mul(2));
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                for byte in data {
-                    result.push(HEX[usize::from(byte >> 4)] as char);
-                    result.push(HEX[usize::from(byte & 15)] as char);
-                }
-                Ok(result)
-            }
+            Self::Hex => Ok(rusthinq_protocol::hex::encode(data)),
         }
     }
 }
@@ -74,9 +58,7 @@ impl Call {
         Ok(Completion {
             owner: self.owner,
             binding: self.binding,
-            device: self.device,
-            session: self.session,
-            generation: self.generation,
+            context: self.context,
             outcome: self.invocation.wait().await?,
         })
     }
@@ -226,9 +208,11 @@ impl Owner {
         Ok(Call {
             owner: self.identity.clone(),
             binding: owned.binding,
-            device: id.into(),
-            session: owned.session,
-            generation,
+            context: Context {
+                device: id.into(),
+                session: owned.session,
+                generation,
+            },
             invocation,
         })
     }
@@ -263,15 +247,18 @@ impl Owner {
             return Err(Error::Stopped);
         }
         self.reconcile(devices);
-        let owned = self.workers.get(&completion.device).ok_or(Error::Stale)?;
+        let owned = self
+            .workers
+            .get(&completion.context.device)
+            .ok_or(Error::Stale)?;
         let generation = match *owned.worker.handle().status().borrow() {
             rusthinq_scripting::worker::Status::Running { generation }
             | rusthinq_scripting::worker::Status::Faulted { generation, .. } => generation,
             rusthinq_scripting::worker::Status::Stopped { .. } => return Err(Error::Stopped),
         };
         if owned.binding != completion.binding
-            || owned.session != completion.session
-            || completion.generation != generation
+            || owned.session != completion.context.session
+            || completion.context.generation != generation
             || completion.outcome.generation != generation
         {
             return Err(Error::Stale);

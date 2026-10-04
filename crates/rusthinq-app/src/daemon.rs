@@ -683,10 +683,10 @@ impl Daemon {
         self.service.handle()
     }
     pub async fn serve(self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
-        let (signer_stop, signer_stopped) = watch::channel(false);
-        let signer = tokio::spawn(self.signer.run(signer_stopped));
-        let (core_stop, core_stopped) = watch::channel(*stop.borrow());
-        let (services_stop, services_stopped) = watch::channel(false);
+        let (signer_stop, signer_stopped) = crate::task::Shutdown::new(false);
+        let signer = crate::task::OwnedTask::spawn(self.signer.run(signer_stopped));
+        let (core_stop, core_stopped) = crate::task::Shutdown::new(*stop.borrow());
+        let (services_stop, services_stopped) = crate::task::Shutdown::new(false);
         let mut tasks = tokio::task::JoinSet::new();
         let handle = self.service.handle();
         let external_handle = handle.external_mqtt();
@@ -731,7 +731,7 @@ impl Daemon {
         for (service, listener) in self.plain {
             tasks.spawn(service.serve_plain(listener, 64, core_stop.subscribe()));
         }
-        let mut core = tokio::spawn(self.service.serve_listeners(
+        let mut core = crate::task::OwnedTask::spawn(self.service.serve_listeners(
             self.thin,
             self.mqtt,
             core_stopped,
@@ -796,7 +796,7 @@ impl Daemon {
             }
         }
         // Keep the publication adapter alive until device workers emit terminal output.
-        core_stop.send_replace(true);
+        core_stop.stop();
         if !core_finished {
             match core.await {
                 Ok(Ok(())) => {}
@@ -824,7 +824,7 @@ impl Daemon {
                 }
             }
         }
-        services_stop.send_replace(true);
+        services_stop.stop();
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok(Ok(())) => {}
@@ -836,7 +836,7 @@ impl Daemon {
                 }
             }
         }
-        signer_stop.send_replace(true);
+        signer_stop.stop();
         let joined = signer.await.map_err(io::Error::other);
         joined?;
         match failure {

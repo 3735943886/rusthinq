@@ -1,12 +1,7 @@
 //! Durable L2 device ledger and process-wide L3 generation high-water mark.
 use rusthinq_lifecycle::{Action, Entry, Input, Ledger, Model, Step};
 use serde_json::{Value, json};
-use std::{
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{io, path::Path, time::Duration};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,12 +32,9 @@ pub struct GenerationBlock {
 }
 
 pub struct Storage {
-    path: PathBuf,
-    parent: PathBuf,
-    _lock: File,
+    file: crate::checkpoint::Checkpoint,
     capacity: usize,
     state: State,
-    uncertain: bool,
 }
 impl Storage {
     /// A missing file initializes empty state. Corrupt or incompatible files fail
@@ -54,46 +46,20 @@ impl Storage {
         let maximum = capacity
             .checked_mul(8192)
             .and_then(|n| n.checked_add(256))
-            .and_then(|n| u64::try_from(n).ok())
-            .and_then(|n| n.checked_add(1))
             .ok_or_else(|| invalid("lifecycle capacity overflow"))?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_owned();
-        let mut lock_path = path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(PathBuf::from(lock_path))?;
-        lock.try_lock().map_err(io::Error::other)?;
-        let state = match File::open(path) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(maximum).read_to_end(&mut bytes)?;
-                if bytes.len() as u64 == maximum {
-                    return Err(invalid("lifecycle checkpoint exceeded"));
-                }
-                decode(&bytes, capacity)?
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => State {
+        let file = crate::checkpoint::Checkpoint::open(path)?;
+        let state = match file.read(maximum)? {
+            Some(bytes) => decode(&bytes, capacity)?,
+            None => State {
                 ledger: Ledger::default(),
                 generation_floor: 0,
                 metadata: Default::default(),
             },
-            Err(error) => return Err(error),
         };
         Ok(Self {
-            path: path.into(),
-            parent,
-            _lock: lock,
+            file,
             capacity,
             state,
-            uncertain: false,
         })
     }
     pub fn state(&self) -> &State {
@@ -103,17 +69,14 @@ impl Storage {
         self.capacity
     }
     pub fn requires_reopen(&self) -> bool {
-        self.uncertain
+        self.file.requires_reopen()
     }
     /// Reserve before transport admission. Unused numbers are intentionally lost
     /// after restart; no generation in this range is issued by a later process.
     /// Run on the application-owned blocking worker.
     pub fn reserve_generations(&mut self, count: u64) -> io::Result<GenerationBlock> {
-        if self.uncertain {
-            return Err(io::Error::other(
-                "lifecycle checkpoint uncertain; reopen before reservation",
-            ));
-        }
+        self.file
+            .ensure_ready("lifecycle checkpoint uncertain; reopen before reservation")?;
         if count == 0 {
             return Err(invalid("zero generation reservation"));
         }
@@ -163,11 +126,8 @@ impl Storage {
     /// Acknowledge L2 persistence effects only after this returns success.
     /// Same-revision identical retries are permitted; conflicting/stale writes fail.
     pub fn save(&mut self, ledger: &Ledger) -> io::Result<()> {
-        if self.uncertain {
-            return Err(io::Error::other(
-                "lifecycle checkpoint uncertain; reopen before retry",
-            ));
-        }
+        self.file
+            .ensure_ready("lifecycle checkpoint uncertain; reopen before retry")?;
         validate(ledger, self.capacity)?;
         if ledger.revision < self.state.ledger.revision
             || ledger.next_incarnation < self.state.ledger.next_incarnation
@@ -205,11 +165,8 @@ impl Storage {
         &mut self,
         updates: &std::collections::BTreeMap<String, DeviceMetadata>,
     ) -> io::Result<()> {
-        if self.uncertain {
-            return Err(io::Error::other(
-                "lifecycle checkpoint uncertain; reopen before metadata write",
-            ));
-        }
+        self.file
+            .ensure_ready("lifecycle checkpoint uncertain; reopen before metadata write")?;
         let mut candidate = self.state.clone();
         for (id, meta) in updates {
             if !candidate
@@ -227,26 +184,13 @@ impl Storage {
     }
     fn commit(&mut self, candidate: State) -> io::Result<()> {
         let bytes = encode(&candidate);
-        let result: io::Result<()> = (|| {
-            let mut temporary = tempfile::Builder::new()
-                .prefix(".lifecycle-")
-                .tempfile_in(&self.parent)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file().sync_all()?;
-            temporary.persist(&self.path).map_err(|error| error.error)?;
-            File::open(&self.parent)?.sync_all()?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.state = candidate;
-                Ok(())
-            }
-            Err(error) => {
-                self.uncertain = true;
-                Err(error)
-            }
-        }
+        self.file.replace(
+            &bytes,
+            ".lifecycle-",
+            "lifecycle checkpoint uncertain; reopen before retry",
+        )?;
+        self.state = candidate;
+        Ok(())
     }
 }
 

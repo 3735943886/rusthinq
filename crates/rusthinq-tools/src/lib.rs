@@ -1,6 +1,5 @@
 //! Thin management API adapters and offline codecs. No device or account ownership.
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures_util::StreamExt;
 use rusthinq_protocol::{
     hex,
     packet_codec::{self, AabbEncodeInput, Decoded, Direction, EncodeInput, TlvEncodeInput},
@@ -10,12 +9,14 @@ use serde_json::{Value, json};
 use std::{
     io::{self, BufRead, Read},
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{client::IntoClientRequest, http::header::AUTHORIZATION},
 };
+
+pub type EventStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone)]
 pub struct Client {
@@ -126,15 +127,10 @@ impl Client {
         }
         Ok(value)
     }
-    pub async fn events(
-        &self,
-    ) -> io::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    pub async fn events(&self) -> io::Result<EventStream> {
         self.events_at("api/events").await
     }
-    pub async fn events_at(
-        &self,
-        path: &str,
-    ) -> io::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    pub async fn events_at(&self, path: &str) -> io::Result<EventStream> {
         let mut url = self.url(path)?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme).map_err(|_| invalid())?;
@@ -341,154 +337,10 @@ pub fn read_capture(args: &Value) -> io::Result<Value> {
     }
     Ok(json!({"events":values,"offset":offset,"limit":limit}))
 }
-pub fn capture_event(event: &Value, id: &str) -> Option<Value> {
-    if event["type"] == "lost" {
-        return Some(json!({"k":"lost","t":now_ms(),"events":event["events"]}));
-    }
-    if event["device"] != id {
-        return None;
-    }
-    let (direction, payload) = match event["type"].as_str() {
-        Some("data") => ("rx", event["hex"].as_str()?),
-        Some("sent") => ("tx", event["hex"].as_str()?),
-        Some("injected") if event["toDevice"] == false => ("rx", event["hex"].as_str()?),
-        _ => return None,
-    };
-    let bytes = hex::decode(payload).ok()?;
-    let text = std::str::from_utf8(&bytes).ok();
-    let value = text.and_then(|t| serde_json::from_str::<Value>(t).ok());
-    let (kind, payload) = match value.as_ref() {
-        Some(value) if value["cmd"] == "ack" => ("ack", value["data"].as_str()?.to_string()),
-        Some(value) if value["Body"]["Format"] == "B64" => {
-            let data = STANDARD.decode(value["Body"]["Data"].as_str()?).ok()?;
-            ("packet", hex::encode(data))
-        }
-        Some(_) => ("clip", text?.to_string()),
-        None => ("packet", payload.to_string()),
-    };
-    Some(json!({"k":direction,"t":now_ms(),"type":kind,"hex":payload}))
-}
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-pub async fn capture(client: Client, id: String, path: &Path) -> io::Result<()> {
-    capture_with_cloud(client, id, path, false).await
-}
-pub async fn cloud_events(
-    client: &Client,
-    device: Option<&str>,
-) -> io::Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-    client
-        .request("api/cloud/notifications", Some(&json!({"enabled":true})))
-        .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    let status = loop {
-        let status = client
-            .request("api/cloud/notifications?limit=0", None)
-            .await?;
-        if status["status"] == "connected" {
-            break status;
-        }
-        if !status["enabled"].as_bool().unwrap_or(false) || tokio::time::Instant::now() >= deadline
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "LG notification feed did not connect; sign in and check account/network status",
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
-    let mut path = format!(
-        "api/cloud/notifications/ws?cursor={}",
-        status["cursor"].as_str().unwrap_or("0")
-    );
-    if let Some(device) = device {
-        path.push_str("&device=");
-        path.push_str(&segment(device));
-    }
-    client.events_at(&path).await
-}
-pub fn notification_capture(event: &Value) -> Option<Value> {
-    match event["type"].as_str()? {
-        "cloudNotification" => {
-            let mut value = event.clone();
-            value["observedAt"] = value["t"].clone();
-            value["t"] = json!(now_ms());
-            value["k"] = json!("cloud");
-            Some(value)
-        }
-        "cloudLoss" => {
-            Some(json!({"k":"lost","source":"cloud","t":now_ms(),"events":event["events"]}))
-        }
-        "cloudStatus" => Some(
-            json!({"k":"note","source":"cloud","t":now_ms(),"text":format!("LG notification feed: {}",event["status"].as_str().unwrap_or("unknown"))}),
-        ),
-        "cloudReset" => Some(
-            json!({"k":"note","source":"cloud","t":now_ms(),"text":"LG account context changed; correlation interrupted"}),
-        ),
-        _ => None,
-    }
-}
-pub async fn watch_cloud(client: Client) -> io::Result<()> {
-    let mut events = cloud_events(&client, None).await?;
-    loop {
-        tokio::select! {signal=tokio::signal::ctrl_c()=>{signal?;let _=events.close(None).await;break;},event=events.next()=>{let Some(event)=event else{return Err(io::Error::new(io::ErrorKind::NotConnected,"LG observation stream closed"));};if let tokio_tungstenite::tungstenite::Message::Text(text)=event.map_err(|_|invalid())?{let event:Value=serde_json::from_str(&text).map_err(|_|invalid())?;if let Some(value)=notification_capture(&event){println!("{value}");}}}}
-    }
-    Ok(())
-}
-pub async fn capture_with_cloud(
-    client: Client,
-    id: String,
-    path: &Path,
-    with_cloud: bool,
-) -> io::Result<()> {
-    // Require both feeds before touching the output file; do not silently degrade --cloud.
-    let mut cloud = if with_cloud {
-        Some(cloud_events(&client, Some(&id)).await?)
-    } else {
-        None
-    };
-    let mut events = client.events().await?;
-    let mut output = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    {
-        use std::io::Write;
-        writeln!(
-            output,
-            "{}",
-            json!({"k":"session","t":now_ms(),"device":id,"cloud":with_cloud,"correlation":"time-aligned observations, not proof of causality"})
-        )?;
-        output.flush()?;
-    }
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    use tokio::io::AsyncBufReadExt;
-    let mut note = Vec::new();
-    let mut notes = true;
-    loop {
-        tokio::select! {
-            signal=tokio::signal::ctrl_c()=>{signal?;let _=events.close(None).await;if let Some(stream)=cloud.as_mut(){let _=stream.close(None).await;}break;},
-            result=stdin.fill_buf(),if notes=>{let bytes=result?;if bytes.is_empty(){notes=false;}else{let end=bytes.iter().position(|b|*b==b'\n').map(|n|n+1);let n=end.unwrap_or(bytes.len());if note.len()+n>65536{return Err(invalid());}note.extend_from_slice(&bytes[..n]);stdin.consume(n);if end.is_some(){let text=std::str::from_utf8(&note).map_err(|_|invalid())?;use std::io::Write;writeln!(output,"{}",json!({"k":"note","t":now_ms(),"text":text.trim_end()}))?;output.flush()?;note.clear();}}},
-            notification=async{match cloud.as_mut(){Some(stream)=>stream.next().await,None=>std::future::pending().await}}=>{
-                let Some(notification)=notification else {use std::io::Write;writeln!(output,"{}",json!({"k":"lost","source":"cloud","t":now_ms(),"events":null,"reason":"LG observation stream closed"}))?;output.flush()?;return Err(io::Error::new(io::ErrorKind::NotConnected,"LG feed closed; capture correlation is incomplete"));};
-                if let tokio_tungstenite::tungstenite::Message::Text(text)=notification.map_err(|_|invalid())? {
-                    let event:Value=serde_json::from_str(&text).map_err(|_|invalid())?;
-                    let records=if event["type"]=="cloudSnapshot"{event["snapshot"]["events"].as_array().cloned().unwrap_or_default()}else{vec![event.clone()]};
-                    for record in records {if let Some(value)=notification_capture(&record){use std::io::Write;writeln!(output,"{value}")?;output.flush()?;}}
-                    if event["type"]=="cloudReset"||event["type"]=="cloudLoss"||(event["type"]=="cloudSnapshot"&&(event["snapshot"]["lost"]==true||event["snapshot"]["status"]!="connected"))||(event["type"]=="cloudStatus"&&event["status"]!="connected") {use std::io::Write;writeln!(output,"{}",json!({"k":"lost","source":"cloud","t":now_ms(),"events":null,"reason":"LG correlation interrupted"}))?;output.flush()?;return Err(io::Error::new(io::ErrorKind::NotConnected,"LG feed interrupted; capture correlation is incomplete"));}
-                }
-            },
-            event=events.next()=>{let Some(event)=event else{break;};let event=event.map_err(|_|invalid())?;if let tokio_tungstenite::tungstenite::Message::Text(text)=event{let event:Value=serde_json::from_str(&text).map_err(|_|invalid())?;if let Some(value)=capture_event(&event,&id){use std::io::Write;writeln!(output,"{value}")?;output.flush()?;}}}
-        }
-    }
-    Ok(())
-}
+mod capture;
+pub use capture::{
+    capture, capture_event, capture_with_cloud, cloud_events, notification_capture, watch_cloud,
+};
 
 pub mod cli;
 pub mod mcp;

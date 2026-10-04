@@ -74,10 +74,7 @@ window.CloudFeed = class {
             this.status(snapshot);
             if (snapshot.reset) {
               this.cursor = "0";
-              this.rows = [];
-              this.bytes = 0;
-              this.container?.replaceChildren();
-              this.onReset?.();
+              this.reset();
               this.onRecord?.({
                 k: "note",
                 t: Date.now(),
@@ -102,15 +99,18 @@ window.CloudFeed = class {
               text: `LG notification feed: ${value.status}`,
             });
           } else if (value.type === "cloudReset") {
-            this.rows = [];
-            this.bytes = 0;
-            this.container?.replaceChildren();
-            this.onReset?.();
+            this.reset();
           } else this.accept(value);
         },
         error: (error) => UI.toast(error.message, "error"),
       },
     );
+  }
+  reset() {
+    this.rows = [];
+    this.bytes = 0;
+    this.container?.replaceChildren();
+    this.onReset?.();
   }
   accept(value) {
     if (value.type === "cloudLoss") {

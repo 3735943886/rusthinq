@@ -13,22 +13,19 @@ impl std::error::Error for DecodeError {}
 
 /// Lowercase hex encoding (like `hex::encode`).
 pub fn encode(data: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write;
-    let data = data.as_ref();
-    let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    encode_with(data.as_ref(), b"0123456789abcdef")
 }
 
 /// Uppercase hex encoding (like `hex::encode_upper`).
 pub fn encode_upper(data: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write;
-    let data = data.as_ref();
+    encode_with(data.as_ref(), b"0123456789ABCDEF")
+}
+
+fn encode_with(data: &[u8], alphabet: &[u8; 16]) -> String {
     let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
-        let _ = write!(out, "{b:02X}");
+    for &byte in data {
+        out.push(alphabet[usize::from(byte >> 4)] as char);
+        out.push(alphabet[usize::from(byte & 15)] as char);
     }
     out
 }

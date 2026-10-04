@@ -510,7 +510,7 @@ async fn notification_socket(
                         Err(broadcast::error::RecvError::Lagged(events)) => json!({"type":"cloudLoss","events":events,"t":crate::observability::now_ms()}),
                         Err(_) => break,
                     };
-                    if value["type"] == "cloudNotification" && query.device.as_deref().is_some_and(|id|value["devices"].as_array().is_some_and(|ids|!ids.is_empty()&&!ids.iter().any(|v|v==id))) {
+                    if value["type"] == "cloudNotification" && query.device.as_deref().is_some_and(|id| !crate::cloud_observer::matches_device(&value, id)) {
                         continue;
                     }
                     if !write(&mut socket, value).await { break; }
@@ -1068,10 +1068,10 @@ pub async fn serve(
 ) -> io::Result<()> {
     let handle = handle.into();
     config.validate()?;
-    let (owned_stop, owned_stopped) = watch::channel(*stop.borrow());
+    let (owned_stop, owned_stopped) = crate::task::Shutdown::new(*stop.borrow());
     let sockets = Arc::new(Semaphore::new(64));
     let names = Names::default();
-    let refresher = tokio::spawn(refresh_names(
+    let refresher = crate::task::OwnedTask::spawn(refresh_names(
         handle.clone(),
         names.clone(),
         owned_stopped.clone(),
@@ -1080,7 +1080,7 @@ pub async fn serve(
         cfg!(feature = "bridge") && handle.cloud_status()["enabled"] == true,
     );
     #[cfg(feature = "bridge")]
-    let observer_task = tokio::spawn(
+    let observer_task = crate::task::OwnedTask::spawn(
         observer
             .clone()
             .run(handle.account_handle(), owned_stopped.clone()),
@@ -1119,7 +1119,7 @@ pub async fn serve(
             }
         }
     }
-    owned_stop.send_replace(true);
+    owned_stop.stop();
     let _ = refresher.await;
     #[cfg(feature = "bridge")]
     let _ = observer_task.await;
