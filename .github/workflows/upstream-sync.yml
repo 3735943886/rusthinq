@@ -6,8 +6,8 @@ name: Upstream Sync
 # for whether it needs porting.
 
 on:
-  schedule:
-    - cron: '0 21 * * *' # 06:00 KST
+  # schedule:
+  #   - cron: '0 21 * * *' # 06:00 KST
   workflow_dispatch: {}
 
 permissions:
