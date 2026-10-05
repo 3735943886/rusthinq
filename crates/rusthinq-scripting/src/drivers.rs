@@ -219,6 +219,10 @@ impl Config {
         if compiled.has_function("on_response", 2) {
             entry.push_str("on_response(ctx,json_parse(text));");
         }
+        entry.push_str("}\nfn __cloud(ctx,text) {");
+        if compiled.has_function("on_cloud_event", 2) {
+            entry.push_str("on_cloud_event(ctx,json_parse(text));");
+        }
         entry.push_str("}\nfn __timer(ctx,text) {");
         if compiled.has_function("on_timer", 2) {
             entry.push_str("on_timer(ctx,text);");

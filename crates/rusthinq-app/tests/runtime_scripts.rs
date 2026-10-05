@@ -865,3 +865,77 @@ async fn reload_removes_only_retained_topics_the_new_generation_does_not_publish
     adapter.await.unwrap().unwrap();
     broker.abort();
 }
+
+#[tokio::test]
+async fn lg_notifications_route_to_matching_live_scripts_and_account_events_are_opt_in() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let (sink, mut publications) = mpsc::channel(8);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(Sink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let _peer = identify(&mut server).await;
+    until(&mut events, |e| {
+        matches!(
+            e,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Online { .. })
+        )
+    })
+    .await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle.attach_script("d".into(), session,
+        Compiled::with_context(r#"fn cloud(ctx, text) { let event = json_parse(text); ctx.publish(event.correlation + ":" + event.payload.kind); }"#, Limits::default(), true, rusthinq_scripting::context::Config::new("d".into(), "test".into())).unwrap(),
+        worker::Config::default(), Callbacks { cloud: Some("cloud".into()), ..Callbacks::default() }).await.unwrap();
+    let observer = rusthinq_app::cloud_observer::Observer::new(true).with_scripts(handle.clone());
+    observer.record(serde_json::json!({"payload":{"deviceId":"d","kind":"disabled"}}));
+    observer.set_enabled(true).unwrap();
+    observer.record(serde_json::json!({"payload":{"deviceId":"other","kind":"wrong"}}));
+    observer.record(serde_json::json!({"payload":{"deviceId":"d","kind":"matched"}}));
+    observer.record(serde_json::json!({"payload":{"kind":"account"}}));
+    for expected in ["device:matched", "account:account"] {
+        let (_, payload) = timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    value = publications.recv() => break value,
+                    event = events.recv() => {
+                        if let Ok(Event::Rejected { reason, .. }) = event {
+                            panic!("{reason}");
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload, expected);
+    }
+    assert!(publications.try_recv().is_err());
+    observer.set_enabled(false).unwrap();
+    observer.record(serde_json::json!({"payload":{"deviceId":"d","kind":"stopped"}}));
+    // A subsequent explicit invocation fences the queue and verifies no stopped event was admitted.
+    handle
+        .invoke_script(
+            "d".into(),
+            session,
+            1,
+            "cloud".into(),
+            r#"{"correlation":"manual","payload":{"kind":"barrier"}}"#.into(),
+        )
+        .await
+        .unwrap();
+    let (_, payload) = timeout(Duration::from_secs(3), publications.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload, "manual:barrier");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    server.shutdown().await;
+}

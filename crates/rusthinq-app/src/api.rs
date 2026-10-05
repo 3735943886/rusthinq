@@ -217,6 +217,11 @@ impl From<crate::cloud_account::Error> for CloudError {
     }
 }
 impl AppHandle {
+    #[cfg(feature = "scripting")]
+    pub(crate) fn cloud_notification(&self, value: &serde_json::Value) {
+        self.0.cloud_notification(value);
+    }
+
     pub fn diagnostics(&self) -> Value {
         self.0.diagnostics()
     }

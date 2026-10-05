@@ -220,3 +220,36 @@ async fn removal_invalidates_even_completed_results_and_offline_grace_cannot_att
     ));
     owner.shutdown().await.unwrap();
 }
+
+#[test]
+fn configured_driver_cloud_callback_parses_envelope_and_is_optional() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = rusthinq_scripting::drivers::Config {
+        watch: false,
+        directory: directory.path().into(),
+        topic_prefix: "test".into(),
+        bindings: Default::default(),
+    };
+    for source in [
+        "fn on_cloud_event(ctx,event) { ctx.publish(event.topic + ':' + event.payload.value); }",
+        "fn start(ctx) {}",
+    ] {
+        std::fs::write(directory.path().join("model.rhai"), source).unwrap();
+        let compiled = config.prepare("d", "model", true, true).unwrap();
+        let mut host = rusthinq_scripting::Host::new(compiled);
+        let outcome = host.invoke(
+            1,
+            "__cloud",
+            r#"{"topic":"lg/event","payload":{"value":"done"}}"#,
+        );
+        assert_eq!(outcome.error, None);
+        if source.contains("on_cloud_event") {
+            assert_eq!(
+                outcome.outputs,
+                vec![rusthinq_scripting::Output::Publish("lg/event:done".into())]
+            );
+        } else {
+            assert!(outcome.outputs.is_empty());
+        }
+    }
+}

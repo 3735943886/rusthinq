@@ -46,6 +46,8 @@ pub struct Observer {
     wanted: watch::Sender<bool>,
     events: broadcast::Sender<Value>,
     available: bool,
+    #[cfg(feature = "scripting")]
+    scripts: Option<crate::api::AppHandle>,
 }
 impl Observer {
     pub fn new(available: bool) -> Self {
@@ -62,7 +64,14 @@ impl Observer {
             wanted,
             events,
             available,
+            #[cfg(feature = "scripting")]
+            scripts: None,
         }
+    }
+    #[cfg(feature = "scripting")]
+    pub fn with_scripts(mut self, handle: impl Into<crate::api::AppHandle>) -> Self {
+        self.scripts = Some(handle.into());
+        self
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
@@ -172,6 +181,12 @@ impl Observer {
             }
         }
         // Queue under the same lock as clear(): delivery order follows history order.
+        #[cfg(feature = "scripting")]
+        if self.enabled()
+            && let Some(handle) = &self.scripts
+        {
+            handle.cloud_notification(&value);
+        }
         let _ = self.events.send(value);
     }
     #[cfg(feature = "bridge")]

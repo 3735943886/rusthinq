@@ -1,5 +1,35 @@
 use super::*;
 impl Handle {
+    /// Nonblocking, bounded admission; capture script/session generations at observation time.
+    #[cfg(feature = "scripting")]
+    pub(crate) fn cloud_notification(&self, value: &serde_json::Value) {
+        let targets: Vec<_> = self
+            .0
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(id, _)| crate::cloud_observer::matches_device(value, id))
+            .map(|(id, (session, generation, _))| crate::scripts::Context {
+                device: id.clone(),
+                session: *session,
+                generation: *generation,
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if let Err(error) = self.0.cloud_scripts.try_send(CloudNotification {
+            targets,
+            input: value.to_string(),
+        }) {
+            let _ = self.0.events.send(Event::Rejected {
+                device: String::new(),
+                reason: format!("cloud notification admission: {error}"),
+            });
+        }
+    }
+
     pub fn diagnostics(&self) -> serde_json::Value {
         self.0.observations.diagnostics()
     }

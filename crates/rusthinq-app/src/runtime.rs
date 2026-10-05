@@ -130,6 +130,8 @@ struct Shared {
     script_states: Mutex<BTreeMap<String, (SessionKey, u64, bool)>>,
     #[cfg(feature = "scripting")]
     scripts: mpsc::Sender<ScriptCommand>,
+    #[cfg(feature = "scripting")]
+    cloud_scripts: mpsc::Sender<CloudNotification>,
     metadata: Mutex<BTreeMap<String, rusthinq_server::thinq1_http::Metadata>>,
     devices: Mutex<Vec<Device>>,
     events: broadcast::Sender<Event>,
@@ -209,6 +211,11 @@ struct PrepareReload {
     result: oneshot::Sender<Result<u64, rusthinq_scripting::Error>>,
 }
 #[cfg(feature = "scripting")]
+struct CloudNotification {
+    targets: Vec<crate::scripts::Context>,
+    input: String,
+}
+#[cfg(feature = "scripting")]
 enum ScriptCommand {
     Attach(Box<AttachScript>),
     Reload(Box<ReloadScript>),
@@ -275,6 +282,8 @@ pub struct Runtime {
 
     #[cfg(feature = "scripting")]
     script_attach: mpsc::Receiver<ScriptCommand>,
+    #[cfg(feature = "scripting")]
+    cloud_scripts: mpsc::Receiver<CloudNotification>,
     #[cfg(feature = "scripting")]
     script_callbacks: BTreeMap<String, crate::scripts::Callbacks>,
     #[cfg(feature = "scripting")]
@@ -397,6 +406,8 @@ impl Runtime {
         let (commands, receiver) = mpsc::channel(event_capacity);
         #[cfg(feature = "scripting")]
         let (script_sender, script_attach) = mpsc::channel(1);
+        #[cfg(feature = "scripting")]
+        let (cloud_script_sender, cloud_scripts) = mpsc::channel(64);
         let (cleanup_state, _) = watch::channel((model.devices(), false));
         let (attach, attachments) = mpsc::channel(1);
         let (cleanup_status, _) = watch::channel(CleanupStatus::Disabled);
@@ -456,6 +467,8 @@ impl Runtime {
             script_states: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "scripting")]
             scripts: script_sender,
+            #[cfg(feature = "scripting")]
+            cloud_scripts: cloud_script_sender,
             metadata: Mutex::new(
                 storage
                     .state()
@@ -497,6 +510,8 @@ impl Runtime {
 
             #[cfg(feature = "scripting")]
             script_attach,
+            #[cfg(feature = "scripting")]
+            cloud_scripts,
             #[cfg(feature = "scripting")]
             script_callbacks: BTreeMap::new(),
             #[cfg(feature = "scripting")]

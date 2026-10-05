@@ -91,7 +91,7 @@
               </p>
             </div>
             <button id="refresh-devices" class="button secondary">
-              <span data-icon="refresh"></span>Refresh
+              Refresh
             </button>
           </div>
           <div class="stat-grid">
@@ -216,8 +216,9 @@
               >
             </div>
             <p class="small muted">
-              Read-only account notifications. Observation starts explicitly and
-              resets after restart. Account events without a device ID are
+              Account notifications. Starting the feed also delivers new events to
+              active scripts with an LG event callback. The feed resets after
+              restart. Account events without a device ID are
               labeled separately.
             </p>
             <button id="cloud-feed-toggle" class="button secondary" disabled>
@@ -324,7 +325,7 @@
                   type="submit"
                   disabled
                 >
-                  Review cleanup
+                  Delete…
                 </button>
               </form>
               <p id="cleanup-result" class="small" role="status"></p>

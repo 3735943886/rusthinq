@@ -161,6 +161,8 @@ pub fn router(
     let observer = crate::cloud_observer::Observer::new(
         cfg!(feature = "bridge") && handle.cloud_status()["enabled"] == true,
     );
+    #[cfg(feature = "scripting")]
+    let observer = observer.with_scripts(handle.clone());
     Ok(build(App {
         observer,
         handle,
@@ -1223,6 +1225,8 @@ pub async fn serve(
     let observer = crate::cloud_observer::Observer::new(
         cfg!(feature = "bridge") && handle.cloud_status()["enabled"] == true,
     );
+    #[cfg(feature = "scripting")]
+    let observer = observer.with_scripts(handle.clone());
     #[cfg(feature = "bridge")]
     let observer_task = crate::task::OwnedTask::spawn(
         observer

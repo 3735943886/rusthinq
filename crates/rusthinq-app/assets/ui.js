@@ -56,7 +56,7 @@ window.UI = (() => {
     search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
     moon: '<path d="M20 14a9 9 0 0 1-10-10 9 9 0 1 0 10 10Z"/>',
     refresh:
-      '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M5 8a8 8 0 0 1 13-3l2 2M4 17l2 2a8 8 0 0 0 13-3"/>',
+      '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5"/>',
     device: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 13h4M8 19v2m8-2v2"/>',
     refrigerator: '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M6 10h12M9 5v2m0 6v4"/>',
     dryer: '<rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="13" r="5"/><path d="M8 5h1m3 0h4M10 12l2 2 2-2"/>',

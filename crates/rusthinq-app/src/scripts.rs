@@ -32,6 +32,8 @@ impl Completion {
 #[derive(Clone, Debug, Default)]
 pub struct Callbacks {
     pub response: Option<String>,
+    /// Receives LG notification JSON, including account events without a device ID.
+    pub cloud: Option<String>,
     pub data: Option<String>,
     pub ready: Option<String>,
     pub timer: Option<String>,

@@ -656,7 +656,7 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                         };
                         if let Err(error)=result {$runtime.script_rejected(id.clone(),error);}
                         else {
-                            $runtime.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),shutdown:Some("__drop".into()),data_encoding:crate::scripts::DataEncoding::Hex});
+                            $runtime.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {cloud:Some("__cloud".into()),response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),shutdown:Some("__drop".into()),data_encoding:crate::scripts::DataEncoding::Hex});
                             let _=$runtime.scripts.as_ref().expect("driver owner").set_shutdown_callback(&id,Some("__drop".into()));
                             $runtime.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(id.clone(),(session,1,false));
                             if let Err(error)=$runtime.invoke_script(id.clone(),1,"__init".into(),String::new()) {$runtime.script_rejected(id.clone(),error);}
@@ -675,6 +675,17 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                     let (sequence, device, completion) = result.map_err(io::Error::other)?;
                     $runtime.script_result(sequence, device, completion, !$stopping && !*$stop.borrow() && $stop.has_changed().is_ok());
                 }
+                Some(CloudNotification { targets, input }) = $runtime.cloud_scripts.recv(), if !$stopping => {
+                    $runtime.reconcile();
+                    for target in targets {
+                        let current=$runtime.model.devices().iter().any(|d|d.entry.id==target.device && d.session==Some(target.session) && d.online && d.removal.is_none());
+                        if !current || $runtime.scripts.as_ref().and_then(|owner|owner.generation(&target.device)) != Some(target.generation) { continue; }
+                        if let Some(function)=$runtime.script_callbacks.get(&target.device).and_then(|c|c.cloud.clone())
+                            && let Err(error)=$runtime.invoke_script(target.device.clone(),target.generation,function,input.clone()) {
+                            $runtime.script_rejected(target.device,error);
+                        }
+                    }
+                },
                 Some(command) = $runtime.script_attach.recv(), if !$stopping && $runtime.pending_attach.is_none() => match command {
                 ScriptCommand::Invoke {device,session,generation,function,input,result}=>{
                     if !result.is_closed() {

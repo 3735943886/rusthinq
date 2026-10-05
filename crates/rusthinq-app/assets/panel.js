@@ -14,6 +14,17 @@
     polling = false;
   const pending = new Set(),
     cards = new Map();
+  function formatUptime(seconds) {
+    if (seconds === undefined) return "—";
+    let remaining = Math.max(0, Math.floor(seconds));
+    const parts = [];
+    for (const [unit, size] of [["day", 86400], ["hour", 3600], ["min", 60], ["s", 1]]) {
+      const value = Math.floor(remaining / size);
+      remaining %= size;
+      if (value) parts.push(`${value}${unit === "s" ? "" : " "}${unit}`);
+    }
+    return parts.join(" ") || "0s";
+  }
   const controls = new DeviceControls.Panel(
     $("device-controls"),
     async (target, prop, value) =>
@@ -238,6 +249,7 @@
       );
     else if (device.bridgePending)
       facts.append(badge("Pairing unresolved", "warning"));
+    else facts.append(badge("Local only", "neutral"));
     const footer = document.createElement("div");
     footer.className = "card-bottom";
     footer.append(
@@ -573,12 +585,9 @@
         detailRows($("runtime-details"), [
           ["Status", health.running ? "Running" : "Stopped"],
           ["Version", health.version],
-          ["Retained cleanup", health.retainedCleanup],
           [
             "Uptime",
-            health.diagnostics?.uptimeSeconds === undefined
-              ? "—"
-              : `${health.diagnostics.uptimeSeconds}s`,
+            formatUptime(health.diagnostics?.uptimeSeconds),
           ],
           [
             "Received / sent",
