@@ -114,6 +114,11 @@ MCP supports live device observation through `device_start`, `read_device` and
 snapshots. See [tool migration](docs/0.2-tools-migration.md#tools-migration) for commands and
 configuration.
 
+Model-specific Rhai drivers, shared helpers and their tests are maintained in
+`rusthinq-scripts`. This repository tests the Rust host and transport using synthetic
+scripts and provides the runner for the scripts repository's CI. The runner accepts
+the checkout being tested without requiring a fixed scripts revision.
+
 ```sh
 # Run the device-driver compatibility suite from a separate scripts checkout
 rusthinq-script-test /path/to/rusthinq-scripts

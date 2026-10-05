@@ -22,11 +22,11 @@ use tokio::{
 struct ScriptSink(mpsc::Sender<(Context, String)>);
 
 #[tokio::test]
-async fn completed_provisioning_auto_loads_real_driver_without_external_mqtt() {
+async fn completed_provisioning_auto_loads_script_without_external_mqtt() {
     auto_driver(false, false, false).await;
 }
 #[tokio::test]
-async fn real_driver_external_publications_have_durable_inventory_and_delete_routes() {
+async fn script_external_publications_have_durable_inventory_and_delete_routes() {
     auto_driver(true, false, false).await;
 }
 #[tokio::test]
@@ -34,18 +34,18 @@ async fn automatic_driver_reload_preserves_scope_on_compile_failure_and_recovers
     auto_driver(false, true, false).await;
 }
 #[tokio::test]
-async fn real_washer_command_is_validated_fenced_and_transmitted_without_claiming_device_ack() {
+async fn script_command_is_fenced_and_transmitted_without_claiming_device_ack() {
     auto_driver(false, false, true).await;
 }
 async fn auto_driver(external: bool, watched: bool, command: bool) {
-    let model = if command { "Pd0F_F" } else { "D140110" };
+    let model = if command { "Command" } else { "Echo" };
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
     let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
     let sources = directory.path().join("drivers");
     std::fs::create_dir(&sources).unwrap();
     for source in std::fs::read_dir(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host-drivers"),
     )
     .unwrap()
     {
@@ -80,7 +80,7 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
                 port: listener.local_addr().unwrap().port(),
                 tls: false,
                 ca: None,
-                client: "real-driver".into(),
+                client: "host-script".into(),
                 username: None,
                 password: None,
                 inventory: inventory.clone(),
@@ -182,7 +182,7 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
     .await;
     let session = handle.snapshot()[0].session.unwrap();
     if command {
-        real_command(&handle, session, &mut peer, &mut events).await;
+        script_command(&handle, session, &mut peer, &mut events).await;
     } else if !external {
         handle
             .invoke_script(
@@ -201,7 +201,7 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
     if watched {
         // Poll once with the original prepared driver before editing it.
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        let path = sources.join("D140110.rhai");
+        let path = sources.join("Echo.rhai");
         let original = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{original}\n// updated fixture\n")).unwrap();
         timeout(Duration::from_secs(3), async {
@@ -943,7 +943,7 @@ async fn mqtt_utf8_admission_error_does_not_fault_script_or_change_its_scope() {
     app.await.unwrap().unwrap();
 }
 
-async fn real_command(
+async fn script_command(
     handle: &rusthinq_app::runtime::Handle,
     session: rusthinq_lifecycle::SessionKey,
     peer: &mut DuplexStream,
@@ -951,60 +951,13 @@ async fn real_command(
 ) {
     let app = rusthinq_app::api::AppHandle::from(handle.clone());
     let mut projected = app.adapter_events();
-    // Without the appliance's remote-start grant, Rhai rejects and emits no send.
+    let expected = vec![0x01, 0x23, 0x45, 0x67];
     app.adapter_invoke(
         "d".into(),
         session,
         1,
         "__command".into(),
-        json!({"prop":"pause","value":""}).to_string(),
-    )
-    .await
-    .unwrap();
-    until(events, |event| matches!(event, Event::ScriptOutput {payload,..} if {
-        let publication: serde_json::Value = serde_json::from_str(payload).unwrap();
-        publication["topic"] == "rusthinq/d/reject" &&
-        serde_json::from_str::<serde_json::Value>(publication["payload"].as_str().unwrap()).unwrap()["code"] == "requires_unmet"
-    })).await;
-    // This transport has no periodic downlinks: after the driver rejection,
-    // the peer's read buffer must contain no command bytes.
-    let mut bytes = [0; 1];
-    assert!(matches!(
-        std::future::poll_fn(|cx| {
-            use std::future::Future;
-            let mut read = std::pin::pin!(peer.read(&mut bytes));
-            std::task::Poll::Ready(read.as_mut().poll(cx))
-        })
-        .await,
-        std::task::Poll::Pending
-    ));
-    let mut payload = vec![0; 25];
-    payload[5] = 1;
-    payload[16] = 4; // remote start, from the pinned driver's documented offsets
-    let mut inner = vec![0x20, 0xeb, 0, 25];
-    inner.extend(payload);
-    let frame = rusthinq_protocol::aabb::wrap(&inner).unwrap();
-    publish(
-        peer,
-        "clip/message/devices/d",
-        json!({
-            "did":"d", "cmd":"device_packet", "data":rusthinq_protocol::hex::encode(frame)
-        }),
-    )
-    .await;
-    until(events, |event| {
-        matches!(event,Event::ScriptOutput {payload,..} if {
-            let output:serde_json::Value=serde_json::from_str(payload).unwrap();
-            output["topic"]=="rusthinq/d/remote_start" && output["payload"]=="true"
-        })
-    })
-    .await;
-    app.adapter_invoke(
-        "d".into(),
-        session,
-        1,
-        "__command".into(),
-        json!({"prop":"pause","value":""}).to_string(),
+        json!({"prop":"send","value":rusthinq_protocol::hex::encode(&expected)}).to_string(),
     )
     .await
     .unwrap();
@@ -1020,21 +973,7 @@ async fn real_command(
     assert_eq!(command["did"], "d");
     let frame = rusthinq_protocol::hex::decode(command["data"].as_str().unwrap()).unwrap();
 
-    // Read the expected LG app control from the unchanged pinned upstream test.
-    let reference = include_str!("fixtures/drivers/Pd0F_F.test.rhai");
-    let pause = reference
-        .split_once("fn test_pause_and_power_off_are_the_short_controls()")
-        .unwrap()
-        .1
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("expect_eq(a::inner_hex(d, 1), \"")
-                .and_then(|rest| rest.split_once('"').map(|pair| pair.0))
-        })
-        .unwrap();
-    let expected = rusthinq_protocol::hex::decode(pause).unwrap();
-    assert_eq!(frame, rusthinq_protocol::aabb::wrap(&expected).unwrap());
+    assert_eq!(frame, expected);
     // Use the existing event subscription for the transport receipt, while the
     // management projection explicitly declines to infer appliance acknowledgment.
     until(events, |event| {

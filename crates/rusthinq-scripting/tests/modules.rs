@@ -130,30 +130,6 @@ fn module_preparation_failure_cannot_replace_running_generation_and_reload_uses_
     );
 }
 #[test]
-fn pinned_real_aabb_common_pure_helpers_run_without_legacy_host_apis() {
-    // rusthinq-scripts 54292921c6edc72ea6ec901b1137845bff14e6ae, unchanged source.
-    let source = r#"import "aabb_common" as c; fn input(v){publish(c::bit(8,8));publish(c::bit(8,1));publish(c::on_off(1));}"#;
-    let mut host = Host::new(
-        compiled(source)
-            .with_modules(vec![module(
-                "aabb_common",
-                include_str!("fixtures/aabb_common.rhai"),
-            )])
-            .unwrap(),
-    );
-    let result = host.invoke(1, "input", "");
-    assert_eq!(result.error, None);
-    assert_eq!(
-        result.outputs,
-        vec![
-            Output::Publish("true".into()),
-            Output::Publish("false".into()),
-            Output::Publish("true".into())
-        ]
-    );
-}
-
-#[test]
 fn module_imports_do_not_repeat_initialization_or_reset_mutable_scope() {
     let source = r#"import "helper" as h; let count=0;publish("init");
         fn input(v){count+=1;publish(h::show(count));}"#;

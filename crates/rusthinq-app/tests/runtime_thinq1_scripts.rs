@@ -2,132 +2,16 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusthinq_app::drivers::Config;
-use rusthinq_scripting::{Host, Output};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf};
 
-// Frames and expected states originate in the pinned upstream driver suite.
-// The Mon envelope is constructed: this is replay, not a captured TLS session.
-fn captured_frame(name: &str) -> Vec<u8> {
-    let source = include_str!("fixtures/drivers/D140110.test.rhai");
-    let prefix = format!("fn {name}() {{ \"");
-    let frame = source
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix(&prefix)
-                .and_then(|rest| rest.split_once('"').map(|pair| pair.0))
-        })
-        .unwrap();
-    rusthinq_protocol::hex::decode(frame).unwrap()
-}
-
-fn feed(host: &mut Host, frame: &[u8]) -> Vec<Value> {
-    let envelope = json!({
-        "Header": {"x-lgedm-deviceId": "dishwasher"},
-        "Body": {"Cmd": "Mon", "Format": "B64", "Data": STANDARD.encode(frame)}
-    });
-    let result = host.invoke(
-        1,
-        "__data",
-        &rusthinq_protocol::hex::encode(envelope.to_string()),
-    );
-    assert_eq!(result.error, None);
-    publications(result.outputs)
-}
-
-fn publications(outputs: Vec<Output>) -> Vec<Value> {
-    outputs
-        .into_iter()
-        .map(|output| {
-            let Output::Publish(text) = output else {
-                panic!("read-only driver emitted a device effect")
-            };
-            serde_json::from_str(&text).unwrap()
-        })
-        .collect()
-}
-
-#[test]
-fn real_thinq1_b64_driver_replays_nine_captured_cycle_states() {
-    let config = Config {
-        directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
-        topic_prefix: "rusthinq".into(),
-        bindings: BTreeMap::new(),
-        watch: false,
-    };
-    let mut host = Host::new(
-        config
-            .prepare("dishwasher", "D140110", false, true)
-            .unwrap(),
-    );
-    let initial = host.invoke(1, "__init", "");
-    assert_eq!(initial.error, None);
-    // The script's own initial publications are opaque here; their content is its tests'.
-    let initial = publications(initial.outputs);
-    assert_eq!(initial.len(), 2);
-    assert!(initial.iter().all(|message| message["retain"] == true));
-
-    for (frame, status, process, remaining, door, child_lock) in [
-        ("ready", "ready", "none", "93", "false", "false"),
-        ("running", "running", "washing", "93", "false", "false"),
-        ("child_lock", "running", "washing", "89", "false", "true"),
-        ("rinsing", "running", "rinsing", "9", "false", "false"),
-        ("drying", "running", "drying", "9", "false", "false"),
-        ("door_open", "running", "drying", "2", "true", "false"),
-        ("finished", "finished", "finished", "1", "true", "false"),
-        ("standby", "standby", "none", "1", "true", "false"),
-        ("off", "off", "none", "1", "true", "false"),
-    ] {
-        let outputs = feed(&mut host, &captured_frame(frame));
-        assert_eq!(outputs.len(), 16, "{frame}");
-        for (property, expected) in [
-            ("available", "true"),
-            ("status", status),
-            ("process", process),
-            ("remaining_time", remaining),
-            ("door", door),
-            ("child_lock", child_lock),
-            ("total_time", "93"),
-            ("error", "none"),
-        ] {
-            let topic = format!("rusthinq/dishwasher/{property}");
-            let output = outputs
-                .iter()
-                .find(|output| output["topic"] == topic)
-                .unwrap();
-            assert_eq!(output["payload"], expected, "{frame}/{property}");
-            assert_eq!(output["retain"], true);
-        }
-    }
-    // Unsupported/short records must not invent values or fault the worker.
-    for frame in ["001122", "AA0632EC0000BB"] {
-        assert!(feed(&mut host, &rusthinq_protocol::hex::decode(frame).unwrap()).is_empty());
-    }
-    let command = host.invoke(
-        1,
-        "__command",
-        &json!({"prop":"status","value":"off"}).to_string(),
-    );
-    assert_eq!(command.error, None);
-    let rejected = publications(command.outputs);
-    assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0]["retain"], false);
-    let event: Value = serde_json::from_str(rejected[0]["payload"].as_str().unwrap()).unwrap();
-    assert_eq!(event["code"], "read_only");
-    let dropped = host.invoke(1, "__drop", "");
-    assert_eq!(dropped.error, None);
-    let dropped = publications(dropped.outputs);
-    assert_eq!(dropped[0]["topic"], "rusthinq/dishwasher/available");
-    assert_eq!(dropped[0]["payload"], "false");
-}
-
 #[tokio::test]
-async fn captured_thinq1_status_automatically_attaches_and_publishes_without_broker() {
+async fn thinq1_status_automatically_attaches_and_publishes_without_broker() {
     automatic_driver(false).await;
 }
 
 #[tokio::test]
-async fn captured_thinq1_mqtt_outputs_keep_restart_safe_exact_and_owner_deletion() {
+async fn thinq1_mqtt_outputs_keep_restart_safe_exact_and_owner_deletion() {
     automatic_driver(true).await;
 }
 
@@ -151,7 +35,8 @@ async fn automatic_driver(external: bool) {
         .unwrap()
         .with_metadata(receiver)
         .with_drivers(Config {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/host-drivers"),
             topic_prefix: "rusthinq".into(),
             bindings: BTreeMap::new(),
             watch: false,
@@ -186,7 +71,7 @@ async fn automatic_driver(external: bool) {
     metadata
         .send(Metadata {
             device_id: "dishwasher".into(),
-            model_name: "D140110".into(),
+            model_name: "Echo".into(),
             device_type: "dishwasher".into(),
             ..Default::default()
         })
@@ -201,7 +86,7 @@ async fn automatic_driver(external: bool) {
     server.admit(stream).unwrap();
     let envelope = json!({
         "Header":{"x-lgedm-deviceId":"dishwasher"},
-        "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(captured_frame("running"))}
+        "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(b"running")}
     });
     peer.write_all(
         &rusthinq_protocol::thinq1::encode(envelope.to_string().as_bytes(), 8192).unwrap(),
@@ -245,13 +130,6 @@ async fn automatic_driver(external: bool) {
             .as_array()
             .unwrap()
             .iter()
-            .any(|value| value["topic"] == "il/dishwasher")
-    );
-    assert!(
-        presentation
-            .as_array()
-            .unwrap()
-            .iter()
             .any(|value| value["topic"] == "rusthinq/dishwasher/status"
                 && value["payload"] == "running")
     );
@@ -274,10 +152,8 @@ async fn automatic_driver(external: bool) {
         while let Ok((topic, value)) = received.try_recv() {
             retained.insert(topic, value);
         }
-        assert_eq!(retained.len(), 17);
+        assert_eq!(retained.len(), 2);
         assert_eq!(retained["rusthinq/dishwasher/status"], "running");
-        assert_eq!(retained["rusthinq/dishwasher/process"], "washing");
-        assert_eq!(retained["rusthinq/dishwasher/total_time"], "93");
         assert_eq!(retained["rusthinq/dishwasher/available"], "true");
     }
     drop(peer);
@@ -308,7 +184,7 @@ async fn automatic_driver(external: bool) {
             .unwrap()
             .unwrap();
         let ledger = rusthinq_app::retained_cleanup::Ledger::open(&inventory, 128).unwrap();
-        assert_eq!(ledger.pending().len(), 17);
+        assert_eq!(ledger.pending().len(), 2);
         assert!(ledger.pending().iter().all(|topic| topic.owner == owner));
         drop(ledger);
         // Reopen with no in-memory publication cache: deletion must use the ledger.
@@ -330,7 +206,7 @@ async fn automatic_driver(external: bool) {
                 .await
                 .unwrap()
                 .unwrap(),
-            16
+            1
         );
         stop.send_replace(true);
         timeout(Duration::from_secs(3), adapter)
@@ -454,7 +330,8 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
         .unwrap()
         .with_metadata(receiver)
         .with_drivers(Config {
-            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drivers"),
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/host-drivers"),
             topic_prefix: "rusthinq".into(),
             bindings: BTreeMap::new(),
             watch: false,
@@ -490,7 +367,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
                 retained.insert(topic.to_string(), value.to_string());
                 let id = &body[2 + length..4 + length];
                 peer.write_all(&[0x40, 2, id[0], id[1]]).await.unwrap();
-                if connection == 0 && retained.len() == 17 {
+                if connection == 0 && retained.len() == 2 {
                     let _ = first_done.take().unwrap().send(());
                     break; // drop the connection: the outage
                 }
@@ -500,9 +377,9 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
                     "reconnect cleared {topic}"
                 );
                 if connection == 1
-                    && retained.len() == 17
+                    && retained.len() == 2
                     && retained
-                        .get("rusthinq/dishwasher/process")
+                        .get("rusthinq/dishwasher/status")
                         .map(String::as_str)
                         == Some("rinsing")
                 {
@@ -517,7 +394,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
     metadata
         .send(Metadata {
             device_id: "dishwasher".into(),
-            model_name: "D140110".into(),
+            model_name: "Echo".into(),
             device_type: "dishwasher".into(),
             ..Default::default()
         })
@@ -528,7 +405,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
     async fn status(peer: &mut tokio::io::DuplexStream, frame: &str) {
         let envelope = json!({
             "Header":{"x-lgedm-deviceId":"dishwasher"},
-            "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(captured_frame(frame))}
+            "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(frame.as_bytes())}
         });
         peer.write_all(
             &rusthinq_protocol::thinq1::encode(envelope.to_string().as_bytes(), 8192).unwrap(),
@@ -568,7 +445,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
             match events.recv().await.unwrap() {
                 Event::ScriptOutput { payload, .. } => {
                     let message: Value = serde_json::from_str(&payload).unwrap();
-                    if message["topic"] == "rusthinq/dishwasher/process"
+                    if message["topic"] == "rusthinq/dishwasher/status"
                         && message["payload"] == "rinsing"
                     {
                         break;
@@ -589,8 +466,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(resynced["rusthinq/dishwasher/status"], "running");
-    assert_eq!(resynced["rusthinq/dishwasher/remaining_time"], "9");
+    assert_eq!(resynced["rusthinq/dishwasher/status"], "rinsing");
     assert!(handle.snapshot()[0].online);
     drop(peer);
     server.shutdown().await;

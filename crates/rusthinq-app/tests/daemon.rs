@@ -315,7 +315,7 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
         management: None,
         drivers: Some(rusthinq_app::drivers::Config {
             directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/drivers"),
+                .join("tests/fixtures/host-drivers"),
             topic_prefix: "test".into(),
             bindings: Default::default(),
             watch: false,
