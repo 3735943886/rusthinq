@@ -153,6 +153,9 @@ contracts and dated implementation evidence.
 
 ## Development and verification
 
+GitHub Actions runs `scripts/check-0.2.sh` on pushes to `dev/0.2` and on
+pull requests targeting that branch. Local commits trigger CI after they are pushed.
+
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
