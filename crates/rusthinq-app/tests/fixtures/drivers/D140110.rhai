@@ -96,10 +96,11 @@ fn on_drop(ctx) { il::publish_property(ctx, "available", "false"); }
 
 fn on_data(ctx, data) {
     let body = c::inner(data, 0x32);
-    if body == () || body[1] != 0xec || body.len() != 2 + record_len() * 2 { return; }
+    if body == () || body[1] != 0xec { return; }
+    let rec = c::common_status_offset(body, record_len());
+    if rec == () { return; }
 
     // The record states its own payload length; anything else is a frame we do not understand.
-    let rec = 2 + record_len();
     if body[rec + 1] != 0x18 { return; }
 
     let p = rec + 2; // offset of the payload

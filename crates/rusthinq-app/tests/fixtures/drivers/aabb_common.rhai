@@ -13,6 +13,18 @@ fn inner(data, first) {
     body
 }
 
+// Offset of the current fixed-length status record in an already unwrapped body.
+// EB carries one record; EC carries the previous record followed by the current one.
+// Exact lengths keep unrelated, truncated and extended formats out of this helper.
+fn common_status_offset(body, status_length) {
+    if body == () || body.len() < 2 || status_length <= 0 { return (); }
+    if body[1] == 0xeb && body.len() == 2 + status_length { return 2; }
+    if body[1] == 0xec && body.len() == 2 + status_length * 2 {
+        return 2 + status_length;
+    }
+    ()
+}
+
 fn pad2(n) { if n < 10 { "0" + n } else { n.to_string() } }
 
 // Publish `name` unless it is `()` (a wire code the table does not know is left unpublished

@@ -78,16 +78,8 @@ fn on_data(ctx, data) {
     let body = c::inner(data, 0x42);
     if body == () { return; }
 
-    // 0xEC pushes the previous record then the current one; 0xEB, the answer to a status
-    // query (asked when the appliance connects), carries the current record alone. An idle
-    // panel pushes nothing else, so 0xEB is what gives the state at startup.
-    let cur = if body[1] == 0xec && body.len() == 2 + record_len() * 2 {
-        2 + record_len()
-    } else if body[1] == 0xeb && body.len() == 2 + record_len() {
-        2
-    } else {
-        return;
-    };
+    let cur = c::common_status_offset(body, record_len());
+    if cur == () { return; }
     il::publish_property(ctx, "available", "true");
 
     let remote = (body[cur] & 0x02) != 0;
