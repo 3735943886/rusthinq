@@ -1390,7 +1390,7 @@ impl Runtime {
                                         Ok(protocol)=>{
                                             if to_device {
                                                 let payload=if protocol==rusthinq_server::Protocol::ThinQ2 {
-                                                    self.shared.message_id.fetch_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|id|id.checked_add(1)).map(|mid|serde_json::json!({"did":id,"mid":mid,"cmd":"packet","type":1,"data":rusthinq_protocol::hex::encode_upper(&data)}).to_string().into_bytes()).map_err(|_|rusthinq_server::Reject::Stopped)
+                                                    self.shared.message_id.try_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|id|id.checked_add(1)).map(|mid|serde_json::json!({"did":id,"mid":mid,"cmd":"packet","type":1,"data":rusthinq_protocol::hex::encode_upper(&data)}).to_string().into_bytes()).map_err(|_|rusthinq_server::Reject::Stopped)
                                                 } else {Ok(data.clone())};
                                                 payload.and_then(|payload|self.server.send(&target,&payload)).map(Some)
                                             } else {

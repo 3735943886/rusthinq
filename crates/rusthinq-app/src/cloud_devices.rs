@@ -763,7 +763,7 @@ async fn supervise(
         }
         let generation = context
             .generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(2))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(2))
             .map_err(|_| stale())?;
         let mut owned_stop = stop.clone();
         let epoch = *cancelled.borrow();
