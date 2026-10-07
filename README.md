@@ -86,6 +86,9 @@ Add `drivers`, `external_mqtt` and `cloud_account` as needed using
 local script-output observation continue without it. LG authentication is also
 optional for local device service.
 
+Daemon logs default to `info`; use `RUST_LOG` for diagnostics. See
+[logging](docs/0.2-runtime.md#logging) for levels and systemd configuration.
+
 For deployment use `--release`; the [build guide](docs/0.2-runtime.md#build) explains
 size optimization and debugging tradeoffs.
 

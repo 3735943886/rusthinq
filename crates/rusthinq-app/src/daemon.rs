@@ -698,8 +698,8 @@ impl Daemon {
                     tokio::select! {
                         _ = stop.changed() => return Ok(()),
                         diagnostic = diagnostics.recv() => match diagnostic {
-                            Ok(diagnostic) => eprintln!("MQTTS: {diagnostic:?}"),
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => eprintln!("MQTTS: {lost} diagnostics not shown"),
+                            Ok(diagnostic) => crate::logging::mqtt_diagnostic(&diagnostic),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => tracing::warn!(lost, "MQTT diagnostics lost"),
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 let _ = stop.wait_for(|stopped| *stopped).await;
                                 return Ok(());
@@ -716,8 +716,8 @@ impl Daemon {
                     tokio::select! {
                         _ = stop.changed() => return Ok(()),
                         rejection = rejections.recv() => match rejection {
-                            Ok(rejection) => eprintln!("{label}: refused {} ({:?})", rejection.peer, rejection.reason),
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => eprintln!("{label}: {lost} refusals not shown"),
+                            Ok(rejection) => tracing::warn!(listener = label, peer = %rejection.peer, reason = ?rejection.reason, "connection refused"),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => tracing::warn!(listener = label, lost, "connection refusal diagnostics lost"),
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 // A finished listener is reported by the core; wait for shutdown.
                                 let _ = stop.wait_for(|stopped| *stopped).await;
