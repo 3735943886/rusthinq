@@ -125,3 +125,40 @@ fn context_publication_uses_same_consumer_and_output_bounds_as_plain_host() {
     assert_eq!(result.outputs, vec![Output::Send("opaque".into())]);
     assert!(matches!(result.error, Some(Error::Execution(_))));
 }
+
+#[test]
+fn generated_ids_are_shared_across_helpers_contexts_and_reload() {
+    fn driver() -> Compiled {
+        let mut config = Config::new("d".into(), "model".into());
+        config.thinq2 = true;
+        config.driver_api = true;
+        Compiled::with_context(r#"fn input(ctx,v) { ctx.send_raw(hex_decode("aAff")); ctx.send_clip("setMaskingInfo", 1, "{\"mask\":true}"); }"#, Limits::default(), true, config).unwrap()
+    }
+    let mut previous = rusthinq_protocol::thinq2::command_mid(0).unwrap();
+    let mut host = Host::new(driver());
+    for generation in [1, 2] {
+        let result = host.invoke(generation, "input", "");
+        assert_eq!(result.error, None);
+        assert_eq!(result.outputs.len(), 2);
+        for (index, output) in result.outputs.into_iter().enumerate() {
+            let Output::Send(text) = output else {
+                panic!("send expected")
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let mid = value["mid"].as_u64().unwrap();
+            assert!(mid > previous);
+            previous = mid;
+            assert_eq!(value["did"], "d");
+            assert_eq!(value["type"], 1);
+            if index == 0 {
+                assert_eq!(value["cmd"], "packet");
+                assert_eq!(value["data"], "AAFF");
+            } else {
+                assert_eq!(value["cmd"], "setMaskingInfo");
+                assert_eq!(value["data"], serde_json::json!({"mask":true}));
+            }
+        }
+        assert!(rusthinq_protocol::thinq2::command_mid(0).unwrap() > previous);
+        host.reload(driver()).unwrap();
+    }
+}

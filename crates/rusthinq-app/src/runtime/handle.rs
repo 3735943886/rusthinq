@@ -419,6 +419,32 @@ impl Handle {
             id,
             session,
             payload,
+            thinq2: false,
+            result,
+        })?;
+        received
+            .await
+            .unwrap_or(Err(rusthinq_server::Reject::Stopped))
+    }
+    /// Generated ThinQ2 envelope; normal device send, independent of diagnostic injection.
+    pub async fn send_clip(
+        &self,
+        id: String,
+        session: SessionKey,
+        cmd: &str,
+        msg_type: i64,
+        data: serde_json::Value,
+    ) -> Result<rusthinq_server::Receipt, rusthinq_server::Reject> {
+        let payload = command_payload(self.0.message_seed, &id, cmd, msg_type, data)?;
+        if payload.len() > 1_000_000 {
+            return Err(rusthinq_server::Reject::PayloadExceeded);
+        }
+        let (result, received) = oneshot::channel();
+        self.management(ManagementCommand::Send {
+            id,
+            session,
+            payload,
+            thinq2: true,
             result,
         })?;
         received

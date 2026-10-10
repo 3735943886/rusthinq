@@ -82,7 +82,15 @@ and System views share the management API. The [dashboard guide](docs/0.2-dashbo
 covers packet monitoring and analysis.
 
 Add `drivers`, `external_mqtt` and `cloud_account` as needed using
-[operations](docs/0.2-operations.md). External MQTT is optional: management and
+[operations](docs/0.2-operations.md).
+
+Normal ThinQ2 commands can use `POST /api/devices/{id}/packet` (hex bytes) or
+`POST /api/devices/{id}/clip` (`cmd`, `type`, `data`); the core generates `did`/`mid`.
+These authenticated, session-scoped APIs work without Rhai or external MQTT and
+are independent of diagnostic injection. See the [request examples and delivery
+contract](docs/0.2-operations.md#generated-thinq2-commands).
+
+External MQTT is optional: management and
 local script-output observation continue without it. LG authentication is also
 optional for local device service.
 

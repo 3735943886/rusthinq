@@ -18,6 +18,8 @@ pub struct Config {
     pub topic_prefix: String,
     pub thinq2: bool,
     pub driver_api: bool,
+    /// Lower bound for the process-wide generated command ID allocator.
+    /// IDs are shared across contexts/reloads and are not persisted across restarts.
     pub message_seed: i64,
 }
 impl Config {
@@ -39,7 +41,6 @@ impl Config {
 struct State {
     values: BTreeMap<String, (Dynamic, usize)>,
     bytes: usize,
-    next_id: i64,
 }
 #[derive(Clone)]
 pub(crate) struct Context {
@@ -63,13 +64,11 @@ impl Context {
         {
             return Err(Error::InvalidConfig);
         }
-        let next_id = config.message_seed;
         Ok(Self {
             config: Arc::new(config),
             state: Arc::new(Mutex::new(State {
                 values: BTreeMap::new(),
                 bytes: 0,
-                next_id,
             })),
         })
     }
@@ -92,12 +91,9 @@ impl Context {
         Ok(serde_json::json!({"did":self.config.device,"mid":mid,"cmd":cmd,"type":msg_type,"data":data}).to_string())
     }
     fn message_id(&self) -> Result<i64, Box<EvalAltResult>> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or("message identifier exhausted")?;
-        Ok(state.next_id)
+        rusthinq_protocol::thinq2::command_mid(self.config.message_seed as u64)
+            .map(|id| id as i64)
+            .ok_or_else(|| "message identifier exhausted".into())
     }
     pub(crate) fn json(&self, text: String) -> Result<String, Box<EvalAltResult>> {
         if !self.config.driver_api {

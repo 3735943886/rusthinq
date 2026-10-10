@@ -125,7 +125,7 @@ struct Shared {
     external_mqtt: Mutex<Option<crate::external_mqtt::Handle>>,
     persisted_models: Mutex<BTreeMap<String, crate::lifecycle_storage::DeviceMetadata>>,
     durable_devices: Mutex<Vec<rusthinq_lifecycle::Entry>>,
-    message_id: std::sync::atomic::AtomicU64,
+    message_seed: u64,
     driver_models: Mutex<BTreeMap<String, (SessionKey, String, bool)>>,
     script_states: Mutex<BTreeMap<String, (SessionKey, u64, bool)>>,
     #[cfg(feature = "scripting")]
@@ -161,6 +161,7 @@ enum ManagementCommand {
         id: String,
         session: SessionKey,
         payload: Vec<u8>,
+        thinq2: bool,
         result: oneshot::Sender<Result<rusthinq_server::Receipt, rusthinq_server::Reject>>,
     },
 }
@@ -422,14 +423,12 @@ impl Runtime {
             cloud_deploy: Mutex::new(BTreeMap::new()),
             persisted_models: Mutex::new(storage.state().metadata.clone()),
             durable_devices: Mutex::new(storage.state().ledger.entries.clone()),
-            message_id: std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(io::Error::other)?
-                    .as_millis()
-                    .try_into()
-                    .map_err(io::Error::other)?,
-            ),
+            message_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_millis()
+                .try_into()
+                .map_err(io::Error::other)?,
             driver_models: Mutex::new(
                 storage
                     .state()
@@ -1373,10 +1372,15 @@ impl Runtime {
                                 } else {let _ = result.send(Err(rusthinq_server::Reject::StaleSession));}
                             }
                         }
-                        ManagementCommand::Send {id, session, payload, result} => {
+                        ManagementCommand::Send {id, session, payload, thinq2, result} => {
                             if !result.is_closed() {
                                 let current = self.model.devices().iter().any(|device| device.entry.id == id && device.session == Some(session) && device.online && device.removal.is_none());
-                                let sent = if current {self.server.send(&SessionId {device:id,generation:session.generation}, &payload)} else {Err(rusthinq_server::Reject::StaleSession)};
+                                let target = SessionId {device:id,generation:session.generation};
+                                let sent = if !current {Err(rusthinq_server::Reject::StaleSession)} else if thinq2 {match self.server.protocol(&target) {
+                                    Ok(rusthinq_server::Protocol::ThinQ2) => self.server.send(&target, &payload),
+                                    Ok(rusthinq_server::Protocol::ThinQ1) => Err(rusthinq_server::Reject::WrongTransport),
+                                    Err(error) => Err(error),
+                                }} else {self.server.send(&target, &payload)};
                                 let _ = result.send(sent);
                             }
                         }
@@ -1390,7 +1394,7 @@ impl Runtime {
                                         Ok(protocol)=>{
                                             if to_device {
                                                 let payload=if protocol==rusthinq_server::Protocol::ThinQ2 {
-                                                    self.shared.message_id.try_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|id|id.checked_add(1)).map(|mid|serde_json::json!({"did":id,"mid":mid,"cmd":"packet","type":1,"data":rusthinq_protocol::hex::encode_upper(&data)}).to_string().into_bytes()).map_err(|_|rusthinq_server::Reject::Stopped)
+                                                    command_payload(self.shared.message_seed, &id, "packet", 1, rusthinq_protocol::hex::encode_upper(&data).into())
                                                 } else {Ok(data.clone())};
                                                 payload.and_then(|payload|self.server.send(&target,&payload)).map(Some)
                                             } else {
@@ -1492,4 +1496,22 @@ impl Runtime {
     fn buffer_driver(&mut self, _id: &SessionId, _data: &[u8]) {}
     fn script_transport(&mut self, _event: &TransportEvent) {}
     fn fire_timers(&mut self) {}
+}
+
+fn command_payload(
+    seed: u64,
+    id: &str,
+    cmd: &str,
+    msg_type: i64,
+    data: serde_json::Value,
+) -> Result<Vec<u8>, rusthinq_server::Reject> {
+    if cmd.is_empty() || cmd.len() > 256 || cmd.chars().any(char::is_control) {
+        return Err(rusthinq_server::Reject::InvalidConfig);
+    }
+    let mid =
+        rusthinq_protocol::thinq2::command_mid(seed).ok_or(rusthinq_server::Reject::Stopped)?;
+    let payload = serde_json::json!({"did":id,"mid":mid,"cmd":cmd,"type":msg_type,"data":data})
+        .to_string()
+        .into_bytes();
+    Ok(payload)
 }

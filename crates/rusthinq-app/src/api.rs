@@ -67,6 +67,22 @@ impl Handle {
             .await
             .into())
     }
+    pub async fn adapter_send_clip(
+        &self,
+        id: String,
+        session: SessionKey,
+        cmd: &str,
+        msg_type: i64,
+        data: Value,
+    ) -> Result<Delivery, Reject> {
+        Ok(self
+            .send_clip(id, session, cmd, msg_type, data)
+            .await
+            .map_err(Reject::from)?
+            .wait()
+            .await
+            .into())
+    }
     pub async fn adapter_inject(
         &self,
         id: String,
@@ -288,6 +304,18 @@ impl AppHandle {
         payload: Vec<u8>,
     ) -> Result<Delivery, Reject> {
         self.0.adapter_send(id, session, payload).await
+    }
+    pub async fn adapter_send_clip(
+        &self,
+        id: String,
+        session: SessionKey,
+        cmd: &str,
+        msg_type: i64,
+        data: Value,
+    ) -> Result<Delivery, Reject> {
+        self.0
+            .adapter_send_clip(id, session, cmd, msg_type, data)
+            .await
     }
     pub async fn adapter_inject(
         &self,

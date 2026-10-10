@@ -199,6 +199,8 @@ fn build(app: App) -> Router {
         .route("/api/devices", get(devices))
         .route("/api/devices/{id}/forget", post(forget))
         .route("/api/devices/{id}/send", post(send))
+        .route("/api/devices/{id}/packet", post(send_packet))
+        .route("/api/devices/{id}/clip", post(send_clip))
         .route("/api/devices/{id}/invoke", post(invoke))
         .route("/api/devices/{id}/reload", post(reload_driver))
         .route("/api/devices/{id}/inject", post(inject))
@@ -779,6 +781,81 @@ async fn send(State(app): State<App>, Path(id): Path<String>, Json(body): Json<V
             },
             payload.as_bytes().to_vec(),
         ),
+    )
+    .await
+    {
+        Ok(Ok(delivery)) => delivery_response(delivery),
+        Ok(Err(reject)) => rejected(reject),
+        Err(_) => error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "delivery unknown; do not automatically retry",
+        ),
+    }
+}
+fn generated_request(
+    body: &Value,
+    packet: bool,
+) -> Result<(SessionKey, String, i64, Value), &'static str> {
+    let object = body.as_object().ok_or("request must be an object")?;
+    let allowed = if packet {
+        &["incarnation", "generation", "hex"][..]
+    } else {
+        &["incarnation", "generation", "cmd", "type", "data"][..]
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("unknown request field");
+    }
+    let session = SessionKey {
+        incarnation: number(body, "incarnation")?,
+        generation: number(body, "generation")?,
+    };
+    if packet {
+        let hex = body["hex"].as_str().ok_or("hex must be a string")?;
+        if hex.is_empty() {
+            return Err("hex must not be empty");
+        }
+        let bytes = rusthinq_protocol::hex::decode(hex).map_err(|_| "invalid hex")?;
+        Ok((
+            session,
+            "packet".into(),
+            1,
+            rusthinq_protocol::hex::encode_upper(bytes).into(),
+        ))
+    } else {
+        let cmd = body["cmd"]
+            .as_str()
+            .filter(|cmd| !cmd.is_empty() && cmd.len() <= 256 && !cmd.chars().any(char::is_control))
+            .ok_or("invalid cmd")?;
+        let msg_type = body["type"]
+            .as_i64()
+            .ok_or("type must be a signed 64-bit integer")?;
+        let data = object.get("data").ok_or("data required")?.clone();
+        Ok((session, cmd.into(), msg_type, data))
+    }
+}
+async fn send_packet(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    generated_send(app, id, body, true).await
+}
+async fn send_clip(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    generated_send(app, id, body, false).await
+}
+async fn generated_send(app: App, id: String, body: Value, packet: bool) -> Response {
+    let (session, cmd, msg_type, data) = match generated_request(&body, packet) {
+        Ok(request) => request,
+        Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
+    };
+    match timeout(
+        Duration::from_secs(30),
+        app.handle
+            .adapter_send_clip(id, session, &cmd, msg_type, data),
     )
     .await
     {
@@ -1583,5 +1660,28 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    #[tokio::test]
+    async fn all_transport_outcomes_keep_the_existing_response_contract() {
+        for (delivery, status, name) in [
+            (Delivery::Sent, StatusCode::OK, "Sent"),
+            (Delivery::Failed, StatusCode::BAD_GATEWAY, "Failed"),
+            (Delivery::Unknown, StatusCode::GATEWAY_TIMEOUT, "Unknown"),
+        ] {
+            let response = delivery_response(delivery);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"delivery":name,"deviceAcknowledged":false})
+            );
+        }
     }
 }

@@ -140,6 +140,27 @@ async fn sends_and_forgets_are_scoped_and_removal_is_admission_then_durable_comp
     })
     .await;
     let session = handle.snapshot()[0].session.unwrap();
+    for endpoint in ["packet", "clip"] {
+        let input =
+            json!({"incarnation":session.incarnation,"generation":session.generation,"hex":"AA"});
+        let input = if endpoint == "clip" {
+            json!({"incarnation":session.incarnation,"generation":session.generation,"cmd":"setMaskingInfo","type":1,"data":{}})
+        } else {
+            input
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    &format!("/api/devices/d/{endpoint}"),
+                    "POST",
+                    input
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
     let body = json!({"incarnation":session.incarnation.to_string(),"generation":session.generation.to_string(),"payload":r#"{"Body":{"Cmd":"custom"}}"#});
     let response = app
         .clone()

@@ -419,3 +419,51 @@ pub fn encode_hex(data: &[u8]) -> String {
     }
     output
 }
+
+/// Process-wide generated command IDs. The caller supplies a clock seed; L1 reads no clock.
+/// Strictly increasing across threads/contexts, bounded by Rhai's signed integer range.
+/// Not persisted: a restart with a rolled-back clock can reuse an old ID.
+pub fn command_mid(seed: u64) -> Option<u64> {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    allocate_mid(&LAST, seed)
+}
+fn allocate_mid(last: &std::sync::atomic::AtomicU64, seed: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    last.try_update(Relaxed, Relaxed, |previous| {
+        previous
+            .max(seed)
+            .checked_add(1)
+            .filter(|id| *id <= i64::MAX as u64)
+    })
+    .ok()
+    .map(|previous| previous.max(seed) + 1)
+}
+
+#[cfg(test)]
+mod command_id_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    #[test]
+    fn seeds_concurrency_and_exhaustion() {
+        let ids = AtomicU64::new(0);
+        assert_eq!(allocate_mid(&ids, 100), Some(101));
+        // A fresh process with the same seed can reuse a historical ID.
+        assert_eq!(allocate_mid(&AtomicU64::new(0), 100), Some(101));
+        assert_eq!(allocate_mid(&ids, 1), Some(102));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let ids = &ids;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert!(allocate_mid(ids, 0).is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(allocate_mid(&ids, 0), Some(903));
+        let ids = AtomicU64::new(i64::MAX as u64 - 1);
+        assert_eq!(allocate_mid(&ids, 0), Some(i64::MAX as u64));
+        assert_eq!(allocate_mid(&ids, 0), None);
+        assert_eq!(allocate_mid(&ids, u64::MAX), None);
+    }
+}
