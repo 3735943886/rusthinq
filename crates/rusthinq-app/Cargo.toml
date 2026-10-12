@@ -13,7 +13,7 @@ gui = []
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml = "0.8"
+toml = "1.1"
 rusthinq-server = { path = "../rusthinq-server" }
 tempfile = "3"
 rusthinq-protocol = { path = "../rusthinq-protocol" }
@@ -38,5 +38,5 @@ tokio-openssl = "0.6"
 tokio = { workspace = true, features = ["test-util"] }
 rusthinq-bridge = { path = "../rusthinq-bridge", features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
