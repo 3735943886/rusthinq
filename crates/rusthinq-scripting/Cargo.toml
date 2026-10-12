@@ -9,4 +9,4 @@ rhai = { version = "=1.26.1", features = ["sync", "internals", "serde"] }
 tokio.workspace = true
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 serde_json.workspace = true
-base64 = "0.22"
+base64 = "0.23"
