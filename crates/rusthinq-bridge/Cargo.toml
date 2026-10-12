@@ -11,7 +11,7 @@ url = "2"
 rusthinq-server = { path = "../rusthinq-server" }
 tokio.workspace = true
 
-reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }
 openssl = "0.10"
 tokio-openssl = "0.6"
 base64 = "0.22"
