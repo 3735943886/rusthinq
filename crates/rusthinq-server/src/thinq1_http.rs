@@ -11,7 +11,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
-use quick_xml::{Reader, events::Event};
+use quick_xml::{Reader, XmlVersion, events::Event};
 use std::{convert::Infallible, io, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 const XML_HEADER: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>"#;
@@ -258,11 +258,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
                 for attribute in element.attributes() {
                     let attribute = attribute.map_err(|_| ())?;
                     attribute
-                        .decode_and_unescape_value(reader.decoder())
+                        .normalized_value(XmlVersion::Implicit1_0)
                         .map_err(|_| ())?;
                 }
                 if stack.is_empty() {
-                    if root || element.name().as_ref() != b"lgedmRoot" {
+                    if root || element.name().as_ref() != "lgedmRoot" {
                         return Err(());
                     }
                     root = true;
@@ -270,7 +270,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
                 if stack.len() == 16 {
                     return Err(());
                 }
-                stack.push(element.name().as_ref().to_vec());
+                stack.push(element.name().as_ref().as_bytes().to_vec());
                 if let Some(model) = target(&stack) {
                     let index = model;
                     if seen[index] {
@@ -282,23 +282,21 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ()> {
             }
             Event::Empty(_) => return Err(()),
             Event::Text(text) => {
-                let decoded = text.decode().map_err(|_| ())?;
-                append(&mut value, &stack, &decoded)?;
+                append(&mut value, &stack, &text)?;
             }
             Event::CData(text) => {
-                let decoded = text.decode().map_err(|_| ())?;
                 if stack.is_empty() {
                     return Err(());
                 }
-                append(&mut value, &stack, &decoded)?;
+                append(&mut value, &stack, &text)?;
             }
             Event::GeneralRef(reference) => {
-                let encoded = format!("&{};", reference.decode().map_err(|_| ())?);
+                let encoded = format!("&{};", &*reference);
                 let decoded = quick_xml::escape::unescape(&encoded).map_err(|_| ())?;
                 append(&mut value, &stack, &decoded)?;
             }
             Event::End(element) => {
-                if stack.last().map(Vec::as_slice) != Some(element.name().as_ref()) {
+                if stack.last().map(Vec::as_slice) != Some(element.name().as_ref().as_bytes()) {
                     return Err(());
                 }
                 if let Some(model) = target(&stack) {
