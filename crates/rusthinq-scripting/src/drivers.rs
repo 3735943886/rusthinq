@@ -1,5 +1,6 @@
 //! Bounded off-thread driver/module preparation, with explicit filesystem ownership.
 use crate::{Compiled, Error, Limits, context, modules::Source};
+use rhai::{ASTNode, Engine, Expr, OptimizationLevel, Stmt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -57,20 +58,33 @@ fn modules(
     bundle: &mut Vec<Source>,
     total: &mut usize,
 ) -> io::Result<()> {
-    for line in source.lines() {
-        let Some(import) = line.trim().strip_prefix("import ") else {
-            continue;
-        };
-        let module = import
-            .trim()
-            .strip_prefix('"')
-            .and_then(|value| value.split_once('"').map(|pair| pair.0))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "only static named imports are supported",
-                )
-            })?;
+    // Use Rhai's parser so whitespace, comments, escaped strings and multiple
+    // imports per line have the same meaning as the source we later execute.
+    let mut engine = Engine::new();
+    engine
+        .set_optimization_level(OptimizationLevel::None)
+        .set_max_expr_depths(200, 100);
+    let ast = engine
+        .compile(source)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut imports = Vec::new();
+    let static_imports = ast.walk(&mut |path| {
+        if let Some(ASTNode::Stmt(Stmt::Import(import, _))) = path.last() {
+            let Expr::StringConstant(module, _) = &import.0 else {
+                return false;
+            };
+            imports.push(module.to_string());
+        }
+        true
+    });
+    if !static_imports {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "only static named imports are supported",
+        ));
+    }
+    for module in &imports {
+        let module = module.as_str();
         if seen.contains(module) {
             continue;
         }

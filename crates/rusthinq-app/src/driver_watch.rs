@@ -31,7 +31,7 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
             let fingerprint = match fingerprint {
                 Ok(value) => value,
                 Err(error) => {
-                    app.driver_error(id, error.to_string());
+                    app.driver_error(id, format!("driver reload source scan: {error}"));
                     continue;
                 }
             };

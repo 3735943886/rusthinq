@@ -16,6 +16,7 @@ use std::{
 use tokio::{net::TcpStream, sync::OnceCell};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DNS_MESSAGE: usize = 65535;
 const MIN_TTL: u64 = 60;
 const MAX_TTL: u64 = 3600;
 const MAX_SERVERS: usize = 8;
@@ -133,8 +134,11 @@ impl Resolver {
 
     async fn query(&self, hostname: &str) -> Resolved {
         let mut last = None;
+        // Share one DNS budget across the configured servers, leaving time for
+        // TCP/TLS inside the caller's default ten-second connection deadline.
+        let server_timeout = TIMEOUT / self.servers.len() as u32;
         for server in &self.servers {
-            match query_server(server, hostname).await {
+            match query_server(server, hostname, server_timeout).await {
                 Ok(records) if !records.is_empty() => {
                     let ttl = records
                         .iter()
@@ -212,12 +216,25 @@ impl reqwest::dns::Resolve for DnsResolver {
     }
 }
 
-async fn query_server(server: &Server, hostname: &str) -> io::Result<Vec<Record>> {
+async fn query_server(
+    server: &Server,
+    hostname: &str,
+    budget: Duration,
+) -> io::Result<Vec<Record>> {
     // IPv4 first: an IPv6-only answer is of no use to a host without IPv6.
-    let (v4, v6) = tokio::join!(
-        query_type(server, hostname, TYPE_A),
-        query_type(server, hostname, TYPE_AAAA),
-    );
+    // Time out each family independently so a silent AAAA lookup cannot discard
+    // an IPv4 answer already received (or vice versa).
+    let query = |qtype| async move {
+        tokio::time::timeout(budget, query_type(server, hostname, qtype))
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS server timed out",
+                ))
+            })
+    };
+    let (v4, v6) = tokio::join!(query(TYPE_A), query(TYPE_AAAA));
     match (v4, v6) {
         (Err(error), Err(_)) => Err(error),
         (v4, v6) => {
@@ -267,17 +284,29 @@ async fn doh_query(url: &url::Url, hostname: &str, qtype: u16) -> io::Result<Vec
     if !response.status().is_success() {
         return Err(io::Error::other(format!("DoH HTTP {}", response.status())));
     }
-    if response.content_length().is_some_and(|n| n > 65535) {
-        return Err(io::Error::other("DoH response exceeded"));
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|_| io::Error::other(format!("DoH response from {url} failed")))?;
-    if body.len() > 65535 {
-        return Err(io::Error::other("DoH response exceeded"));
-    }
+    let body = read_doh_body(response).await?;
     parse_response(&body, qtype)
+}
+
+async fn read_doh_body(mut response: reqwest::Response) -> io::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_DNS_MESSAGE as u64)
+    {
+        return Err(io::Error::other("DoH response exceeded"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| io::Error::other("DoH response body failed"))?
+    {
+        if chunk.len() > MAX_DNS_MESSAGE - body.len() {
+            return Err(io::Error::other("DoH response exceeded"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 async fn plain_query(address: SocketAddr, hostname: &str, qtype: u16) -> io::Result<Vec<Record>> {
@@ -296,7 +325,7 @@ async fn plain_query(address: SocketAddr, hostname: &str, qtype: u16) -> io::Res
             continue;
         }
         let mut buffer = [0u8; 4096];
-        match tokio::time::timeout(TIMEOUT, socket.recv(&mut buffer)).await {
+        match tokio::time::timeout(TIMEOUT / 2, socket.recv(&mut buffer)).await {
             Ok(Ok(n)) => return parse_response(buffer.get(..n).unwrap_or_default(), qtype),
             Ok(Err(error)) => last = Some(error),
             Err(_) => {
@@ -562,6 +591,144 @@ mod tests {
         assert_eq!(
             unreachable.resolve("::1").await.unwrap(),
             vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]
+        );
+    }
+    #[tokio::test]
+    async fn silent_primary_dns_reaches_backup_within_connection_deadline() {
+        let primary = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backup = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Resolver::new(&[
+            primary.local_addr().unwrap().to_string(),
+            backup.local_addr().unwrap().to_string(),
+        ])
+        .unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..2 {
+                let (n, peer) = backup.recv_from(&mut buffer).await.unwrap();
+                let query = &buffer[..n];
+                let qtype = u16::from_be_bytes([query[n - 4], query[n - 3]]);
+                let response = if qtype == TYPE_A {
+                    build_response(query, &[(TYPE_A, 120, &[127, 0, 0, 1])], 0)
+                } else {
+                    build_response(query, &[], 0)
+                };
+                backup.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_with(
+                &resolver,
+                "backup.example.test",
+                listener.local_addr().unwrap().port(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_address_family_survives_other_family_timeout() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = Server::Plain(socket.local_addr().unwrap());
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            loop {
+                let (n, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let query = &buffer[..n];
+                if u16::from_be_bytes([query[n - 4], query[n - 3]]) == TYPE_A {
+                    let response = build_response(query, &[(TYPE_A, 120, &[127, 0, 0, 1])], 0);
+                    socket.send_to(&response, peer).await.unwrap();
+                }
+            }
+        });
+        let result = query_server(&server, "family.example.test", Duration::from_millis(100)).await;
+        responder.abort();
+        let _ = responder.await;
+        assert_eq!(
+            result.unwrap(),
+            vec![Record {
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ttl: 120
+            }]
+        );
+    }
+
+    async fn http_response(
+        headers: &str,
+        body: Vec<u8>,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let headers = headers.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            // Keep the stream open: an oversized body must fail before EOF.
+            std::future::pending::<()>().await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn doh_body_rejects_chunked_overflow_without_waiting_for_eof() {
+        let mut body = Vec::new();
+        for _ in 0..2 {
+            body.extend_from_slice(b"8000\r\n");
+            body.extend(vec![0; 32768]);
+            body.extend_from_slice(b"\r\n");
+        }
+        let (response, server) = http_response(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            body,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(1), read_doh_body(response)).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "DoH response exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn doh_body_accepts_exact_limit_and_rejects_oversized_content_length() {
+        let mut body = b"ffff\r\n".to_vec();
+        body.extend(vec![42; MAX_DNS_MESSAGE]);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (response, server) = http_response(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            body,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(1), read_doh_body(response)).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(result.unwrap().unwrap(), vec![42; MAX_DNS_MESSAGE]);
+        let (response, server) = http_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n",
+            Vec::new(),
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(1), read_doh_body(response)).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "DoH response exceeded"
         );
     }
 }
