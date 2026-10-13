@@ -65,7 +65,6 @@ struct Gateway {
 #[derive(Clone)]
 struct Account {
     headers: HeaderMap,
-    home: String,
     expires: tokio::time::Instant,
 }
 #[derive(Clone)]
@@ -76,6 +75,9 @@ pub struct Client {
     gateway_url: Url,
     gateway: Option<Gateway>,
     account: Option<Account>,
+    // Routing metadata is separate from authentication headers: URL construction
+    // must never receive the account's credential-bearing state.
+    household_id: Option<String>,
 }
 fn text(value: &str, max: usize) -> Result<(), Error> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
@@ -202,6 +204,7 @@ impl Client {
             gateway_url: endpoint(GATEWAY)?,
             gateway: None,
             account: None,
+            household_id: None,
         })
     }
     /// Test seam: an LG-compatible service at `gateway`, trusted by `root_pem`, with
@@ -239,6 +242,11 @@ impl Client {
         headers: HeaderMap,
         body: Option<String>,
     ) -> Result<Value, Error> {
+        // Check the actual destination at the send boundary as well as enforcing
+        // HTTPS on the client, including for authenticated and OAuth requests.
+        if url.scheme() != "https" {
+            return Err(Error::InvalidInput);
+        }
         if body.as_ref().is_some_and(|body| body.len() > LIMIT) {
             return Err(Error::InvalidInput);
         }
@@ -495,11 +503,8 @@ impl Client {
         if tokio::time::Instant::now() >= expires {
             return Err(Error::InvalidResponse);
         }
-        self.account = Some(Account {
-            headers,
-            home: home.into(),
-            expires,
-        });
+        self.account = Some(Account { headers, expires });
+        self.household_id = Some(home.into());
         Ok(())
     }
     pub fn country(&self) -> &str {
@@ -522,19 +527,23 @@ impl Client {
     }
     pub fn logout(&mut self) {
         self.account = None;
+        self.household_id = None;
     }
     fn home_url(&self, device: Option<&str>) -> Result<Url, Error> {
         if !self.authenticated() {
             return Err(Error::NotAuthenticated);
         }
-        let account = self.account.as_ref().ok_or(Error::NotAuthenticated)?;
+        let household_id = self
+            .household_id
+            .as_deref()
+            .ok_or(Error::NotAuthenticated)?;
         let mut url = append(
             &self.gateway.as_ref().ok_or(Error::NotAuthenticated)?.api,
             "service/homes",
         )?;
         {
             let mut path = url.path_segments_mut().map_err(|_| Error::InvalidInput)?;
-            path.push(&account.home);
+            path.push(household_id);
             if let Some(device) = device {
                 text(device, 256)?;
                 if matches!(device, "." | "..") {
@@ -849,13 +858,70 @@ mod tests {
         assert!(Client::new("kr").is_err());
         assert!(Client::new("KRR").is_err());
     }
-    async fn mock(replies: Vec<(u16, String)>) -> (Client, tokio::task::JoinHandle<Vec<String>>) {
+    #[tokio::test]
+    async fn request_rejects_cleartext_before_sending_credentials() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let mut client = Client::new("KR").unwrap();
+        // Even a mistakenly permissive HTTP client cannot bypass the request guard.
+        client.http = Http::builder().no_proxy().build().unwrap();
+        let mut headers = HeaderMap::new();
+        header(&mut headers, "authorization", "Bearer private-access").unwrap();
+        assert_eq!(
+            client
+                .request(
+                    url,
+                    Method::POST,
+                    headers,
+                    Some("refresh_token=private-refresh".into())
+                )
+                .await
+                .unwrap_err(),
+            Error::InvalidInput,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    fn mock_tls() -> &'static (openssl::ssl::SslAcceptor, String) {
+        use openssl::{
+            pkey::PKey,
+            ssl::{SslAcceptor, SslMethod},
+            x509::X509,
+        };
+        use rusthinq_server::certificates::Authority;
+        static TLS: std::sync::OnceLock<(SslAcceptor, String)> = std::sync::OnceLock::new();
+        TLS.get_or_init(|| {
+            let ca = Authority::generate("cloud-fixture-ca.example", 2048).unwrap();
+            let identity = ca
+                .server_identity("cloud.example", Default::default())
+                .unwrap();
+            let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).unwrap();
+            acceptor
+                .set_certificate(&X509::from_pem(&identity.certificate_chain_pem).unwrap())
+                .unwrap();
+            acceptor
+                .set_private_key(&PKey::private_key_from_pem(&identity.private_key_pem).unwrap())
+                .unwrap();
+            (acceptor.build(), ca.certificate_pem().to_owned())
+        })
+    }
+
+    async fn mock(replies: Vec<(u16, String)>) -> (Client, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("https://cloud.example:{}/", address.port())).unwrap();
+        let (acceptor, root) = mock_tls();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
             for (status, body) in replies {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let ssl = openssl::ssl::Ssl::new(acceptor.context()).unwrap();
+                let mut stream = tokio_openssl::SslStream::new(ssl, stream).unwrap();
+                std::pin::Pin::new(&mut stream).accept().await.unwrap();
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
                     request.push(stream.read_u8().await.unwrap());
@@ -874,14 +940,18 @@ mod tests {
                 stream.read_exact(&mut data).await.unwrap();
                 request.extend_from_slice(&data);
                 requests.push(String::from_utf8(request).unwrap());
-                stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                // Oversized-response tests intentionally close the client after headers.
+                let _ = stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
             requests
         });
         let mut client = Client::new("KR").unwrap();
-        // Plaintext is confined to this local fixture. Production Client forbids HTTP.
         client.http = Http::builder()
+            .https_only(true)
             .no_proxy()
+            .resolve("cloud.example", address)
+            .add_root_certificate(reqwest::Certificate::from_pem(root.as_bytes()).unwrap())
             .timeout(Duration::from_secs(2))
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -994,12 +1064,19 @@ mod tests {
         );
         client.remove_device("d/a").await.unwrap();
         client.logout();
+        assert!(client.household_id.is_none());
         assert_eq!(
             client.list_devices().await.unwrap_err(),
             Error::NotAuthenticated
         );
         let requests = task.await.unwrap();
         assert_eq!(requests.len(), 8);
+        for request in &requests {
+            let destination = request.lines().next().unwrap();
+            assert!(!destination.contains("private-access"));
+            assert!(!destination.contains("refresh%26secret"));
+            assert!(!destination.contains("refresh_token"));
+        }
         assert!(requests[0].contains("refresh_token=refresh%26secret"));
         assert!(requests[1].contains("authorization: Bearer private-access"));
         assert!(requests[2].contains("x-device-type: 601"));
@@ -1216,7 +1293,7 @@ mod tests {
             client.authenticate("second").await.unwrap_err(),
             Error::Http(503)
         );
-        assert_eq!(client.account.as_ref().unwrap().home, "h/a");
+        assert_eq!(client.household_id.as_deref(), Some("h/a"));
         assert_eq!(task.await.unwrap().len(), 7);
     }
     #[tokio::test]
