@@ -23,9 +23,14 @@ fn name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
+/// LG model ids may contain `.` (`F_V8_Y___W.B_2QEUK`); modules stay plain names.
+/// Every dot-separated part is a valid name, so `.`, `..` and hidden files are rejected.
+fn model(model: &str) -> bool {
+    model.len() <= 128 && model.split('.').all(name)
+}
 
-fn read(root: &Path, name: &str) -> io::Result<String> {
-    if !self::name(name) {
+fn read(root: &Path, name: &str, valid: fn(&str) -> bool) -> io::Result<String> {
+    if !valid(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid driver/module name",
@@ -94,7 +99,7 @@ fn modules(
                 "cyclic/oversized driver module bundle",
             ));
         }
-        let source = read(root, module)?;
+        let source = read(root, module, self::name)?;
         *total = total
             .checked_add(source.len() + module.len())
             .filter(|total| *total <= MAX_SOURCE)
@@ -119,7 +124,10 @@ impl Config {
             || self.topic_prefix.contains(['#', '+', '\0'])
             || self.bindings.len() > 256
             || self.bindings.iter().any(|(id, model)| {
-                id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) || !name(model)
+                id.is_empty()
+                    || id.len() > 256
+                    || id.chars().any(char::is_control)
+                    || !self::model(model)
             })
         {
             return Err(io::Error::new(
@@ -134,7 +142,7 @@ impl Config {
         use std::hash::{Hash, Hasher};
         let root = self.directory.canonicalize()?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model)?;
+        let source = read(&root, model, self::model)?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -176,7 +184,7 @@ impl Config {
             .canonicalize()
             .map_err(|e| Error::Compile(e.to_string()))?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model).map_err(|e| Error::Compile(e.to_string()))?;
+        let source = read(&root, model, self::model).map_err(|e| Error::Compile(e.to_string()))?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -254,5 +262,35 @@ impl Config {
         }
         entry.push_str("}\n");
         compiled.with_entry(&entry)?.with_modules(bundle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_ids_may_contain_dots_but_not_empty_parts() {
+        for valid in ["DHUM_056905_WW", "F_V8_Y___W.B_2QEUK", "a.b.c", "x-1"] {
+            assert!(model(valid), "{valid}");
+        }
+        for invalid in ["", ".", "..", ".hidden", "a.", "a..b", "../x", "a/b", "a b"] {
+            assert!(!model(invalid), "{invalid}");
+        }
+        assert!(!model(&"a".repeat(129)));
+        assert!(!name("a.b"), "module names stay plain");
+    }
+
+    #[test]
+    fn dotted_model_loads_while_dotted_module_does_not() {
+        let root = std::env::temp_dir().join(format!("rusthinq-drivers-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("F_V8_Y___W.B_2QEUK.rhai"), "fn start(ctx) {}").unwrap();
+        let root = root.canonicalize().unwrap();
+        let read_model = read(&root, "F_V8_Y___W.B_2QEUK", model);
+        let read_module = read(&root, "F_V8_Y___W.B_2QEUK", name);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(read_model.unwrap(), "fn start(ctx) {}");
+        assert_eq!(read_module.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }
