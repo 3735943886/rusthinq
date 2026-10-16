@@ -841,10 +841,76 @@
       return text.slice(0, 200);
     }
   }
+  function addActivity(label, device, detail, error) {
+    $("activity-empty")?.remove();
+    const row = document.createElement("article");
+    row.className = "activity-item";
+    const symbol = document.createElement("span");
+    symbol.className = "event-icon";
+    symbol.innerHTML = icon(error ? "info" : "pulse");
+    const info = document.createElement("div");
+    info.append(
+      text("strong", label),
+      text("p", `${device || ""}${device ? " · " : ""}${String(detail).slice(0, 500)}`),
+    );
+    const time = text("time", new Date().toLocaleTimeString());
+    row.append(symbol, info, time);
+    $("activity-list").prepend(row);
+    while ($("activity-list").children.length > 100)
+      $("activity-list").lastElementChild.remove();
+  }
+  // Drivers republish every property on each report; only a changed value is news. Changes from
+  // one report arrive together and are shown as one row per device.
+  const published = new Map();
+  const changed = new Map();
+  let changeTimer = null;
+  function flushChanges() {
+    for (const [device, props] of changed)
+      addActivity(
+        "Device state changed",
+        device,
+        [...props].map(([prop, value]) => `${prop} = ${value}`).join(", "),
+      );
+    changed.clear();
+  }
+  function driverOutput(event) {
+    let publication;
+    try {
+      publication = JSON.parse(event.payload);
+    } catch {
+      return;
+    }
+    const device = event.context?.device;
+    const parts = String(publication.topic || "").split("/");
+    // Only the device's own topics: <prefix>/<id>/<prop>. The descriptor lives elsewhere.
+    if (!device || parts.length < 3 || parts[parts.length - 2] !== device) return;
+    const prop = parts[parts.length - 1];
+    if (prop === "reject") {
+      let rejection = {};
+      try {
+        rejection = JSON.parse(publication.payload);
+      } catch {}
+      addActivity(
+        "Driver rejected a command",
+        device,
+        `${rejection.prop ?? "?"}: ${rejection.reason || rejection.code || "rejected"}`,
+        true,
+      );
+      return;
+    }
+    const key = `${device}/${prop}`;
+    if (published.get(key) === publication.payload) return;
+    published.set(key, publication.payload);
+    if (!changed.has(device)) changed.set(device, new Map());
+    changed.get(device).set(prop, publication.payload);
+    clearTimeout(changeTimer);
+    changeTimer = setTimeout(flushChanges, 300);
+  }
   function activity(event) {
     controls.event(event);
-    // Packet bytes and script publications belong in the studio, not the event list.
-    if (["data", "sent", "scriptOutput"].includes(event.type)) return;
+    if (event.type === "scriptOutput") return driverOutput(event);
+    // Packet bytes belong in the studio, not the event list.
+    if (["data", "sent"].includes(event.type)) return;
     // A driver run is only news when it fails; its results arrive as state.
     if (event.type === "scriptExecuted" && !event.error) return;
     // A driver turns device reports into state; without one, show the report itself.
@@ -860,16 +926,9 @@
     const fingerprint = JSON.stringify([event.type, event.device, summary]);
     if (fingerprint === lastEvent && event.type === "stateChanged") return;
     lastEvent = fingerprint;
-    $("activity-empty")?.remove();
-    const row = document.createElement("article");
-    row.className = "activity-item";
-    const symbol = document.createElement("span");
-    symbol.className = "event-icon";
-    symbol.innerHTML = icon(event.error ? "info" : "pulse");
-    const info = document.createElement("div");
     const labels = {
       stateChanged: event.cloudBound !== undefined ? "Device report" : "Device state updated",
-      scriptExecuted: "Driver executed",
+      scriptExecuted: "Driver failed",
       scriptStopped: "Driver stopped",
       scriptDelivery: "Device transmission",
       rejected: "Operation rejected",
@@ -877,18 +936,12 @@
       lost: "Events missed",
       injected: "Packet injected",
     };
-    info.append(
-      text("strong", labels[event.type] || event.type),
-      text(
-        "p",
-        `${event.device || event.context?.device || ""}${event.device || event.context?.device ? " · " : ""}${event.type === "lost" ? `${event.events} events missed` : event.type === "scriptExecuted" ? event.error || "Execution completed" : String(summary).slice(0, 500)}`,
-      ),
+    addActivity(
+      labels[event.type] || event.type,
+      event.device || event.context?.device,
+      event.type === "lost" ? `${event.events} events missed` : summary,
+      event.error,
     );
-    const time = text("time", new Date().toLocaleTimeString());
-    row.append(symbol, info, time);
-    $("activity-list").prepend(row);
-    while ($("activity-list").children.length > 100)
-      $("activity-list").lastElementChild.remove();
     if (event.type === "lost")
       toast(`${event.events} activity events were missed.`, "error");
   }
