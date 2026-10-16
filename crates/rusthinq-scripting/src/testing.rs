@@ -294,10 +294,18 @@ pub fn run(directory: &Path) -> io::Result<Vec<Report>> {
     };
     config.validate()?;
     let mut reports = Vec::new();
+    // A flat runtime directory or a scripts checkout with its drivers in `drivers/`.
     let mut paths = std::fs::read_dir(&config.directory)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    paths.sort();
+    let drivers = config.directory.join("drivers");
+    if drivers.is_dir() {
+        for entry in std::fs::read_dir(drivers)? {
+            paths.push(entry?.path());
+        }
+    }
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    paths.dedup_by(|a, b| a.file_name() == b.file_name());
     for path in paths {
         let Some(model) = path
             .file_stem()

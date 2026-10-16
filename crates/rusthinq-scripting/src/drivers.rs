@@ -29,14 +29,35 @@ fn model(model: &str) -> bool {
     model.len() <= 128 && model.split('.').all(name)
 }
 
-fn read(root: &Path, name: &str, valid: fn(&str) -> bool) -> io::Result<String> {
-    if !valid(name) {
+/// Where `name.rhai` lives: the root itself, which holds local overrides and flat
+/// installs, else its `drivers/` or `modules/` subdirectory, a scripts checkout as is.
+fn locate(root: &Path, subdirectory: &str, name: &str) -> PathBuf {
+    let flat = root.join(format!("{name}.rhai"));
+    if flat.exists() {
+        flat
+    } else {
+        root.join(subdirectory).join(format!("{name}.rhai"))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Driver,
+    Module,
+}
+
+fn read(root: &Path, name: &str, kind: Kind) -> io::Result<String> {
+    let (valid, subdirectory) = match kind {
+        Kind::Driver => (self::model(name), "drivers"),
+        Kind::Module => (self::name(name), "modules"),
+    };
+    if !valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid driver/module name",
         ));
     }
-    let path = root.join(format!("{name}.rhai")).canonicalize()?;
+    let path = locate(root, subdirectory, name).canonicalize()?;
     if !path.starts_with(root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -99,7 +120,7 @@ fn modules(
                 "cyclic/oversized driver module bundle",
             ));
         }
-        let source = read(root, module, self::name)?;
+        let source = read(root, module, Kind::Module)?;
         *total = total
             .checked_add(source.len() + module.len())
             .filter(|total| *total <= MAX_SOURCE)
@@ -142,7 +163,7 @@ impl Config {
         use std::hash::{Hash, Hasher};
         let root = self.directory.canonicalize()?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model, self::model)?;
+        let source = read(&root, model, Kind::Driver)?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -184,7 +205,7 @@ impl Config {
             .canonicalize()
             .map_err(|e| Error::Compile(e.to_string()))?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model, self::model).map_err(|e| Error::Compile(e.to_string()))?;
+        let source = read(&root, model, Kind::Driver).map_err(|e| Error::Compile(e.to_string()))?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -287,10 +308,45 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("F_V8_Y___W.B_2QEUK.rhai"), "fn start(ctx) {}").unwrap();
         let root = root.canonicalize().unwrap();
-        let read_model = read(&root, "F_V8_Y___W.B_2QEUK", model);
-        let read_module = read(&root, "F_V8_Y___W.B_2QEUK", name);
+        let read_model = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Driver);
+        let read_module = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Module);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(read_model.unwrap(), "fn start(ctx) {}");
         assert_eq!(read_module.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn checkout_layout_resolves_and_root_files_override() {
+        let root = tempfile_dir("layout");
+        std::fs::create_dir_all(root.join("drivers")).unwrap();
+        std::fs::create_dir_all(root.join("modules")).unwrap();
+        std::fs::write(root.join("drivers/M.rhai"), "import \"c\" as c;").unwrap();
+        std::fs::write(root.join("modules/c.rhai"), "fn shipped() {}").unwrap();
+        let root = root.canonicalize().unwrap();
+        let driver = read(&root, "M", Kind::Driver).unwrap();
+        let shipped = read(&root, "c", Kind::Module).unwrap();
+        std::fs::write(root.join("c.rhai"), "fn local() {}").unwrap();
+        let local = read(&root, "c", Kind::Module).unwrap();
+        let module_as_driver = read(&root, "c", Kind::Driver).unwrap();
+        let missing = read(&root, "M", Kind::Module);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(driver, "import \"c\" as c;");
+        assert_eq!(shipped, "fn shipped() {}");
+        assert_eq!(
+            local, "fn local() {}",
+            "a root file overrides the shipped one"
+        );
+        assert_eq!(
+            module_as_driver, "fn local() {}",
+            "the root stays flat for both"
+        );
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rusthinq-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 }
