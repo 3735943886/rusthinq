@@ -274,6 +274,19 @@ impl Compiled {
             .iter_functions()
             .any(|function| function.name == name && function.params.len() == arguments)
     }
+    /// Adopt a base script's functions as this script's own; this script's definitions win.
+    /// The base's imports join this script's, so its bundled modules resolve as usual.
+    pub fn with_base(mut self, source: &str) -> Result<Self, Error> {
+        if self.modules_loaded {
+            return Err(Error::InvalidConfig);
+        }
+        let base = self
+            .engine
+            .compile(source)
+            .map_err(|e| Error::Compile(e.to_string()))?;
+        self.ast = base.merge(&self.ast);
+        Ok(self)
+    }
     pub fn with_entry(mut self, source: &str) -> Result<Self, Error> {
         self.source_bytes = self
             .source_bytes

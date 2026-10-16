@@ -137,6 +137,38 @@ fn modules(
     }
     Ok(())
 }
+/// Top-level `import "name";` without `as`: the driver inherits that module's functions.
+fn bases(source: &str) -> io::Result<Vec<String>> {
+    let ast = Engine::new()
+        .compile(source)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(ast
+        .statements()
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Import(import, _) if import.1.name.is_empty() => match &import.0 {
+                Expr::StringConstant(module, _) => Some(module.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect())
+}
+/// Inherited modules, nearest first: a later entry's functions yield to every earlier one.
+fn inheritance(bundle: &[Source], source: &str, chain: &mut Vec<String>) -> io::Result<()> {
+    for base in bases(source)?.into_iter().rev() {
+        if chain.contains(&base) {
+            continue;
+        }
+        let module = bundle
+            .iter()
+            .find(|module| module.name == base)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "inherited module"))?;
+        chain.push(base);
+        inheritance(bundle, &module.source, chain)?;
+    }
+    Ok(())
+}
 impl Config {
     pub fn validate(&self) -> io::Result<()> {
         if !self.directory.is_dir()
@@ -240,7 +272,13 @@ impl Config {
             outputs: 256,
             output_bytes: 1_048_576,
         };
-        let compiled = Compiled::with_context(&source, limits, consumer, ctx)?;
+        let mut chain = Vec::new();
+        inheritance(&bundle, &source, &mut chain).map_err(|e| Error::Compile(e.to_string()))?;
+        let mut compiled = Compiled::with_context(&source, limits, consumer, ctx)?;
+        for base in &chain {
+            let module = bundle.iter().find(|module| &module.name == base);
+            compiled = compiled.with_base(module.map_or("", |module| module.source.as_str()))?;
+        }
         let mut entry = String::new();
         entry.push_str("fn __init(ctx,text) {");
         if compiled.has_function("publish_config", 1) {
@@ -348,5 +386,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn unaliased_import_inherits_hooks_nearest_first() {
+        let root = tempfile_dir("inherit");
+        std::fs::create_dir_all(root.join("drivers")).unwrap();
+        std::fs::create_dir_all(root.join("modules")).unwrap();
+        std::fs::write(root.join("modules/base.rhai"), "fn on_data(ctx, data) {}").unwrap();
+        std::fs::write(root.join("modules/mid.rhai"), "import \"base\";").unwrap();
+        std::fs::write(
+            root.join("drivers/M.rhai"),
+            "import \"mid\"; import \"x\" as x;",
+        )
+        .unwrap();
+        std::fs::write(root.join("modules/x.rhai"), "fn f() {}").unwrap();
+        let config = Config {
+            watch: false,
+            directory: root.clone(),
+            topic_prefix: "t".into(),
+            bindings: Default::default(),
+        };
+        let compiled = config.prepare("d", "M", true, true);
+        let source = std::fs::read_to_string(root.join("drivers/M.rhai")).unwrap();
+        let bundle = vec![
+            Source {
+                name: "base".into(),
+                source: "fn on_data(ctx, data) {}".into(),
+            },
+            Source {
+                name: "mid".into(),
+                source: "import \"base\";".into(),
+            },
+        ];
+        let mut chain = Vec::new();
+        inheritance(&bundle, &source, &mut chain).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(chain, ["mid", "base"], "aliased imports are not inherited");
+        assert!(compiled.unwrap().has_function("on_data", 2));
     }
 }
