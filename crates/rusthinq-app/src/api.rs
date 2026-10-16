@@ -164,6 +164,13 @@ fn event_value(event: Event) -> Value {
         Event::Metadata(metadata) => {
             json!({"type":"metadata","device":metadata.device_id,"model":metadata.model_name,"deviceType":metadata.device_type})
         }
+        // Still a state change for status refreshers; the panel summarizes the payload.
+        Event::Transport(
+            rusthinq_server::Event::CloudBound(id, bytes)
+            | rusthinq_server::Event::BridgedCloudBound(id, _, bytes),
+        ) => {
+            json!({"type":"stateChanged","device":id.device,"cloudBound":String::from_utf8_lossy(&bytes)})
+        }
         other => json!({"type":"stateChanged","detail":format!("{other:?}")}),
     }
 }

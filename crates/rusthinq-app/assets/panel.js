@@ -829,11 +829,29 @@
     });
   };
   let lastEvent = "";
+  function cloudSummary(text) {
+    try {
+      const message = JSON.parse(text);
+      return (
+        [message.kind, message.cmd]
+          .filter((part) => typeof part === "string" && part)
+          .join(" · ") || text.slice(0, 200)
+      );
+    } catch {
+      return text.slice(0, 200);
+    }
+  }
   function activity(event) {
     controls.event(event);
     // Packet bytes and script publications belong in the studio, not the event list.
     if (["data", "sent", "scriptOutput"].includes(event.type)) return;
+    // A driver run is only news when it fails; its results arrive as state.
+    if (event.type === "scriptExecuted" && !event.error) return;
+    // A driver turns device reports into state; without one, show the report itself.
+    if (event.cloudBound !== undefined && snapshot.devices[event.device]?.mapped)
+      return;
     const summary =
+      (event.cloudBound !== undefined && cloudSummary(event.cloudBound)) ||
       event.error ||
       event.reason ||
       event.delivery ||
@@ -850,7 +868,7 @@
     symbol.innerHTML = icon(event.error ? "info" : "pulse");
     const info = document.createElement("div");
     const labels = {
-      stateChanged: "Device state updated",
+      stateChanged: event.cloudBound !== undefined ? "Device report" : "Device state updated",
       scriptExecuted: "Driver executed",
       scriptStopped: "Driver stopped",
       scriptDelivery: "Device transmission",
