@@ -222,8 +222,90 @@ async fn until(events: &mut broadcast::Receiver<Event>, predicate: impl Fn(&Even
     .unwrap();
 }
 
+async fn local_device(
+    local_address: SocketAddr,
+    id: &str,
+    events: &mut broadcast::Receiver<Event>,
+) -> SslStream<TcpStream> {
+    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    connector
+        .cert_store_mut()
+        .add_cert(X509::from_pem(authority().certificate_pem().as_bytes()).unwrap())
+        .unwrap();
+    let ssl = connector
+        .build()
+        .configure()
+        .unwrap()
+        .into_ssl("mqtt.example")
+        .unwrap();
+    let mut device = SslStream::new(ssl, TcpStream::connect(local_address).await.unwrap()).unwrap();
+    Pin::new(&mut device).connect().await.unwrap();
+    device
+        .write_all(
+            &mqtt::frame(
+                0x10,
+                &{
+                    let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 0];
+                    body.extend_from_slice(&(id.len() as u16).to_be_bytes());
+                    body.extend_from_slice(id.as_bytes());
+                    body
+                },
+                8192,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(packet(&mut device).await, [0x20, 2, 0, 0]);
+    let topic = format!("lime/devices/{id}");
+    let topic = topic.as_bytes();
+    let mut body = vec![0, 1, 0, topic.len() as u8];
+    body.extend_from_slice(topic);
+    body.push(0);
+    device
+        .write_all(&mqtt::frame(0x82, &body, 8192).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(packet(&mut device).await, [0x90, 3, 0, 1, 0]);
+    publish(
+        &mut device,
+        &format!("clip/provisioning/devices/{id}"),
+        json!({"did":id,"cmd":"deploy","kind":"MODEL","data":{"appInfo":{"protocolVer":"7"},"platformInfo":{"version":"real"}}})
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    published(&packet(&mut device).await);
+    publish(
+        &mut device,
+        &format!("clip/message/devices/{id}"),
+        json!({"did":id,"cmd":"completeProvisioning_ack"})
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    until(events, |event| {
+        matches!(
+            event,
+            Event::Lifecycle(rusthinq_lifecycle::Action::Online { id: device, .. }) if device == id
+        )
+    })
+    .await;
+    device
+}
+
 #[tokio::test]
 async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_acks() {
+    bridge_round_trips(false).await;
+}
+
+#[tokio::test]
+async fn late_local_reconnection_ignores_events_accumulated_while_offline() {
+    bridge_round_trips(true).await;
+}
+
+async fn bridge_round_trips(late_local: bool) {
+    const EVENT_CAPACITY: usize = 256;
     let directory = tempfile::tempdir().unwrap();
     // The device is known as incarnation 1, and its cloud registration was adopted earlier.
     let mut storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
@@ -324,7 +406,7 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_ack
         },
         Arc::new(SystemClock),
         Duration::ZERO,
-        256,
+        EVENT_CAPACITY,
         None,
     )
     .unwrap()
@@ -352,63 +434,7 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_ack
     let cloud_task = tokio::spawn(cloud.run(stopped.clone()));
     let task = tokio::spawn(service.serve((thin, thin_listener), (local, local_listener), stopped));
 
-    // The local appliance connects and provisions as on a real network.
-    let mut connector = SslConnector::builder(SslMethod::tls_client()).unwrap();
-    connector
-        .cert_store_mut()
-        .add_cert(X509::from_pem(authority().certificate_pem().as_bytes()).unwrap())
-        .unwrap();
-    let ssl = connector
-        .build()
-        .configure()
-        .unwrap()
-        .into_ssl("mqtt.example")
-        .unwrap();
-    let mut device = SslStream::new(ssl, TcpStream::connect(local_address).await.unwrap()).unwrap();
-    Pin::new(&mut device).connect().await.unwrap();
-    device
-        .write_all(
-            &mqtt::frame(
-                0x10,
-                &[0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 0, 0, 1, b'd'],
-                8192,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(packet(&mut device).await, [0x20, 2, 0, 0]);
-    let topic = b"lime/devices/d";
-    let mut body = vec![0, 1, 0, topic.len() as u8];
-    body.extend_from_slice(topic);
-    body.push(0);
-    device
-        .write_all(&mqtt::frame(0x82, &body, 8192).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(packet(&mut device).await, [0x90, 3, 0, 1, 0]);
-    publish(
-        &mut device,
-        "clip/provisioning/devices/d",
-        json!({"did":"d","cmd":"deploy","kind":"MODEL","data":{"appInfo":{"protocolVer":"7"},"platformInfo":{"version":"real"}}})
-            .to_string()
-            .as_bytes(),
-    )
-    .await;
-    published(&packet(&mut device).await);
-    publish(
-        &mut device,
-        "clip/message/devices/d",
-        br#"{"did":"d","cmd":"completeProvisioning_ack"}"#,
-    )
-    .await;
-    until(&mut events, |event| {
-        matches!(
-            event,
-            Event::Lifecycle(rusthinq_lifecycle::Action::Online { .. })
-        )
-    })
-    .await;
+    let mut device = local_device(local_address, "d", &mut events).await;
     let frame = json!({"did":"d","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())}).to_string();
     // Acks are the driver's (this device has none), so the host itself never answers.
     publish(&mut device, "clip/message/devices/d", frame.as_bytes()).await;
@@ -436,7 +462,8 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_ack
 
     let lg_acceptor = acceptor("localhost");
     let mut previous_end = None;
-    for session in 0..3 {
+    let mut noise_device = None;
+    for session in 0..if late_local { 2 } else { 3 } {
         let Ok(mut lg_mqtt) = timeout(
             Duration::from_secs(5),
             accept_tls(&cloud_listener, &lg_acceptor),
@@ -511,6 +538,76 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_ack
         previous_end = Some(Instant::now());
         publish(&mut device, "clip/message/devices/d", frame.as_bytes()).await;
         nothing_pending(&mut device).await;
+        if late_local && session == 0 {
+            // The completed first cloud session proves the supervisor has started.
+            // Remove its local session so it cannot subscribe/start a new cloud
+            // session partway through the flood, regardless of backoff timing.
+            drop(device);
+            until(&mut events, |event| {
+                matches!(
+                    event, Event::Transport(rusthinq_server::Event::Down(id, _)) if id.device == "d"
+                )
+            })
+            .await;
+            assert!(
+                handle
+                    .snapshot()
+                    .iter()
+                    .find(|d| d.entry.id == "d")
+                    .unwrap()
+                    .session
+                    .is_none()
+            );
+            let mut noise = local_device(local_address, "noise", &mut events).await;
+            let noise_frame = json!({"did":"noise","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())}).to_string();
+            let mut lag_probe = handle.subscribe();
+            for _ in 0..=EVENT_CAPACITY {
+                publish(
+                    &mut noise,
+                    "clip/message/devices/noise",
+                    noise_frame.as_bytes(),
+                )
+                .await;
+                // App-level acknowledgement of each individual packet prevents
+                // overflowing the transport queue and proves broadcast emission.
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        match events.recv().await.unwrap() {
+                            Event::Transport(rusthinq_server::Event::Data(id, _))
+                                if id.device == "noise" =>
+                            {
+                                break;
+                            }
+                            Event::Lost { .. } => {
+                                panic!("transport events lost while creating app backlog")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert!(
+                matches!(lag_probe.try_recv(), Err(broadcast::error::TryRecvError::Lagged(n)) if n > 0),
+                "the app broadcast must actually overflow an unread receiver"
+            );
+            assert!(!connected(&app));
+            assert!(
+                handle
+                    .snapshot()
+                    .iter()
+                    .find(|d| d.entry.id == "d")
+                    .unwrap()
+                    .session
+                    .is_none()
+            );
+            device = local_device(local_address, "d", &mut events).await;
+            noise_device = Some(noise);
+            // This scenario measures correctness after a local reconnect; the
+            // original test above retains the cloud-only backoff timing check.
+            previous_end = None;
+        }
     }
 
     // Logout ends cloud access: no further LG connection is attempted.
@@ -522,6 +619,7 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_ack
             .is_err()
     );
 
+    drop(noise_device);
     stop.send_replace(true);
     for task in [account_task, cloud_task] {
         timeout(Duration::from_secs(5), task)

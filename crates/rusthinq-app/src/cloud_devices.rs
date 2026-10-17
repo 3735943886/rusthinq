@@ -751,7 +751,6 @@ async fn supervise(
     .await
     .map_err(|e| io::Error::other(format!("{e:?}")))??;
     let mut backoff = 1;
-    let mut events = context.app.subscribe();
     let mut states = context.app.state_changes();
     loop {
         if *stop.borrow() {
@@ -804,6 +803,10 @@ async fn supervise(
             .map_err(|_| stale())?;
         let mut owned_stop = stop.clone();
         let epoch = *cancelled.borrow();
+        // Subscribed per session: nothing drains a receiver while this loop waits for a local
+        // session, and what other devices did meanwhile would only arrive as a lag that ends
+        // the session before it starts. A lag inside the session is still fatal.
+        let mut events = context.app.subscribe();
         let result = owned_remote(
             &context.account,
             &account,
