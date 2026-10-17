@@ -543,9 +543,13 @@ async fn bridge_round_trips(late_local: bool) {
             // Remove its local session so it cannot subscribe/start a new cloud
             // session partway through the flood, regardless of backoff timing.
             drop(device);
+            // The runtime folds the transport's Down into the lifecycle: the app sees the
+            // device lose its session, not a Down event.
             until(&mut events, |event| {
                 matches!(
-                    event, Event::Transport(rusthinq_server::Event::Down(id, _)) if id.device == "d"
+                    event,
+                    Event::Lifecycle(rusthinq_lifecycle::Action::Changed(device))
+                        if device.entry.id == "d" && device.session.is_none()
                 )
             })
             .await;
