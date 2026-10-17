@@ -476,15 +476,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Some((generation, topic, payload)) = qos2.remove(&id)
                     && generation == guard.generation
                 {
-                    let sample = match broker.clock.sample() {
-                        Ok(sample) => sample,
-                        Err(_) => break Disconnect::Io,
-                    };
                     let outcome = model.input(
                         Input::Device {
                             topic: &topic,
                             payload: &payload,
-                            outbound_mid: sample.mid,
                         },
                         start.elapsed(),
                     );
@@ -505,15 +500,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 // QoS1 is at-least-once. DUP can also be the first delivery seen here.
                 // Packet identifiers are reusable after PUBACK, so do not infer
                 // application-level duplication from an identifier or DUP alone.
-                let sample = match broker.clock.sample() {
-                    Ok(sample) => sample,
-                    Err(_) => break Disconnect::Io,
-                };
                 let outcome = model.input(
                     Input::Device {
                         topic: &topic,
                         payload: &payload,
-                        outbound_mid: sample.mid,
                     },
                     start.elapsed(),
                 );

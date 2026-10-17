@@ -199,12 +199,16 @@ impl Session {
         // Validate outbound bounds before mutating identity or producing actions.
         let body = message.get("Body");
         let response = body.filter(|body| body.is_object() && body.get("ReturnCode").is_some());
-        let poll = matches!(
-            message.pointer("/Body/Cmd").and_then(Value::as_str),
-            Some("Mon" | "DevInfo")
-        );
-        let ack = if poll && response.is_none() {
-            let ack = json!({"Header": message["Header"], "Body": {"Return": "OK"}});
+        // The LG server acknowledges every device message that is not itself a response
+        // (DevInfo, Alive, ...) by echoing its CmdWId; a device acked any other way resets
+        // the connection (anszom/rethink#16, upstream b3ce2b4).
+        let ack = if body.and_then(|body| body.get("ReturnCode")).is_none() {
+            let mut reply = serde_json::Map::new();
+            if let Some(command) = message.pointer("/Body/CmdWId") {
+                reply.insert("CmdWId".into(), command.clone());
+            }
+            reply.insert("ReturnCode".into(), "0000".into());
+            let ack = json!({"Header": {"x-lgedm-deviceId": id}, "Body": reply});
             Some(encode(
                 &serde_json::to_vec(&ack).map_err(|_| Error::InvalidJson)?,
                 self.max_payload,

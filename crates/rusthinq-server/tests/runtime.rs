@@ -43,19 +43,24 @@ async fn frame<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
         .unwrap();
     bytes
 }
-async fn identify<S: AsyncWrite + Unpin>(
+async fn identify<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     events: &mut broadcast::Receiver<Event>,
     device: &str,
 ) -> SessionId {
     stream
-        .write_all(&packet(device, serde_json::json!({"Cmd":"Status"})))
+        .write_all(&packet(
+            device,
+            serde_json::json!({"Cmd":"Status","CmdWId":"w-1"}),
+        ))
         .await
         .unwrap();
     let Event::Up(id) = next(events).await else {
         panic!("expected up")
     };
     assert!(matches!(next(events).await, Event::Data(ref current, _) if current == &id));
+    let ack: serde_json::Value = serde_json::from_slice(&frame(stream).await).unwrap();
+    assert_eq!(ack["Body"]["CmdWId"], "w-1");
     id
 }
 #[tokio::test]
@@ -81,8 +86,10 @@ async fn loopback_ack_command_response_and_eof() {
         panic!("expected up")
     };
     let ack: serde_json::Value = serde_json::from_slice(&frame(&mut client).await).unwrap();
-    assert_eq!(ack["Header"]["unknown"], 7);
-    assert_eq!(ack["Body"]["Return"], "OK");
+    assert_eq!(
+        ack,
+        serde_json::json!({"Header":{"x-lgedm-deviceId":"device"},"Body":{"ReturnCode":"0000"}})
+    );
     assert_eq!(
         next(&mut events).await,
         Event::Data(id.clone(), input[4..].to_vec())

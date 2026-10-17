@@ -12,13 +12,15 @@ fn wire(payload: &[u8]) -> Vec<u8> {
     encode(payload, 4096).unwrap()
 }
 
+// Device messages and the LG server's replies from a WTDN3 (anszom/rethink#16).
 #[test]
-fn poll_replay_at_every_split_preserves_ack_header_and_data() {
-    for cmd in ["DevInfo", "Mon"] {
-        let data = payload(
-            "dev-1",
-            json!({"Cmd":cmd,"Format":"B64","Data":"AQI=","unknown":42}),
-        );
+fn every_request_is_acked_by_echoing_its_command_id() {
+    for body in [
+        json!({"CmdWId":"7f6816e0-99a3-11f0-b166-7c1c4ec8cc53","Cmd":"DevInfo","Format":"B64","Data":"UnVsZVZlcj0xLjM="}),
+        json!({"CmdWId":"8571a6f0-99a3-11f0-856f-7c1c4ec8cc53","Cmd":"Alive"}),
+        json!({"CmdWId":"n-2","Cmd":"Other","unknown":42}),
+    ] {
+        let data = payload("dev-1", body.clone());
         let frame = wire(&data);
         for split in 0..=frame.len() {
             let mut model = session();
@@ -35,7 +37,7 @@ fn poll_replay_at_every_split_preserves_ack_header_and_data() {
             let ack: serde_json::Value = serde_json::from_slice(&ack[4..]).unwrap();
             assert_eq!(
                 ack,
-                json!({"Header":{"x-lgedm-deviceId":"dev-1","unknown":7},"Body":{"Return":"OK"}})
+                json!({"Header":{"x-lgedm-deviceId":"dev-1"},"Body":{"CmdWId":body["CmdWId"],"ReturnCode":"0000"}})
             );
             assert_eq!(actions[2], Action::Data(data.clone()));
         }
@@ -43,8 +45,40 @@ fn poll_replay_at_every_split_preserves_ack_header_and_data() {
 }
 
 #[test]
+fn a_request_without_a_command_id_is_still_acked() {
+    let data = payload("dev-1", json!({"Cmd":"Alive"}));
+    let outcome = session().input(Input::Bytes(&wire(&data)), Duration::ZERO);
+    let Action::Send(ack) = &outcome.actions[1] else {
+        panic!("missing ACK")
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&ack[4..]).unwrap(),
+        json!({"Header":{"x-lgedm-deviceId":"dev-1"},"Body":{"ReturnCode":"0000"}})
+    );
+}
+
+#[test]
+fn status_push_and_command_response_are_observed_without_an_ack() {
+    // The status push the device sends after Mon/Start carries ReturnCode; the server does not answer it.
+    for body in [
+        json!({"CmdWId":"n-1","ReturnCode":"0000","Format":"B64","Data":"AQAAAAAAAAAAAAAAAAAAAAAAAAAABgBkAAAAAA=="}),
+        json!({"Cmd":"Mon","ReturnCode":"0000","CmdWId":"n-1"}),
+    ] {
+        let data = payload("dev-1", body.clone());
+        let outcome = session().input(Input::Bytes(&wire(&data)), Duration::ZERO);
+        assert_eq!(
+            outcome.actions,
+            vec![
+                Action::Identified("dev-1".into()),
+                Action::Response(body),
+                Action::Data(data)
+            ]
+        );
+    }
+}
+
+#[test]
 fn command_response_is_observed_without_generating_an_ack() {
-    // A response carrying Cmd=Mon is still a response, not a poll request.
     let body = json!({"Cmd":"Mon","ReturnCode":"0000","CmdWId":"n-1"});
     let data = payload("dev-1", body.clone());
     let outcome = session().input(Input::Bytes(&wire(&data)), Duration::ZERO);
@@ -60,14 +94,19 @@ fn command_response_is_observed_without_generating_an_ack() {
 
 #[test]
 fn valid_prefix_actions_survive_a_later_invalid_frame() {
-    let data = payload("dev-1", json!({"Cmd":"Other"}));
+    let body = json!({"ReturnCode":"0000"});
+    let data = payload("dev-1", body.clone());
     let bytes = [wire(&data), wire(b"{")].concat();
     let mut model = session();
     let outcome = model.input(Input::Bytes(&bytes), Duration::ZERO);
     assert_eq!(outcome.error, Some(Error::InvalidJson));
     assert_eq!(
         outcome.actions,
-        vec![Action::Identified("dev-1".into()), Action::Data(data)]
+        vec![
+            Action::Identified("dev-1".into()),
+            Action::Response(body),
+            Action::Data(data)
+        ]
     );
     assert_eq!(outcome.next_deadline, None);
     assert_eq!(
@@ -179,7 +218,8 @@ fn injected_time_enforces_idle_deadline_and_monotonicity() {
 
 #[test]
 fn multiple_frames_identify_once() {
-    let data = payload("dev-1", json!({}));
+    let body = json!({"ReturnCode":"0000"});
+    let data = payload("dev-1", body.clone());
     let bytes = [wire(&data), wire(&data)].concat();
     let mut model = session();
     let outcome = model.input(Input::Bytes(&bytes), Duration::ZERO);
@@ -187,7 +227,9 @@ fn multiple_frames_identify_once() {
         outcome.actions,
         vec![
             Action::Identified("dev-1".into()),
+            Action::Response(body.clone()),
             Action::Data(data.clone()),
+            Action::Response(body),
             Action::Data(data)
         ]
     );

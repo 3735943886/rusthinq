@@ -1,10 +1,6 @@
 //! Per-MQTT-connection CLIP interpretation. The broker, provisioning response
 //! service, time source, TLS, and device replacement belong to the runtime.
-use crate::{
-    aabb,
-    lg_compat::{self, AckOwner},
-};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,23 +68,10 @@ pub struct Outcome {
 }
 
 pub enum Input<'a> {
-    BridgeState {
-        generation: u64,
-        active: bool,
-    },
-    ProvisionResult {
-        operation: u64,
-        sent: bool,
-    },
-    Device {
-        topic: &'a str,
-        payload: &'a [u8],
-        outbound_mid: u64,
-    },
-    Cloud {
-        generation: u64,
-        payload: &'a [u8],
-    },
+    BridgeState { generation: u64, active: bool },
+    ProvisionResult { operation: u64, sent: bool },
+    Device { topic: &'a str, payload: &'a [u8] },
+    Cloud { generation: u64, payload: &'a [u8] },
     End,
 }
 
@@ -178,11 +161,7 @@ impl Session {
                     self.closed = true;
                     Ok(vec![])
                 }
-                Input::Device {
-                    topic,
-                    payload,
-                    outbound_mid,
-                } => self.device(topic, payload, outbound_mid),
+                Input::Device { topic, payload } => self.device(topic, payload),
                 Input::Cloud {
                     generation,
                     payload,
@@ -241,21 +220,7 @@ impl Session {
         Ok(value)
     }
 
-    fn policy(&self) -> lg_compat::Policy {
-        lg_compat::select(
-            self.deploy
-                .as_ref()
-                .and_then(|v| v.get("kind"))
-                .and_then(Value::as_str),
-            self.deploy
-                .as_ref()
-                .and_then(|v| v.pointer("/data/appInfo/softVer"))
-                .and_then(Value::as_str),
-            self.bridge_active,
-        )
-    }
-
-    fn device(&mut self, topic: &str, payload: &[u8], mid: u64) -> Result<Vec<Action>, Error> {
+    fn device(&mut self, topic: &str, payload: &[u8]) -> Result<Vec<Action>, Error> {
         // Bound topics too; do not allocate an attacker-sized normalized topic.
         if topic.len() > self.max_payload {
             return Err(Error::PayloadExceeded);
@@ -305,22 +270,9 @@ impl Session {
                         .and_then(Value::as_str)
                         .ok_or(Error::InvalidHex)?,
                 )?;
-                if !self.ready {
-                    if !self.policy().first_packet_completes_provisioning {
-                        return Err(Error::NotProvisioned);
-                    }
-                    self.make_ready(&mut actions);
-                }
-                if self.policy().ack_owner == AckOwner::Local
-                    && let Some(ack) = aabb::cloud_ack(&data)
-                {
-                    let message =
-                        json!({"did":id,"mid":mid,"cmd":"ack","type":1,"data":encode_hex(&ack)});
-                    actions.push(self.send(
-                        id,
-                        &serde_json::to_vec(&message).map_err(|_| Error::InvalidJson)?,
-                    )?);
-                }
+                // Some firmware never sends completeProvisioning_ack and starts with packets
+                // instead (T17A1EFHU_F among others; upstream rethink 8f6d19e).
+                self.make_ready(&mut actions);
                 actions.push(Action::Data(data));
                 actions.push(Action::CloudBound {
                     payload: payload.to_vec(),

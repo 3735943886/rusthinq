@@ -223,7 +223,7 @@ async fn until(events: &mut broadcast::Receiver<Event>, predicate: impl Fn(&Even
 }
 
 #[tokio::test]
-async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_local_acks() {
+async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_gets_no_host_acks() {
     let directory = tempfile::tempdir().unwrap();
     // The device is known as incarnation 1, and its cloud registration was adopted earlier.
     let mut storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
@@ -410,10 +410,9 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
     })
     .await;
     let frame = json!({"did":"d","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())}).to_string();
-    // Before bridging, the local ACK owner answers the appliance.
+    // Acks are the driver's (this device has none), so the host itself never answers.
     publish(&mut device, "clip/message/devices/d", frame.as_bytes()).await;
-    let (_, ack, _) = published(&packet(&mut device).await);
-    assert_eq!(serde_json::from_slice::<Value>(&ack).unwrap()["cmd"], "ack");
+    nothing_pending(&mut device).await;
 
     timeout(Duration::from_secs(5), async {
         while !account.status().logged_in {
@@ -494,8 +493,13 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
         let (topic, delivered, _) = published(&packet(&mut device).await);
         assert_eq!(topic, "lime/devices/d");
         assert_eq!(delivered.strip_suffix(&[0]).unwrap_or(&delivered), command);
+        // Without a driver to ack, LG's own acks reach the appliance.
+        let ack = br#"{"did":"d","mid":1000,"cmd":"ack","type":1,"data":"AA08F000C5043EBB"}"#;
+        publish(&mut lg_mqtt, "lg/down", ack).await;
+        let (_, delivered, _) = published(&packet(&mut device).await);
+        assert_eq!(delivered.strip_suffix(&[0]).unwrap_or(&delivered), ack);
 
-        // LG drops the connection: ACK ownership returns to the local owner.
+        // LG drops the connection: the appliance is served locally again.
         drop(lg_mqtt);
         timeout(Duration::from_secs(5), async {
             while connected(&app) {
@@ -505,23 +509,8 @@ async fn bridged_thinq2_device_relays_through_fake_lg_cloud_and_falls_back_to_lo
         .await
         .unwrap();
         previous_end = Some(Instant::now());
-        timeout(Duration::from_secs(5), async {
-            loop {
-                publish(&mut device, "clip/message/devices/d", frame.as_bytes()).await;
-                device.write_all(&[0xc0, 0]).await.unwrap();
-                let first = packet(&mut device).await;
-                if first == [0xd0, 0] {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue; // bridge state not released yet
-                }
-                let (_, ack, _) = published(&first);
-                assert_eq!(serde_json::from_slice::<Value>(&ack).unwrap()["cmd"], "ack");
-                assert_eq!(packet(&mut device).await, [0xd0, 0]);
-                break;
-            }
-        })
-        .await
-        .unwrap();
+        publish(&mut device, "clip/message/devices/d", frame.as_bytes()).await;
+        nothing_pending(&mut device).await;
     }
 
     // Logout ends cloud access: no further LG connection is attempted.

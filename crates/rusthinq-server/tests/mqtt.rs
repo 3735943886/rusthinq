@@ -14,7 +14,7 @@ use tokio::{
 struct FixedClock;
 
 #[tokio::test]
-async fn bridge_downlink_is_fenced_and_bridged_ingress_has_no_local_clip_ack() {
+async fn bridge_downlink_is_fenced_and_device_packets_get_no_host_ack() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let handle = broker.handle();
     let mut events = handle.subscribe();
@@ -75,14 +75,6 @@ async fn bridge_downlink_is_fenced_and_bridged_ingress_has_no_local_clip_ack() {
     peer.write_all(&[0xc0, 0]).await.unwrap();
     assert_eq!(wire(&mut peer).await, [0xd0, 0]);
     publish(&mut peer, "clip/message/devices/d", &packet).await;
-    let mqtt::Packet::Publish { payload, .. } = mqtt::decode(&wire(&mut peer).await, 8192).unwrap()
-    else {
-        panic!("local ack")
-    };
-    assert_eq!(
-        serde_json::from_slice::<Value>(&payload).unwrap()["cmd"],
-        "ack"
-    );
     assert!(matches!(event(&mut events).await, Event::Data(ref id,_) if id == &session));
     assert!(matches!(event(&mut events).await, Event::CloudBound(ref id,_) if id == &session));
     broker.stop();
@@ -90,7 +82,7 @@ async fn bridge_downlink_is_fenced_and_bridged_ingress_has_no_local_clip_ack() {
 }
 
 #[tokio::test]
-async fn redeploy_drops_inherited_cloud_ack_ownership() {
+async fn redeploy_drops_inherited_bridge_state() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let handle = broker.handle();
     let mut events = handle.subscribe();
@@ -137,14 +129,6 @@ async fn redeploy_drops_inherited_cloud_ack_ownership() {
     );
     let packet = json!({"did":"d","cmd":"device_packet","data":rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0,1,4]).unwrap())});
     publish(&mut peer, "clip/message/devices/d", &packet).await;
-    let mqtt::Packet::Publish { payload, .. } = mqtt::decode(&wire(&mut peer).await, 8192).unwrap()
-    else {
-        panic!("ack")
-    };
-    assert_eq!(
-        serde_json::from_slice::<Value>(&payload).unwrap()["cmd"],
-        "ack"
-    );
     assert!(matches!(event(&mut events).await, Event::Data(_, _)));
     assert!(matches!(event(&mut events).await, Event::CloudBound(_, _)));
     broker.stop();
@@ -520,7 +504,7 @@ async fn ready<S: AsyncRead + AsyncWrite + Unpin>(
     id
 }
 #[tokio::test]
-async fn local_deploy_timesync_ack_and_raw_data_are_ordered() {
+async fn local_deploy_timesync_and_raw_data_are_ordered() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let handle = broker.handle();
     let mut events = handle.subscribe();
@@ -562,12 +546,6 @@ async fn local_deploy_timesync_ack_and_raw_data_are_ordered() {
     );
     let payload = json!({"did":"d","cmd":"device_packet","data": rusthinq_protocol::thinq2::encode_hex(&rusthinq_protocol::aabb::wrap(&[0xf0, 1, 4]).unwrap()),"unknown":42});
     publish(&mut peer, "clip/message/devices/d", &payload).await;
-    let mqtt::Packet::Publish { payload: ack, .. } =
-        mqtt::decode(&wire(&mut peer).await, 2_000_000).unwrap()
-    else {
-        panic!("ACK")
-    };
-    assert_eq!(serde_json::from_slice::<Value>(&ack).unwrap()["cmd"], "ack");
     assert!(matches!(event(&mut events).await, Event::Data(ref current, _) if current == &id));
     assert_eq!(
         event(&mut events).await,

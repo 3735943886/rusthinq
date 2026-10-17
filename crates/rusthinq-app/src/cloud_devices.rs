@@ -879,7 +879,8 @@ async fn connected(
             .persisted_models()
             .get(&local.device)
             .map(|meta| meta.device_type.clone())
-            .unwrap_or_else(|| "201".into());
+            .filter(|device_type| !device_type.is_empty())
+            .ok_or_else(stale)?;
         transport::prepare_thinq1(material, &local.device, &identity.model, &device_type).await?;
     }
     let stream = tokio::select! {biased;_=stop.changed()=>return Ok(()),_=cancelled.changed()=>return Ok(()),result=connector.connect()=>result?};
@@ -938,6 +939,11 @@ async fn connected(
                 context.app.cloud_changed(local.device.clone());
                 },
                 Some(session::Event::Downlink{payload,result})=>{
+                    // A device with a driver gets its acks from the driver (aabb_common's ack), as upstream rethink does.
+                    if ready && matches!(material,Material::ThinQ2{..}) && context.app.script_states().get(&local.device).is_some_and(|(key,_,_)|key.generation==local.generation)
+                        && serde_json::from_slice::<serde_json::Value>(payload.strip_suffix(&[0]).unwrap_or(&payload)).is_ok_and(|value|value["cmd"]=="ack") {
+                        let _=result.send(true);continue;
+                    }
                     let receipt=if ready && matches!(material,Material::ThinQ1{..}){context.bridge.downlink(registration,local,&payload,&context.server,Some(&context.firmware)).map_err(|e|io::Error::other(format!("{e:?}")))}else if ready{
                         let value:serde_json::Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|e|io::Error::other(format!("{e:?}")))?;context.firmware.learn_command(&value)?;context.broker.cloud(local,generation,&payload).map_err(|e|io::Error::other(format!("{e:?}")))
                     }else{Err(stale())};

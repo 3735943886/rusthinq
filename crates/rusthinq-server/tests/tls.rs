@@ -181,8 +181,8 @@ async fn matching_certificates_and_thinq1_ack_over_real_tls() {
         let mut ack = vec![0; size as usize];
         stream.read_exact(&mut ack).await.unwrap();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&ack).unwrap()["Body"]["Return"],
-            "OK"
+            serde_json::from_slice::<serde_json::Value>(&ack).unwrap()["Body"]["ReturnCode"],
+            "0000"
         );
         assert!(matches!(events.recv().await.unwrap(), Event::Sent(_, bytes) if bytes == ack));
         assert!(matches!(events.recv().await.unwrap(), Event::Data(_, bytes) if bytes == payload));
