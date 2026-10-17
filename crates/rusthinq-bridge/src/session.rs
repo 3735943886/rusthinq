@@ -311,6 +311,12 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                                     match value["cmd"].as_str().ok_or_else(invalid)? {
                                         "completeProvisioning"=>{
                                             counter=counter.checked_add(1).ok_or_else(invalid)?;
+                                            // Empirical compatibility values used continuously by rethink's bridge;
+                                            // rssi/fs are template values rather than measured device state.
+                                            // Introduced in anszom/rethink d984fd4521ea00eacd4d307755d96237013f3247;
+                                            // https://github.com/anszom/rethink/blob/0e570698713b038ea0a25da3cc36fd97aea84813/bridge/thinq2connection.ts#L48-L61
+                                            // Exact values are not proven mandatory. The reviewed upstream code/history
+                                            // contains no report of problems caused by them; this is not all-device validation.
                                             let ack=json!({"mid":counter,"did":config.identity.device,"kind":config.identity.model,"cmd":"completeProvisioning_ack","rssi":-48,"fs":"idle","data":null,"type":1});
                                             write(&mut writer,&publication(&config.publish,ack.to_string().as_bytes(),None)?).await?;completed=true;
                                         },

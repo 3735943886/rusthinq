@@ -4,10 +4,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
-    task::JoinHandle,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -196,11 +193,19 @@ impl Handle {
 }
 pub struct Worker {
     handle: Handle,
-    task: JoinHandle<()>,
-    finished: std::sync::mpsc::Receiver<()>,
+    task: rusthinq_task::Completion<()>,
+    tasks: rusthinq_task::Supervisor,
 }
 impl Worker {
     pub fn spawn(compiled: Compiled, config: Config) -> Result<Self, Error> {
+        Self::spawn_in(compiled, config, &rusthinq_task::Supervisor::new(1))
+    }
+    /// Use a caller-owned completion group so cancelled workers retain their budget.
+    pub fn spawn_in(
+        compiled: Compiled,
+        config: Config,
+        tasks: &rusthinq_task::Supervisor,
+    ) -> Result<Self, Error> {
         if config.capacity == 0
             || config.capacity > Semaphore::MAX_PERMITS
             || config.input_bytes == 0
@@ -209,8 +214,6 @@ impl Worker {
         {
             return Err(Error::InvalidConfig);
         }
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|error| Error::Worker(error.to_string()))?;
         let (send, receive) = mpsc::channel(config.capacity);
         let (status, _) = watch::channel(Status::Running { generation: 1 });
         let shared = Arc::new(Shared {
@@ -224,23 +227,30 @@ impl Worker {
             status,
         });
         let owner = shared.clone();
-        let (finished, receiver) = std::sync::mpsc::channel();
-        let task = runtime.spawn_blocking(move || {
-            let _finished = finished;
-            run(Host::new(compiled), receive, owner);
-        });
+        let task = tasks
+            .try_spawn_blocking(move || run(Host::new(compiled), receive, owner))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Error::Busy
+                } else {
+                    Error::Worker(error.to_string())
+                }
+            })?;
         Ok(Self {
             handle: Handle(shared),
             task,
-            finished: receiver,
+            tasks: tasks.clone(),
         })
     }
     pub fn handle(&self) -> Handle {
         self.handle.clone()
     }
+    pub fn background_tasks(&self) -> rusthinq_task::Supervisor {
+        self.tasks.clone()
+    }
     /// Finish the current invocation, cancel unstarted work, and join the worker.
-    /// Cancellation or dropping the worker waits synchronously for bounded execution
-    /// and its shutdown callback. Worker code must not depend on async runtime progress.
+    /// Cancelling this wait requests stop without blocking; the completion group
+    /// retains the join and worker budget until execution and callbacks finish.
     pub async fn shutdown(self) -> Result<(), Error> {
         self.shutdown_with_output().await.map(|_| ())
     }
@@ -263,9 +273,7 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.handle.request_stop();
-        // Keep the join handle owned even when shutdown_with_output is cancelled.
-        // The sender is released on completion, panic, or cancellation before start.
-        let _ = self.finished.recv();
+        // The supervisor retains the join and capacity lease after this receipt drops.
     }
 }
 struct Message {
@@ -345,7 +353,7 @@ mod tests {
     use tokio::{sync::Notify, time::timeout};
 
     #[tokio::test]
-    async fn cancelling_shutdown_waits_for_invocation_and_callback() {
+    async fn cancelled_shutdown_is_nonblocking_and_supervisor_retains_capacity() {
         let mut compiled = Compiled::new(
             "fn input(v){gate();} fn bye(v){finished();}",
             Limits::default(),
@@ -369,6 +377,7 @@ mod tests {
         });
         let worker = Worker::spawn(compiled, Config::default()).unwrap();
         let handle = worker.handle();
+        let tasks = worker.background_tasks();
         handle.set_shutdown_callback(Some("bye".into())).unwrap();
         let invocation = handle.invoke(1, "input".into(), String::new()).unwrap();
         timeout(Duration::from_secs(3), entered.notified())
@@ -380,18 +389,31 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        // Release from an independent thread: dropping the future must wait even on
-        // a current-thread runtime, where no other async task can make progress.
-        let releaser = std::thread::spawn(move || {
+        drop(shutdown);
+        assert!(!completed.load(Ordering::Acquire));
+        assert_eq!(tasks.available(), 0);
+        assert!(matches!(
+            Worker::spawn_in(
+                Compiled::new("fn input(v) {}", Limits::default(), true).unwrap(),
+                Config::default(),
+                &tasks,
+            ),
+            Err(Error::Busy)
+        ));
+        // This task runs on the SAME current-thread executor after drop returns.
+        tokio::task::yield_now().await;
+        {
             let (lock, changed) = &*release;
             *lock.lock().unwrap() = true;
             changed.notify_one();
-        });
-        drop(shutdown);
+        }
+        timeout(Duration::from_secs(3), tasks.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(completed.load(Ordering::Acquire));
         assert_eq!(*handle.status().borrow(), Status::Stopped { generation: 1 });
         invocation.wait().await.unwrap();
-        releaser.join().unwrap();
     }
 
     #[tokio::test]

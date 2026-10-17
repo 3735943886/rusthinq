@@ -689,6 +689,9 @@ impl Daemon {
             .as_ref()
             .and_then(|(_, listener)| listener.local_addr().ok())
     }
+    pub fn background_tasks(&self) -> crate::runtime::BackgroundTasks {
+        self.service.background_tasks()
+    }
     pub fn handle(&self) -> crate::runtime::Handle {
         self.service.handle()
     }

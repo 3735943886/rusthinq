@@ -11,6 +11,7 @@ scripting = ["dep:rusthinq-scripting", "dep:notify"]
 gui = []
 
 [dependencies]
+rusthinq-task = { path = "../rusthinq-task" }
 rusthinq-driver-config = { path = "../rusthinq-driver-config" }
 notify = { version = "8.2", optional = true }
 tracing = "0.1"

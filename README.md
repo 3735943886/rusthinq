@@ -39,6 +39,7 @@ see [operations](docs/0.2-operations.md) for its limits and delivery semantics.
 
 | Crate | Responsibility |
 | --- | --- |
+| `rusthinq-task` | Bounded blocking task ownership and asynchronous drain |
 | `rusthinq-protocol` | Device wire formats and protocol decisions |
 | `rusthinq-lifecycle` | Device lifecycle, identity and generation transitions |
 | `rusthinq-server` | Local device transports and provisioning services |

@@ -70,6 +70,7 @@ pub struct Owner {
     identity: Arc<()>,
     next_binding: u64,
     capacity: usize,
+    tasks: rusthinq_task::Supervisor,
     workers: BTreeMap<String, Owned>,
     retiring: Vec<(Context, Worker)>,
     reaping: tokio::task::JoinSet<Result<(Context, Option<Outcome>), Error>>,
@@ -112,13 +113,14 @@ impl Owner {
             })
     }
     pub fn new(capacity: usize) -> Result<Self, Error> {
-        if capacity == 0 {
+        if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(Error::InvalidConfig);
         }
         Ok(Self {
             identity: Arc::new(()),
             next_binding: 1,
             capacity,
+            tasks: rusthinq_task::Supervisor::new(capacity),
             workers: BTreeMap::new(),
             retiring: Vec::new(),
             reaping: tokio::task::JoinSet::new(),
@@ -159,7 +161,7 @@ impl Owner {
             .next_binding
             .checked_add(1)
             .ok_or(Error::GenerationExhausted)?;
-        let worker = Worker::spawn(compiled, config)?;
+        let worker = Worker::spawn_in(compiled, config, &self.tasks)?;
         self.workers.insert(
             id,
             Owned {
@@ -271,8 +273,12 @@ impl Owner {
     pub async fn reap(&mut self) -> Result<(), Error> {
         self.reap_with_outputs().await.map(|_| ())
     }
+    pub fn background_tasks(&self) -> rusthinq_task::Supervisor {
+        self.tasks.clone()
+    }
     pub fn can_attach(&self) -> bool {
         self.workers.len() + self.retiring.len() + self.reaping.len() < self.capacity
+            && self.tasks.available() > 0
     }
     pub fn retirement_pending(&self) -> bool {
         !self.retiring.is_empty() || !self.reaping.is_empty()
@@ -328,6 +334,15 @@ impl Owner {
         for (id, owned) in std::mem::take(&mut self.workers) {
             self.retire(id, owned);
         }
-        self.reap_with_outputs().await
+        let outputs = self.reap_with_outputs().await;
+        let drained = self
+            .tasks
+            .shutdown()
+            .await
+            .map_err(|error| Error::Worker(error.to_string()));
+        match outputs {
+            Ok(outputs) => drained.map(|()| outputs),
+            Err(error) => Err(error),
+        }
     }
 }

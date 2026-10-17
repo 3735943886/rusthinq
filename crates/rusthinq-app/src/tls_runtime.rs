@@ -69,6 +69,9 @@ impl Service {
                 .with_bridge(bridge, Arc::new(handle), Duration::from_secs(90))?;
         Ok((self, cloud))
     }
+    pub fn background_tasks(&self) -> crate::runtime::BackgroundTasks {
+        self.runtime.background_tasks()
+    }
     pub fn handle(&self) -> Handle {
         self.runtime.handle()
     }

@@ -286,7 +286,7 @@ impl ScriptCommand {
         }
     }
 }
-type WriteTask = crate::task::StorageTask<(Storage, WriteResult)>;
+type WriteTask = rusthinq_task::Completion<(Storage, WriteResult)>;
 #[cfg(feature = "scripting")]
 mod scripting;
 #[cfg(feature = "scripting")]
@@ -295,6 +295,23 @@ use scripting::runtime_select;
 macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($branches:tt)*) => {tokio::select! { biased; $($branches)* }}; }
 mod transport;
 use transport::TransportHandle;
+
+/// Keep this receipt before starting a runtime if cancellation must be followed by
+/// an explicit drain. Stop/drop the runtime before waiting; the receipt itself
+/// never blocks in Drop and does not publish cancelled script outputs.
+#[derive(Clone)]
+pub struct BackgroundTasks(Vec<rusthinq_task::Supervisor>);
+impl BackgroundTasks {
+    pub async fn shutdown(&self) -> io::Result<()> {
+        let mut failure = None;
+        for tasks in &self.0 {
+            if let Err(error) = tasks.shutdown().await {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
 
 pub struct Runtime {
     #[cfg(feature = "scripting")]
@@ -346,6 +363,7 @@ pub struct Runtime {
     model: Model,
     storage: Option<Storage>,
     write: Option<WriteTask>,
+    storage_tasks: rusthinq_task::Supervisor,
     server: TransportHandle,
     transport: broadcast::Receiver<TransportEvent>,
     shared: Arc<Shared>,
@@ -576,6 +594,7 @@ impl Runtime {
             model,
             storage: Some(storage),
             write: None,
+            storage_tasks: rusthinq_task::Supervisor::new(1),
             server,
             transport,
             shared,
@@ -597,6 +616,18 @@ impl Runtime {
             deferred_storage: None,
             metadata: None,
         })
+    }
+    pub fn background_tasks(&self) -> BackgroundTasks {
+        let tasks = vec![self.storage_tasks.clone()];
+        #[cfg(feature = "scripting")]
+        let tasks = {
+            let mut tasks = tasks;
+            if let Some(owner) = &self.scripts {
+                tasks.push(owner.background_tasks());
+            }
+            tasks
+        };
+        BackgroundTasks(tasks)
     }
     pub fn handle(&self) -> Handle {
         Handle(self.shared.clone())
@@ -779,7 +810,7 @@ impl Runtime {
             })
             .collect::<BTreeMap<_, _>>();
         let mut storage = self.storage.take().expect("idle model storage");
-        self.write = Some(crate::task::StorageTask::spawn(move || {
+        self.write = Some(self.storage_tasks.spawn_blocking(move || {
             let result = storage
                 .save_metadata(&batch)
                 .map_err(|error| error.to_string());
@@ -965,7 +996,7 @@ impl Runtime {
             self.deferred_storage = Some(action);
             return;
         };
-        self.write = Some(crate::task::StorageTask::spawn(move || {
+        self.write = Some(self.storage_tasks.spawn_blocking(move || {
             let result = storage.execute(&action).expect("storage effect");
             (storage, WriteResult::Lifecycle(result))
         }));
@@ -1320,7 +1351,13 @@ impl Runtime {
     }
     /// Shutdown L3 first, then signal this loop; it reconciles final session state
     /// and drains/join all started storage work, including coalesced final updates.
-    pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
+    pub async fn run(self, stop: watch::Receiver<bool>) -> io::Result<()> {
+        let background = self.background_tasks();
+        let result = self.run_inner(stop).await;
+        let drained = background.shutdown().await;
+        result.and(drained)
+    }
+    async fn run_inner(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
         let mut admissions = self.server.generation_changes();
         self.reconcile();
         let mut stopping = *stop.borrow();
@@ -1338,7 +1375,7 @@ impl Runtime {
                 let (generation, ceiling) = self.server.generation_budget();
                 if ceiling.saturating_sub(generation) <= low_water {
                     let mut storage = self.storage.take().expect("idle storage worker");
-                    self.write = Some(crate::task::StorageTask::spawn(move || {
+                    self.write = Some(self.storage_tasks.spawn_blocking(move || {
                         let result = storage
                             .reserve_generations(count)
                             .map_err(|error| error.to_string());
@@ -1582,4 +1619,53 @@ fn command_payload(
         .to_string()
         .into_bytes();
     Ok(payload)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_runtime_keeps_storage_locked_until_async_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        let server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let storage = Storage::open(&path, 4).unwrap();
+        let mut runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 4).unwrap();
+        let background = runtime.background_tasks();
+        let mut storage = runtime.storage.take().unwrap();
+        let (started, ready) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        runtime.write = Some(runtime.storage_tasks.spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            let reservation = storage
+                .reserve_generations(7)
+                .map_err(|error| error.to_string());
+            (storage, WriteResult::Reservation(reservation))
+        }));
+        ready.await.unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let mut run = Box::pin(runtime.run(stopped));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(run.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(run);
+        assert!(
+            Storage::open(&path, 4).is_err(),
+            "in-flight storage retains its checkpoint lock"
+        );
+        // This would deadlock with the former synchronous Drop on a single-thread runtime.
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), background.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let reopened = Storage::open(&path, 4).unwrap();
+        assert_eq!(reopened.state().generation_floor, 7);
+        server.shutdown().await;
+    }
 }
