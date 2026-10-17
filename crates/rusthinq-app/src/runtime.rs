@@ -116,6 +116,8 @@ struct Shared {
     observations: crate::observability::Observability,
     driver_reload_configured: std::sync::atomic::AtomicBool,
     driver_watch: std::sync::atomic::AtomicBool,
+    /// Read by packet analysis, which asks the model's driver to describe a frame.
+    driver_config: Mutex<Option<crate::drivers::Config>>,
     cloud: Mutex<Option<crate::cloud_account::Handle>>,
     #[cfg(feature = "bridge")]
     cloud_devices: Mutex<Option<crate::cloud_devices::Handle>>,
@@ -416,6 +418,7 @@ impl Runtime {
             observations: Default::default(),
             driver_reload_configured: std::sync::atomic::AtomicBool::new(false),
             driver_watch: std::sync::atomic::AtomicBool::new(false),
+            driver_config: Mutex::new(None),
             cloud: Mutex::new(None),
             #[cfg(feature = "bridge")]
             cloud_devices: Mutex::new(None),
@@ -599,6 +602,11 @@ impl Runtime {
         self.shared
             .driver_watch
             .store(config.watch, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .shared
+            .driver_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
         self.drivers = Some(config);
         self.shared
             .driver_reload_configured

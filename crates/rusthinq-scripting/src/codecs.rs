@@ -114,12 +114,4 @@ pub(crate) fn install(engine: &mut Engine) {
     engine.register_fn("tlv_frame_parse", |bytes: Blob| {
         tlv::frame_parse(&bytes).map_or(Dynamic::UNIT, |items| Dynamic::from_array(values(items)))
     });
-    engine.register_fn("known_tag_name", |tag: i64| {
-        rusthinq_protocol::tlv_catalog::known_tag_name(tag as u16)
-            .unwrap_or("")
-            .to_string()
-    });
-    engine.register_fn("is_known_tag", |tag: i64| {
-        rusthinq_protocol::tlv_catalog::is_known_tag(tag as u16)
-    });
 }

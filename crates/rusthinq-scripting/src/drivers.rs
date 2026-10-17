@@ -190,6 +190,15 @@ impl Config {
         }
         Ok(())
     }
+    /// A driver file exists for this model (bindings are per device and do not apply).
+    pub fn has_driver(&self, model: &str) -> bool {
+        self::model(model)
+            && self.directory.canonicalize().is_ok_and(|root| {
+                locate(&root, "drivers", model)
+                    .canonicalize()
+                    .is_ok_and(|path| path.starts_with(&root) && path.is_file())
+            })
+    }
     /// Fingerprint only this model and its static module dependencies.
     pub fn source_revision(&self, id: &str, model: &str) -> io::Result<u64> {
         use std::hash::{Hash, Hasher};

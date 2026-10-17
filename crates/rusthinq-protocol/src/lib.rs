@@ -9,14 +9,10 @@ pub mod crc16;
 pub mod hex;
 pub mod mqtt;
 pub mod tlv;
-pub mod tlv_catalog;
 
 pub mod packet_codec;
 
 pub mod json_splitter;
 pub mod mtosp;
 
-// Selectively reused offline analysis from the fixed 0.1 reference.
-pub mod aabb_analysis;
 pub mod decode;
-pub mod uart_binary;

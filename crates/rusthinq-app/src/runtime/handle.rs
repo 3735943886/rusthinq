@@ -86,6 +86,15 @@ impl Handle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The configured driver directory, if any.
+    pub fn driver_config(&self) -> Option<crate::drivers::Config> {
+        self.0
+            .driver_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Drivers reload themselves on file change.
     pub fn driver_watch(&self) -> bool {
         self.0

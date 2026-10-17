@@ -266,6 +266,45 @@ impl Compiled {
         self.source_bytes = total;
         Ok(self)
     }
+    /// Ask the driver what a frame means: `describe(data, to_device)` with no device context.
+    /// `None` when the driver has no `describe` or returns `()`; the hook may not send or publish.
+    pub fn describe(
+        &self,
+        data: &[u8],
+        to_device: bool,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        if !self.has_function("describe", 2) {
+            return Ok(None);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.engine.call_fn_with_options::<Dynamic>(
+                CallFnOptions::new().eval_ast(true),
+                &mut Scope::new(),
+                self.invocation_ast.as_ref().unwrap_or(&self.ast),
+                "describe",
+                (data.to_vec(), to_device),
+            )
+        }));
+        let emitted = {
+            let mut buffer = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buffer.bytes = 0;
+            !std::mem::take(&mut buffer.outputs).is_empty()
+        };
+        let value = match result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return Err(Error::Execution(error.to_string())),
+            Err(_) => return Err(Error::Execution("native panic".into())),
+        };
+        if emitted {
+            return Err(Error::Execution("describe cannot send or publish".into()));
+        }
+        if value.is_unit() {
+            return Ok(None);
+        }
+        rhai::serde::from_dynamic(&value)
+            .map(Some)
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
     pub fn context_device(&self) -> Option<&str> {
         self.context.as_ref().map(|ctx| ctx.device())
     }
@@ -388,6 +427,14 @@ impl Host {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// See [`Compiled::describe`]; independent of this host's device state.
+    pub fn describe(
+        &self,
+        data: &[u8],
+        to_device: bool,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        self.compiled.describe(data, to_device)
     }
     /// The caller must invoke serially on a device-owned blocking worker.
     /// Outputs preserve the emitted prefix on failure; downstream must fence the

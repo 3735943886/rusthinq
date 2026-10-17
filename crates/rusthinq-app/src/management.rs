@@ -185,7 +185,6 @@ fn build(app: App) -> Router {
         )
         .route("/api/cloud/notifications/ws", get(notification_socket))
         .route("/api/packets/decode", post(decode_packet))
-        .route("/api/tlv/catalog", get(tlv_catalog))
         .route("/api/cloud/devices", get(cloud_devices))
         .route("/api/cloud/inventory", get(cloud_inventory))
         .route("/api/devices/{id}/bridge/{action}", post(cloud_device))
@@ -382,10 +381,16 @@ async fn decode_packet(State(app): State<App>, Json(input): Json<PacketDecode>) 
     {
         return error(StatusCode::BAD_REQUEST, "invalid packet analysis input");
     }
+    let drivers = app.handle.driver_config();
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut decoded =
             rusthinq_protocol::decode::decode_hex_payload(&input.hex, input.direction.as_deref())?;
+        if let (Some(drivers), Some(model)) = (drivers, input.model_id.as_deref())
+            && !model.is_empty()
+        {
+            describe(&drivers, model, &mut decoded);
+        }
         decoded["exportText"] = json!(rusthinq_protocol::decode::re_export_text(
             &decoded,
             input.model_id.as_deref(),
@@ -399,9 +404,93 @@ async fn decode_packet(State(app): State<App>, Json(input): Json<PacketDecode>) 
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "packet analysis failed"),
     }
 }
-async fn tlv_catalog() -> Json<Value> {
-    Json(rusthinq_protocol::decode::tlv_catalog_json())
+/// Meaning comes from the model's driver (`describe(data, to_device)`), never from the host.
+#[cfg(feature = "scripting")]
+fn describe(drivers: &crate::drivers::Config, model: &str, decoded: &mut Value) {
+    let Ok(bytes) = rusthinq_protocol::hex::decode(decoded["hex"].as_str().unwrap_or_default())
+    else {
+        return;
+    };
+    if !drivers.has_driver(model) {
+        return;
+    }
+    let to_device = decoded["direction"] == "toDevice";
+    let (description, note) = match drivers.prepare(ANALYSIS_DEVICE, model, true, true) {
+        Err(error) => (None, Some(format!("driver unavailable: {error:?}"))),
+        Ok(compiled) if compiled.has_function("describe", 2) => {
+            match compiled.describe(&bytes, to_device) {
+                Ok(Some(value)) => match rusthinq_protocol::decode::description(&value) {
+                    Some(description) => (Some((description, "describe")), None),
+                    None => (
+                        None,
+                        Some("driver description had no summary, fields or notes".into()),
+                    ),
+                },
+                Ok(None) => (None, None),
+                Err(error) => (None, Some(format!("driver describe failed: {error:?}"))),
+            }
+        }
+        // Without describe, a device frame reads as what the driver's on_data publishes for it.
+        Ok(compiled) if !to_device && compiled.has_function("on_data", 2) => {
+            let (description, error) = published_by(compiled, &bytes, &drivers.topic_prefix);
+            (
+                description.map(|d| (d, "on_data")),
+                error.map(|e| format!("driver on_data failed: {e:?}")),
+            )
+        }
+        Ok(_) => (None, None),
+    };
+    if let Some((mut description, source)) = description {
+        description["source"] = source.into();
+        decoded["description"] = description;
+    }
+    if let (Some(note), Some(notes)) = (note, decoded["notes"].as_array_mut()) {
+        notes.push(note.into());
+    }
 }
+#[cfg(feature = "scripting")]
+const ANALYSIS_DEVICE: &str = "packet-analysis";
+/// Run `on_data` once on a fresh, detached context. Its sends are dropped and its
+/// publications only collected: nothing reaches a device or MQTT.
+#[cfg(feature = "scripting")]
+fn published_by(
+    compiled: rusthinq_scripting::Compiled,
+    data: &[u8],
+    prefix: &str,
+) -> (Option<Value>, Option<rusthinq_scripting::Error>) {
+    let topic = format!("{prefix}/{ANALYSIS_DEVICE}/");
+    let outcome = rusthinq_scripting::Host::new(compiled).invoke(
+        1,
+        "__data",
+        &rusthinq_protocol::hex::encode(data),
+    );
+    let fields: Vec<Value> = outcome
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            rusthinq_scripting::Output::Publish(text) => serde_json::from_str::<Value>(text).ok(),
+            _ => None,
+        })
+        .filter_map(|message| {
+            let name = message["topic"].as_str()?.strip_prefix(&topic)?.to_owned();
+            let value = match &message["payload"] {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            Some(json!({"name": name, "value": value}))
+        })
+        .collect();
+    let note = "what on_data publishes for this frame alone, from an empty driver state";
+    (
+        rusthinq_protocol::decode::description(&json!({ "fields": fields })).map(|mut d| {
+            d["notes"] = json!([note]);
+            d
+        }),
+        outcome.error,
+    )
+}
+#[cfg(not(feature = "scripting"))]
+fn describe(_: &crate::drivers::Config, _: &str, _: &mut Value) {}
 async fn mqtt_status(State(app): State<App>) -> Json<Value> {
     let Some(handle) = app.handle.external_mqtt() else {
         return Json(json!({"status":"Disabled"}));

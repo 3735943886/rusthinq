@@ -239,20 +239,16 @@
             `badge ${integrity ? "good" : "error"}`,
           ),
         );
-      if (decoded.unknownCount)
-        summary.push(
-          text("span", `${decoded.unknownCount} unknown tags`, "badge warning"),
-        );
+      // Meaning comes from the device's driver; without one only the framing is shown.
+      const described = decoded.description;
+      if (described?.summary)
+        summary.push(text("span", described.summary, "badge neutral"));
+      else if (!described)
+        summary.push(text("span", "No driver description", "badge warning"));
       $("analysis-summary").replaceChildren(...summary);
-      const fields = decoded.elements?.length
-        ? decoded.elements.map((field) => [
-            field.name || field.hex,
-            String(field.v),
-          ])
-        : (decoded.binaryAnalysis?.fields || []).map((field) => [
-            field.name,
-            `${field.interpretation || field.raw}${field.confidence ? ` · ${field.confidence}` : ""}`,
-          ]);
+      const fields = described?.fields?.length
+        ? described.fields.map((field) => [field.name, field.value])
+        : (decoded.elements || []).map((field) => [field.hex, String(field.v)]);
       $("analysis-fields").replaceChildren(
         ...fields.map(([key, value]) => {
           const row = document.createElement("div");
@@ -269,10 +265,7 @@
             "analysis-note",
           ),
         );
-      const notes = [
-        ...(decoded.notes || []),
-        ...(decoded.binaryAnalysis?.re_notes || []),
-      ];
+      const notes = [...(decoded.notes || []), ...(described?.notes || [])];
       $("analysis-notes").replaceChildren(
         ...notes.slice(0, 12).map((note) => text("p", note, "analysis-note")),
       );

@@ -9,6 +9,9 @@ impl Config {
             bindings: self.bindings.clone(),
         }
     }
+    pub(crate) fn has_driver(&self, model: &str) -> bool {
+        self.engine_config().has_driver(model)
+    }
     pub(crate) fn source_revision(&self, id: &str, model: &str) -> std::io::Result<u64> {
         self.engine_config().source_revision(id, model)
     }

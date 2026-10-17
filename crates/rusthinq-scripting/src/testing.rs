@@ -192,6 +192,22 @@ fn engine(config: Config, model: String) -> Engine {
         .register_fn("feed", |d: &mut Device, bytes: Vec<u8>| {
             state(d).feed(&bytes)
         })
+        .register_fn(
+            "describe",
+            |d: &mut Device, text: &str, to_device: bool| -> Result<Dynamic> {
+                let text = text
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>();
+                let bytes = rusthinq_protocol::hex::decode(text)
+                    .map_err(|e| Box::<EvalAltResult>::from(e.to_string()))?;
+                match state(d).host.describe(&bytes, to_device) {
+                    Ok(Some(value)) => rhai::serde::to_dynamic(value),
+                    Ok(None) => Ok(Dynamic::UNIT),
+                    Err(error) => Err(format!("{error:?}").into()),
+                }
+            },
+        )
         .register_fn("set", |d: &mut Device, prop: &str, value: &str| {
             state(d).invoke(
                 "__command",

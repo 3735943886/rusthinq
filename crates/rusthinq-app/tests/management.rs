@@ -611,12 +611,120 @@ async fn offline_analysis_is_available_without_gui_and_rejects_invalid_scope() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+    // Tag and field meaning is the drivers' (describe), so the host has no catalog to serve.
     assert_eq!(
         app.oneshot(request("/api/tlv/catalog", "GET", json!({})))
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::NOT_FOUND
+    );
+    server.shutdown().await;
+}
+
+#[cfg(feature = "scripting")]
+#[tokio::test]
+async fn packet_analysis_asks_the_model_driver_to_describe_the_frame() {
+    use rusthinq_app::drivers;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("drivers")).unwrap();
+    for (model, source) in [
+        // Synthetic: echoes framing facts the host already knows, no appliance meaning.
+        (
+            "Describe",
+            r#"fn describe(data, to_device) {
+                #{ summary: if to_device { "write" } else { "report" },
+                   fields: [#{ name: "first", value: data[0], start: 0, length: 1 }],
+                   notes: ["synthetic"] }
+            }"#,
+        ),
+        // Synthetic: publishes the first byte and sends one frame back.
+        (
+            "Plain",
+            r#"fn on_data(ctx, data) {
+                ctx.send_raw(data);
+                ctx.publish_raw(ctx.device_topic() + "/first", data[0].to_string(), true);
+            }"#,
+        ),
+        ("Silent", "fn on_data(ctx, data) {}"),
+        (
+            "Loud",
+            r#"fn describe(data, to_device) { send("x"); #{ summary: "s" } }"#,
+        ),
+    ] {
+        std::fs::write(
+            directory
+                .path()
+                .join("drivers")
+                .join(format!("{model}.rhai")),
+            source,
+        )
+        .unwrap();
+    }
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(
+        Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+        server.handle(),
+        Duration::ZERO,
+        16,
+    )
+    .unwrap()
+    .with_drivers(drivers::Config {
+        directory: directory.path().into(),
+        topic_prefix: "test".into(),
+        bindings: Default::default(),
+        watch: false,
+    })
+    .unwrap();
+    let (_, stop) = watch::channel(false);
+    let app = management::router(runtime.handle(), config(false), stop).unwrap();
+    let decode = |model: &str, direction: &str| {
+        let app = app.clone();
+        let body = json!({"hex":"aa0720d801ffbb", "direction":direction, "model_id":model});
+        async move {
+            let response = app
+                .oneshot(request("/api/packets/decode", "POST", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 65536).await.unwrap())
+                .unwrap()
+        }
+    };
+    let described = decode("Describe", "toDevice").await;
+    assert_eq!(
+        described["description"],
+        json!({"summary":"write","fields":[{"name":"first","value":"170","start":0,"length":1}],"notes":["synthetic"],"source":"describe"})
+    );
+    assert!(
+        described["exportText"]
+            .as_str()
+            .unwrap()
+            .contains("driver (describe):\n  summary: write\n  first = 170 [bytes 0+1]")
+    );
+    // Without describe, a device frame shows what on_data publishes; its send goes nowhere.
+    let published = decode("Plain", "fromDevice").await;
+    assert_eq!(
+        published["description"],
+        json!({"fields":[{"name":"first","value":"170"}],"notes":["what on_data publishes for this frame alone, from an empty driver state"],"source":"on_data"})
+    );
+    for (model, direction) in [
+        ("Plain", "toDevice"),
+        ("Silent", "fromDevice"),
+        ("Absent", "fromDevice"),
+    ] {
+        let plain = decode(model, direction).await;
+        assert!(plain.get("description").is_none(), "{model}");
+        assert_eq!(plain["protocol"], "Aabb");
+    }
+    let loud = decode("Loud", "fromDevice").await;
+    assert!(loud.get("description").is_none());
+    assert!(
+        loud["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("cannot send or publish"))
     );
     server.shutdown().await;
 }

@@ -351,6 +351,9 @@ impl AppHandle {
     pub fn driver_watch(&self) -> bool {
         self.0.driver_watch()
     }
+    pub fn driver_config(&self) -> Option<crate::drivers::Config> {
+        self.0.driver_config()
+    }
     pub async fn adapter_reload_driver(
         &self,
         id: String,
