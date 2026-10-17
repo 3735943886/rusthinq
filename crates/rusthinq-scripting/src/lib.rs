@@ -377,7 +377,9 @@ impl Compiled {
             .set_max_expr_depths(200, 100)
             .set_max_operations(limits.operations)
             .set_max_string_size(limits.string_bytes)
-            .set_max_array_size(1024)
+            // Rhai bounds a Blob as an array: a frame admitted as text must also fit as bytes
+            // (a split AC's ThinQ1 status is a ~2 KB JSON document).
+            .set_max_array_size(limits.string_bytes.max(1024))
             .set_max_map_size(256)
             .set_max_call_levels(32);
         engine.on_print(|_| {});

@@ -354,6 +354,37 @@ mod tests {
     }
 
     #[test]
+    fn a_thinq1_status_larger_than_the_array_limit_reaches_on_data() {
+        use base64::Engine as _;
+        // A split AC's ThinQ1 status is a ~2 KB JSON document (anszom/rethink#70).
+        let root = tempfile_dir("large-thinq1");
+        std::fs::write(
+            root.join("Big.rhai"),
+            "fn on_data(ctx, data) { ctx.publish_raw(ctx.device_topic() + \"/len\", data.len().to_string(), true); }",
+        )
+        .unwrap();
+        let config = Config {
+            watch: false,
+            directory: root.clone(),
+            topic_prefix: "p".into(),
+            bindings: BTreeMap::new(),
+        };
+        let mut host = crate::Host::new(config.prepare("d", "Big", false, true).unwrap());
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 4096]);
+        let envelope = serde_json::json!({"Header":{"x-lgedm-deviceId":"d"},"Body":{"Format":"B64","Data":data}});
+        let outcome = host.invoke(
+            1,
+            "__data",
+            &rusthinq_protocol::hex::encode(envelope.to_string().as_bytes()),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(outcome.error, None);
+        assert!(
+            matches!(&outcome.outputs[..], [crate::Output::Publish(text)] if text.contains("\"4096\""))
+        );
+    }
+
+    #[test]
     fn inheritance_scan_accepts_what_the_driver_engine_accepts() {
         // Deeper than Rhai's debug-build default expression depth, within the engine's 200.
         let deep = format!("fn f() {{ {}1{} }}", "(".repeat(30), ")".repeat(30));
