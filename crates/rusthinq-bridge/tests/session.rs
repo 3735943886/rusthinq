@@ -60,10 +60,20 @@ async fn rti_start_stop_latest_status_and_delivered_command_ack() {
         reply.await.unwrap().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    let start = rusthinq_protocol::thinq1::encode(br#"{"Body":{"CmdOpt":"Start"}}"#, 1024).unwrap();
+    // LG's Mon/Start (anszom/rethink#16) is acked, then the saved status follows.
+    let start = rusthinq_protocol::thinq1::encode(
+        br#"{"Header":{"x-lgedm-deviceId":"d"},"Body":{"CmdWId":"n-d","Cmd":"Mon","CmdOpt":"Start"}}"#,
+        1024,
+    )
+    .unwrap();
     for byte in start {
         peer.write_all(&[byte]).await.unwrap();
     }
+    let ack: Value = serde_json::from_slice(&rti(&mut peer).await).unwrap();
+    assert_eq!(
+        ack,
+        json!({"Header":{"x-lgedm-deviceId":"d"},"Body":{"CmdWId":"n-d","ReturnCode":"0000"}})
+    );
     let status: Value = serde_json::from_slice(&rti(&mut peer).await).unwrap();
     assert_eq!(status["Body"]["Data"], "AQI=");
     let command=br#"{ "Header":{"x-lgedm-deviceId":"d"},"Body":{"CmdWId":"remote","Cmd":"Ctrl","unknown":true} }"#;

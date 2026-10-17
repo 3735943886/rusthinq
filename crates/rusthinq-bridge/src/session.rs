@@ -134,15 +134,24 @@ pub async fn thinq1<S: AsyncRead + AsyncWrite + Unpin>(
                         let payload=buffer[4..size].to_vec();buffer.drain(..size);
                         let value:Value=serde_json::from_slice(&payload).map_err(|_|invalid())?;
                         if !value.is_object() || value.get("Header").and_then(|h|h.get("x-lgedm-deviceId")).is_some_and(|id|id.as_str()!=Some(identity.device.as_str())) {return Err(invalid());}
-                        match value["Body"]["CmdOpt"].as_str() {
-                            Some("Start")=>{active=true;if let Some(payload)=&latest {write(&mut writer,&thinq1::encode(payload,MAX).map_err(|_|invalid())?).await?;}},
-                            Some("Stop")=>active=false,
+                        // As the appliance does (anszom/rethink#16): every cloud request is acked with its CmdWId.
+                        let body=&value["Body"];
+                        let ack=match (body.get("ReturnCode"),body.get("CmdWId")) {
+                            (None,Some(id))=>Some(thinq1::encode(json!({"Header":{"x-lgedm-deviceId":identity.device},"Body":{"CmdWId":id,"ReturnCode":"0000"}}).to_string().as_bytes(),MAX).map_err(|_|invalid())?),
+                            _=>None,
+                        };
+                        match (body["Cmd"].as_str(),body["CmdOpt"].as_str()) {
+                            (Some("Mon"),Some("Start"))=>{
+                                if let Some(ack)=&ack {write(&mut writer,ack).await?;}
+                                active=true;if let Some(payload)=&latest {write(&mut writer,&thinq1::encode(payload,MAX).map_err(|_|invalid())?).await?;}
+                            },
+                            (Some("Mon"),Some("Stop"))=>{
+                                if let Some(ack)=&ack {write(&mut writer,ack).await?;}
+                                active=false;
+                            },
                             _=>{
                                 downlink(&events,payload).await?;
-                                if value["Body"].get("ReturnCode").is_none() && let Some(id)=value["Body"].get("CmdWId") {
-                                    let ack=json!({"Header":{"x-lgedm-deviceId":identity.device},"Body":{"CmdWId":id,"ReturnCode":"0000"}}).to_string();
-                                    write(&mut writer,&thinq1::encode(ack.as_bytes(),MAX).map_err(|_|invalid())?).await?;
-                                }
+                                if let Some(ack)=&ack {write(&mut writer,ack).await?;}
                             }
                         }
                         partial=if buffer.is_empty(){None}else{Some(Instant::now()+DEADLINE)};
