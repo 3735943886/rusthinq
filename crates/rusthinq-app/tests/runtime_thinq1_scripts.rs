@@ -38,6 +38,7 @@ async fn automatic_driver(external: bool) {
             directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/host-drivers"),
             topic_prefix: "rusthinq".into(),
+            limits: Default::default(),
             bindings: BTreeMap::new(),
             watch: false,
         })
@@ -333,6 +334,7 @@ async fn broker_outage_keeps_driver_running_and_reconnect_resyncs_retained_state
             directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/host-drivers"),
             topic_prefix: "rusthinq".into(),
+            limits: Default::default(),
             bindings: BTreeMap::new(),
             watch: false,
         })

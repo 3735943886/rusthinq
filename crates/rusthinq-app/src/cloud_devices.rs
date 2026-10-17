@@ -232,9 +232,8 @@ impl Runtime {
     }
     fn current(&self, id: &str, incarnation: u64) -> bool {
         self.app
-            .snapshot()
-            .iter()
-            .any(|d| d.entry.id == id && d.entry.incarnation == incarnation && d.removal.is_none())
+            .device(id)
+            .is_some_and(|d| d.entry.incarnation == incarnation && d.removal.is_none())
     }
     async fn command(
         &mut self,
@@ -549,6 +548,18 @@ impl Runtime {
             }
         };
         let identity = client.account_identity().ok_or_else(stale)?.to_owned();
+        if !self.records().iter().any(|record| {
+            record.enabled
+                && record.material.is_some()
+                && record.attempt.owner.account == identity
+                && self.current(
+                    &record.attempt.owner.device,
+                    record.attempt.owner.incarnation,
+                )
+        }) {
+            *empty = None;
+            return Ok(false);
+        }
         let epoch = *self.account.cancellation().borrow();
         let inventory = owned_remote(&self.account, &identity, epoch, stop, async {
             timeout(Duration::from_secs(30), client.list_devices())
@@ -605,6 +616,22 @@ impl Runtime {
         }
         Ok(false)
     }
+    fn reconciliation_needed(&self) -> bool {
+        self.account
+            .authenticated_client()
+            .ok()
+            .is_some_and(|client| {
+                self.records().iter().any(|record| {
+                    record.enabled
+                        && record.material.is_some()
+                        && client.account_identity() == Some(record.attempt.owner.account.as_str())
+                        && self.current(
+                            &record.attempt.owner.device,
+                            record.attempt.owner.incarnation,
+                        )
+                })
+            })
+    }
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
         // Restore registration ownership even without authentication or an active socket.
         for record in self.records() {
@@ -624,10 +651,12 @@ impl Runtime {
                 }
             }
         }
+        let mut device_states = self.app.state_changes();
         let mut accounts = self.account.clients();
         let mut empty_inventory = None;
         let mut reconcile_at = tokio::time::Instant::now();
         while !*stop.borrow() {
+            let reconcile_needed = self.reconciliation_needed();
             let command = tokio::select! {
                 biased;
                 _=stop.changed()=>break,
@@ -639,7 +668,8 @@ impl Runtime {
                     reconcile_at = tokio::time::Instant::now();
                     continue;
                 },
-                _=tokio::time::sleep_until(reconcile_at)=>{
+                changed=device_states.changed()=>{if changed.is_err(){break;} continue;},
+                _=tokio::time::sleep_until(reconcile_at),if reconcile_needed=>{
                     let recheck = self.reconcile_account(&mut empty_inventory, &mut stop).await.unwrap_or(false);
                     reconcile_at = tokio::time::Instant::now() + Duration::from_secs(if recheck {60} else {900});
                     continue;
@@ -666,6 +696,7 @@ impl Runtime {
                 drop(statuses);
                 self.app.cloud_changed(target);
             }
+            reconcile_at = tokio::time::Instant::now();
             let _ = command.result.send(result);
         }
         self.commands.close();
@@ -721,6 +752,7 @@ async fn supervise(
     .map_err(|e| io::Error::other(format!("{e:?}")))??;
     let mut backoff = 1;
     let mut events = context.app.subscribe();
+    let mut states = context.app.state_changes();
     loop {
         if *stop.borrow() {
             break;
@@ -729,11 +761,10 @@ async fn supervise(
             .borrow()
             .clone()
             .filter(|c| c.authenticated() && c.account_identity() == Some(account.as_str()));
-        let current = context.app.snapshot().into_iter().find(|d| {
-            d.entry.id == device
-                && d.entry.incarnation == registration.incarnation
-                && d.removal.is_none()
-        });
+        let current = context
+            .app
+            .device(&device)
+            .filter(|d| d.entry.incarnation == registration.incarnation && d.removal.is_none());
         if current.is_none() {
             break;
         }
@@ -745,7 +776,13 @@ async fn supervise(
                 generation: s.generation,
             });
         let Some(local) = local.filter(|_| client.is_some()) else {
-            tokio::select! {biased;_=stop.changed()=>break,_=cancelled.changed()=>{cancelled.borrow_and_update();},_=clients.changed()=>{},_=events.recv()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+            tokio::select! {
+                biased;
+                _=stop.changed()=>break,
+                changed=cancelled.changed()=>{if changed.is_err() {break;} cancelled.borrow_and_update();},
+                changed=clients.changed()=>{if changed.is_err() {break;}},
+                changed=states.changed()=>{if changed.is_err() {break;}},
+            }
             continue;
         };
         context
@@ -758,7 +795,7 @@ async fn supervise(
             if error != rusthinq_bridge::devices::Error::Stale {
                 return Err(io::Error::other(format!("{error:?}")));
             }
-            tokio::select! {biased;_=stop.changed()=>break,_=events.recv()=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}
+            tokio::select! {biased;_=stop.changed()=>break,changed=states.changed()=>{if changed.is_err(){break;}}}
             continue;
         }
         let generation = context
@@ -773,17 +810,21 @@ async fn supervise(
             epoch,
             &mut owned_stop,
             connected(
-                &context,
-                &connector,
-                &material,
-                &registration,
-                &local,
-                generation,
-                &mut events,
-                &mut stop,
-                &mut cancelled,
-                &mut clients,
-                &account,
+                CloudSession {
+                    context: &context,
+                    connector: &connector,
+                    material: &material,
+                    registration: &registration,
+                    local: &local,
+                    generation,
+                    account: &account,
+                },
+                SessionSignals {
+                    events: &mut events,
+                    stop: &mut stop,
+                    cancelled: &mut cancelled,
+                    clients: &mut clients,
+                },
             ),
         )
         .await;
@@ -795,9 +836,8 @@ async fn supervise(
         // Only the cloud session may have ended. Unbind means the *local* session is
         // finished, after which it can never be bound again; keep the binding while that
         // local session is still current so the next cloud session can reuse it.
-        let local_current = context.app.snapshot().iter().any(|d| {
-            d.entry.id == device
-                && d.entry.incarnation == registration.incarnation
+        let local_current = context.app.device(&device).is_some_and(|d| {
+            d.entry.incarnation == registration.incarnation
                 && d.online
                 && d.removal.is_none()
                 && d.session.is_some_and(|s| s.generation == local.generation)
@@ -843,20 +883,37 @@ async fn supervise(
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
     Ok(())
 }
-#[allow(clippy::too_many_arguments)]
-async fn connected(
-    context: &Context,
-    connector: &transport::Connector,
-    material: &Material,
-    registration: &Registration,
-    local: &SessionId,
+struct CloudSession<'a> {
+    context: &'a Context,
+    connector: &'a transport::Connector,
+    material: &'a Material,
+    registration: &'a Registration,
+    local: &'a SessionId,
     generation: u64,
-    events: &mut tokio::sync::broadcast::Receiver<AppEvent>,
-    stop: &mut watch::Receiver<bool>,
-    cancelled: &mut watch::Receiver<u64>,
-    clients: &mut watch::Receiver<Option<Arc<Client>>>,
-    account: &str,
-) -> io::Result<()> {
+    account: &'a str,
+}
+struct SessionSignals<'a> {
+    events: &'a mut tokio::sync::broadcast::Receiver<AppEvent>,
+    stop: &'a mut watch::Receiver<bool>,
+    cancelled: &'a mut watch::Receiver<u64>,
+    clients: &'a mut watch::Receiver<Option<Arc<Client>>>,
+}
+async fn connected(session: CloudSession<'_>, signals: SessionSignals<'_>) -> io::Result<()> {
+    let CloudSession {
+        context,
+        connector,
+        material,
+        registration,
+        local,
+        generation,
+        account,
+    } = session;
+    let SessionSignals {
+        events,
+        stop,
+        cancelled,
+        clients,
+    } = signals;
     let identity = session::Identity {
         device: local.device.clone(),
         model: context

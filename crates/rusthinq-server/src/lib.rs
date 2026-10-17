@@ -27,6 +27,9 @@ pub struct Config {
     pub outbound_capacity: usize,
     pub event_capacity: usize,
     pub max_connections: usize,
+    /// Idle deadline for ThinQ1 and pre-CONNECT MQTT. After MQTT CONNECT, the
+    /// deadline is the maximum of this value, 300s appliance grace, and 1.5 times
+    /// the client keep-alive interval.
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
     /// Must be at least the loaded lifecycle ledger's generation high-water mark.
@@ -170,6 +173,7 @@ struct Shared {
     completions: Mutex<HashMap<u64, watch::Receiver<bool>>>,
     events: broadcast::Sender<Event>,
     diagnostics: broadcast::Sender<MqttDiagnostic>,
+    admissions: watch::Sender<()>,
     config: Config,
 }
 impl Shared {
@@ -209,6 +213,11 @@ impl ServerHandle {
         }
         state.generation_ceiling = ceiling;
         Ok(())
+    }
+    /// Subscribe before reading the budget; includes unidentified admissions and
+    /// coalesces bursts without losing the latest budget state.
+    pub fn generation_changes(&self) -> watch::Receiver<()> {
+        self.0.admissions.subscribe()
     }
     pub fn generation_budget(&self) -> (u64, u64) {
         let state = self.0.lock();
@@ -334,6 +343,7 @@ impl Server {
             completions: Mutex::new(HashMap::new()),
             events,
             diagnostics: broadcast::channel(config.event_capacity).0,
+            admissions: watch::channel(()).0,
             config,
         }));
         Ok(Self {
@@ -370,6 +380,7 @@ impl Server {
             state.active.insert(generation);
             generation
         };
+        self.handle.0.admissions.send_replace(());
         let shared = self.handle.0.clone();
         let stop = self.stop.subscribe();
         let (completed, completion) = watch::channel(false);

@@ -165,6 +165,26 @@ fn configuration_resolves_paths_and_rejects_typographical_fields() {
     } else {
         assert!(Config::load(&path).is_err());
     }
+    value["drivers"]["limits"] = serde_json::json!({"worker_capacity":3,"operations":12345});
+    std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+    if cfg!(feature = "scripting") {
+        let limits = Config::load(&path).unwrap().drivers.unwrap().limits;
+        assert_eq!(limits.worker_capacity, 3);
+        assert_eq!(limits.operations, 12345);
+        assert_eq!(limits.source_bytes, 524288);
+    }
+    for invalid in [
+        serde_json::json!({"operations":0}),
+        serde_json::json!({"worker_capacity":0}),
+        serde_json::json!({"source_bytes":-1}),
+        serde_json::json!({"string_bytes":"large"}),
+        serde_json::json!({"operation":12345}),
+    ] {
+        value["drivers"]["limits"] = invalid;
+        std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+    value["drivers"].as_object_mut().unwrap().remove("limits");
     value["drivers"]["watch"] = serde_json::json!("true");
     std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     assert!(Config::load(&path).is_err());
@@ -317,6 +337,7 @@ async fn daemon_keeps_mqtt_alive_until_terminal_publication_is_confirmed() {
             directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/host-drivers"),
             topic_prefix: "test".into(),
+            limits: Default::default(),
             bindings: Default::default(),
             watch: false,
         }),

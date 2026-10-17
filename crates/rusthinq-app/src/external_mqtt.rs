@@ -150,6 +150,7 @@ struct Cache {
     values: BTreeMap<String, Publication>,
     bytes: usize,
     next: u64,
+    retained_revision: u64,
 }
 enum Removal {
     Topic {
@@ -192,6 +193,7 @@ pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
             values: BTreeMap::new(),
             bytes: 0,
             next: 0,
+            retained_revision: 0,
         }),
         notify: Notify::new(),
         transient,
@@ -319,6 +321,7 @@ impl Handle {
             }
             cache.values.insert(topic, message);
             cache.bytes = bytes;
+            cache.retained_revision = version;
         } else if !matches!(*self.0.status.borrow(), Status::Connected) {
             // No subscriber can receive a non-retained message without a broker; replaying
             // it after reconnect would deliver a stale occurrence. Count the loss instead of
@@ -333,7 +336,9 @@ impl Handle {
         }
         cache.next = version;
         drop(cache);
-        self.0.notify.notify_one();
+        if retain {
+            self.0.notify.notify_one();
+        }
         Ok(())
     }
 }
@@ -346,34 +351,10 @@ impl PublishSink for Handle {
     }
 }
 fn valid_scope(app: &Application, message: &Publication) -> bool {
-    if message.retired {
-        return app.retired_script(&message.context.device).as_ref() == Some(&message.context)
-            && app.snapshot().iter().any(|device| {
-                device.entry.id == message.context.device
-                    && device.entry.incarnation == message.context.session.incarnation
-                    && device.entry.last_generation == message.context.session.generation
-                    && device.session.is_none()
-                    && device.removal.is_none()
-            });
-    }
-    app.snapshot().iter().any(|device| {
-        device.entry.id == message.context.device
-            && device.session == Some(message.context.session)
-            && device.online
-            && device.removal.is_none()
-    }) && app
-        .script_states()
-        .get(&message.context.device)
-        .is_some_and(|(session, generation, _)| {
-            *session == message.context.session && *generation == message.context.generation
-        })
+    app.publication_current(&message.context, message.retired, false)
 }
 fn current(app: &Application, message: &Publication) -> bool {
-    valid_scope(app, message)
-        && app.durable_devices().iter().any(|entry| {
-            entry.id == message.context.device
-                && entry.incarnation == message.context.session.incarnation
-        })
+    app.publication_current(&message.context, message.retired, true)
 }
 impl Runtime {
     pub async fn run(
@@ -434,7 +415,7 @@ impl Runtime {
         mut ledger: Ledger,
         stop: &mut watch::Receiver<bool>,
     ) -> io::Result<()> {
-        let mut events = app.adapter_events(); // before recovery snapshot
+        let mut states = app.state_changes(); // before recovery snapshot
         let mut versions = BTreeMap::new();
         let mut scopes = BTreeMap::<String, Context>::new();
         let mut ping = Instant::now() + Duration::from_secs(30);
@@ -442,6 +423,10 @@ impl Runtime {
         loop {
             if *stop.borrow() {
                 return Ok(());
+            }
+            if Instant::now() >= ping {
+                session.ping().await?;
+                ping = Instant::now() + Duration::from_secs(30);
             }
             if let Ok(removal) = self.removals.try_recv() {
                 ledger = self.remove(&mut session, ledger, removal, stop).await?;
@@ -567,28 +552,45 @@ impl Runtime {
             if progress {
                 continue;
             }
-            if self.transient.is_empty() {
+            let settled_retained = {
                 let cache = self.shared.cache.lock().unwrap_or_else(|e| e.into_inner());
                 if cache
                     .values
                     .values()
                     .all(|value| versions.get(&value.topic) == Some(&value.version))
                 {
-                    self.shared.flushed.send_replace(cache.next);
+                    if self.transient.is_empty() {
+                        self.shared.flushed.send_replace(cache.next);
+                    }
+                    Some(cache.retained_revision)
+                } else {
+                    None
                 }
-            }
-            tokio::select! {
-                _=stop.changed()=>return Ok(()),
-                _=self.shared.notify.notified()=>{},
-                _=tokio::time::sleep(Duration::from_secs(1))=>{
-                    if Instant::now()>=ping {session.ping().await?;ping=Instant::now()+Duration::from_secs(30);}
-                },
-                event=events.recv()=>match event {Ok(_)|Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{},Err(tokio::sync::broadcast::error::RecvError::Closed)=>return Ok(())},
-                Some(message)=self.transient.recv()=>{
-                    if current(app,&message) {session.publish_transient(&message.topic,message.payload.as_bytes()).await?;}
-                },
-                Some(removal)=self.removals.recv()=>{
-                    ledger = self.remove(&mut session,ledger,removal,stop).await?;
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    _=stop.changed()=>return Ok(()),
+                    _=tokio::time::sleep_until(ping)=>{
+                        session.ping().await?;
+                        ping=Instant::now()+Duration::from_secs(30);
+                    },
+                    _=self.shared.notify.notified()=>break,
+                    changed=states.changed()=>{if changed.is_err() {return Ok(());} break;},
+                    Some(message)=self.transient.recv()=>{
+                        if current(app,&message) {session.publish_transient(&message.topic,message.payload.as_bytes()).await?;}
+                        // Transient output must not traverse/reconcile retained state.
+                        // Hold the admission lock while checking the queue/watermark,
+                        // so a newly queued output cannot be reported flushed early.
+                        let cache = self.shared.cache.lock().unwrap_or_else(|e|e.into_inner());
+                        if self.transient.is_empty() && settled_retained == Some(cache.retained_revision) {
+                            self.shared.flushed.send_replace(cache.next);
+                        }
+                    },
+                    Some(removal)=self.removals.recv()=>{
+                        ledger = self.remove(&mut session,ledger,removal,stop).await?;
+                        break;
+                    }
                 }
             }
         }
@@ -658,5 +660,102 @@ impl Runtime {
         }
         let _ = result.send(Ok(topics.len()));
         Ok(ledger)
+    }
+}
+
+#[cfg(all(test, feature = "scripting"))]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_ping_deadline_survives_continuous_unrelated_application_events() {
+        use std::{
+            future::{Future, poll_fn},
+            task::Poll,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::lifecycle_storage::Storage::open(&directory.path().join("devices.json"), 4)
+                .unwrap();
+        let server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let app = crate::runtime::Runtime::new(storage, server.handle(), Duration::ZERO, 128)
+            .unwrap()
+            .handle();
+        let config = Config {
+            host: "127.0.0.1".into(),
+            port: 1883,
+            tls: false,
+            ca: None,
+            client: "deadline".into(),
+            username: None,
+            password: None,
+            inventory: directory.path().join("retained.json"),
+        };
+        let (outputs, mut adapter) = new(config).unwrap();
+        let ledger = Ledger::open(&directory.path().join("inventory.json"), 4).unwrap();
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let transport: Transport = Box::new(client);
+        let (session, ()) = tokio::join!(
+            Session::connect(transport, "deadline", Duration::from_secs(3)),
+            async {
+                assert_eq!(peer.read_u8().await.unwrap(), 0x10);
+                let length = peer.read_u8().await.unwrap();
+                let mut body = vec![0; usize::from(length)];
+                peer.read_exact(&mut body).await.unwrap();
+                peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+            }
+        );
+        let (stop, mut stopped) = watch::channel(false);
+        let application: Application = app.clone().into();
+        let mut connection = Box::pin(async move {
+            adapter
+                .connected(&application, session.unwrap(), ledger, &mut stopped)
+                .await
+        });
+        assert!(poll_fn(|cx| Poll::Ready(connection.as_mut().poll(cx).is_pending())).await);
+        let task = tokio::spawn(connection);
+        // A transient from an obsolete scope is fenced, but must still release
+        // flush waiters without any retained notification or periodic scan.
+        let before_flush = Instant::now();
+        outputs
+            .try_publish(
+                &Context {
+                    device: "gone".into(),
+                    session: rusthinq_lifecycle::SessionKey {
+                        incarnation: 1,
+                        generation: 1,
+                    },
+                    generation: 1,
+                },
+                serde_json::json!({"topic":"test/gone/event","payload":"one-shot","retain":false})
+                    .to_string(),
+            )
+            .unwrap();
+        timeout(Duration::from_millis(1), outputs.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Instant::now(), before_flush);
+        for _ in 0..60 {
+            app.driver_error("unrelated".into(), "noise".into());
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
+        let mut ping = [0; 2];
+        assert!(
+            poll_fn(|cx| {
+                let read = peer.read_exact(&mut ping);
+                tokio::pin!(read);
+                Poll::Ready(matches!(read.poll(cx), Poll::Ready(Ok(_))))
+            })
+            .await,
+            "PINGREQ deadline was reset by application traffic"
+        );
+        assert_eq!(ping, [0xc0, 0]);
+        peer.write_all(&[0xd0, 0]).await.unwrap();
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+        server.shutdown().await;
     }
 }

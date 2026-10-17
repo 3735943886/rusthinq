@@ -130,14 +130,6 @@ impl Handle {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-    pub(crate) fn retired_script(&self, id: &str) -> Option<crate::scripts::Context> {
-        self.0
-            .retired_scripts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .cloned()
-    }
     #[cfg(feature = "scripting")]
     pub(crate) fn driver_error(&self, device: String, reason: String) {
         let _ = self.0.events.send(Event::Rejected { device, reason });
@@ -186,6 +178,21 @@ impl Handle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+    #[cfg(feature = "scripting")]
+    pub(crate) fn driver_revision(
+        &self,
+        id: &str,
+        session: SessionKey,
+        generation: u64,
+    ) -> Option<u64> {
+        self.0
+            .driver_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .filter(|(s, g, _)| *s == session && *g == generation)
+            .map(|(_, _, r)| *r)
     }
     pub fn script_states(&self) -> BTreeMap<String, (SessionKey, u64, bool)> {
         self.0
@@ -473,11 +480,74 @@ impl Handle {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.0.events.subscribe()
     }
+    pub(crate) fn state_changes(&self) -> watch::Receiver<()> {
+        self.0.state_changed.subscribe()
+    }
+    #[cfg(feature = "bridge")]
+    pub(crate) fn device(&self, id: &str) -> Option<Device> {
+        self.0
+            .devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+    /// Check one publication's current scope without copying global projections.
+    pub(crate) fn publication_current(
+        &self,
+        ctx: &crate::scripts::Context,
+        retired: bool,
+        durable: bool,
+    ) -> bool {
+        let devices = self.0.devices.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(device) = devices.get(&ctx.device) else {
+            return false;
+        };
+        let valid = if retired {
+            device.entry.incarnation == ctx.session.incarnation
+                && device.entry.last_generation == ctx.session.generation
+                && device.session.is_none()
+                && device.removal.is_none()
+                && self
+                    .0
+                    .retired_scripts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&ctx.device)
+                    == Some(ctx)
+        } else {
+            device.session == Some(ctx.session)
+                && device.online
+                && device.removal.is_none()
+                && self
+                    .0
+                    .script_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&ctx.device)
+                    .is_some_and(|(session, generation, _)| {
+                        *session == ctx.session && *generation == ctx.generation
+                    })
+        };
+        valid
+            && (!durable
+                || self
+                    .0
+                    .durable_devices
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|entry| {
+                        entry.id == ctx.device && entry.incarnation == ctx.session.incarnation
+                    }))
+    }
     pub fn snapshot(&self) -> Vec<Device> {
         self.0
             .devices
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
+            .values()
+            .cloned()
+            .collect()
     }
 }

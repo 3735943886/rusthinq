@@ -6,7 +6,7 @@ const artifacts = process.env.GUI_TEST_ARTIFACTS || "/tmp/rusthinq-gui-check";
 fs.mkdirSync(artifacts, { recursive: true });
 const assert = require("node:assert/strict");
 (async () => {
-  const browser = await chromium.launch({ args: ["--no-sandbox"] });
+  const browser = await chromium.launch({ args: ["--no-sandbox"], executablePath: process.env.GUI_TEST_CHROMIUM });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
     colorScheme: "light",
@@ -233,6 +233,10 @@ const assert = require("node:assert/strict");
       20,
     );
   });
+  await page.routeWebSocket("**/api/services/ws", (ws) => {
+    sockets.services = ws;
+    setTimeout(() => ws.send(JSON.stringify({type: "servicesChanged"})), 20);
+  });
   await page.routeWebSocket("**/api/events", (ws) => {
     sockets.events = ws;
   });
@@ -303,6 +307,17 @@ const assert = require("node:assert/strict");
   await page.waitForFunction(() =>
     document.querySelector(".control-result").textContent.includes("Queued"),
   );
+  // An open, unchanged dialog must not poll presentation every two seconds.
+  await page.waitForTimeout(200);
+  const presentationReads = () => requests.filter(r => r.path.endsWith("/presentation")).length;
+  const idleReads = presentationReads();
+  const accountReads = requests.filter(r => r.path === "/api/cloud").length;
+  await page.waitForTimeout(5200);
+  assert.equal(presentationReads(), idleReads);
+  assert.equal(requests.filter(r => r.path === "/api/cloud").length, accountReads);
+  sockets.events.send(JSON.stringify({type:"scriptOutput",context:{device:"washer-01"},payload:JSON.stringify({topic:"test/washer-01/power",payload:"true"})}));
+  await page.waitForTimeout(200);
+  assert.ok(presentationReads() > idleReads);
   const widget = requests.filter((r) => r.path.endsWith("/invoke")).at(-1);
   assert.deepEqual(JSON.parse(widget.body.input), {
     prop: "power",
@@ -397,7 +412,8 @@ const assert = require("node:assert/strict");
           scriptGeneration: "1",
         },
         sequence: i,
-        error: null,
+        // Successful executions are intentionally hidden from the activity feed.
+        error: `fixture failure ${i}`,
       }),
     );
   await page.waitForFunction(

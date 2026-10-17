@@ -115,21 +115,11 @@ window.DeviceControls = (() => {
               input.setAttribute("role", "switch");
             } else if (def.type === "select") {
               input = document.createElement("select");
-              const options =
-                def.type === "binary"
-                  ? ["false", "true"]
-                  : Array.isArray(def.options)
-                    ? def.options.slice(0, 256)
-                    : [];
+              const options = Array.isArray(def.options)
+                ? def.options.slice(0, 256)
+                : [];
               for (const option of options) {
-                const node = text(
-                  "option",
-                  def.type === "binary"
-                    ? option === "true"
-                      ? "On"
-                      : "Off"
-                    : String(option),
-                );
+                const node = text("option", String(option));
                 node.value = String(option);
                 input.append(node);
               }

@@ -51,26 +51,11 @@ pub async fn capture(client: Client, id: String, path: &Path) -> io::Result<()> 
     capture_with_cloud(client, id, path, false).await
 }
 pub async fn cloud_events(client: &Client, device: Option<&str>) -> io::Result<EventStream> {
-    client
+    let status = client
         .request("api/cloud/notifications", Some(&json!({"enabled":true})))
         .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    let status = loop {
-        let status = client
-            .request("api/cloud/notifications?limit=0", None)
-            .await?;
-        if status["status"] == "connected" {
-            break status;
-        }
-        if !status["enabled"].as_bool().unwrap_or(false) || tokio::time::Instant::now() >= deadline
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "LG notification feed did not connect; sign in and check account/network status",
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
+    // Subscribe immediately. The socket sends an initial status snapshot and all
+    // subsequent transitions, so no HTTP readiness poll/handoff is needed.
     let mut path = format!(
         "api/cloud/notifications/ws?cursor={}",
         status["cursor"].as_str().unwrap_or("0")
@@ -79,8 +64,46 @@ pub async fn cloud_events(client: &Client, device: Option<&str>) -> io::Result<E
         path.push_str("&device=");
         path.push_str(&segment(device));
     }
-    client.events_at(&path).await
+    let mut stream = client.events_at(&path).await?;
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while let Some(message) = stream.next().await {
+            let event = message_value(message.map_err(|_| invalid())?)?;
+            let Some(event) = event else {
+                continue;
+            };
+            let status = if event["type"] == "cloudSnapshot" {
+                &event["snapshot"]
+            } else {
+                &event
+            };
+            if status["status"] == "connected" {
+                return Ok(());
+            }
+            if status["enabled"] == false
+                || event["type"] == "cloudReset"
+                || event["type"] == "cloudLoss"
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "LG notification feed unavailable while connecting",
+                ));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "LG notification stream closed before connecting",
+        ))
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "LG notification feed did not connect within 45 seconds",
+        )
+    })??;
+    Ok(stream)
 }
+
 pub fn notification_capture(event: &Value) -> Option<Value> {
     match event["type"].as_str()? {
         "cloudNotification" => {
@@ -261,6 +284,60 @@ pub async fn capture_with_cloud(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cloud_readiness_uses_stream_status_without_http_polling() {
+        use axum::{
+            Json, Router,
+            extract::{Query, WebSocketUpgrade, ws::Message as WsMessage},
+            routing::{get, post},
+        };
+        use std::collections::BTreeMap;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(
+            &format!("http://{}/", listener.local_addr().unwrap()),
+            None,
+            None,
+        )
+        .unwrap();
+        // Only the expected POST and WebSocket route exist. An extra status GET
+        // or a wrong path is rejected by normal HTTP routing.
+        let routes=Router::new()
+            .route("/api/cloud/notifications",post(|Json(body):Json<Value>|async move {
+                assert_eq!(body,json!({"enabled":true}));
+                Json(json!({"enabled":true,"status":"connecting","cursor":"7"}))
+            }))
+            .route("/api/cloud/notifications/ws",get(|Query(query):Query<BTreeMap<String,String>>,upgrade:WebSocketUpgrade|async move {
+                assert_eq!(query.get("cursor").map(String::as_str),Some("7"));
+                assert_eq!(query.get("device").map(String::as_str),Some("d"));
+                upgrade.on_upgrade(|mut ws|async move {
+                    for value in [json!({"type":"cloudSnapshot","snapshot":{"status":"connecting","enabled":true}}),json!({"type":"cloudStatus","status":"connected","enabled":true}),json!({"type":"cloudNotification","sequence":"8"})] {
+                        ws.send(WsMessage::Text(value.to_string().into())).await.unwrap();
+                    }
+                    ws.send(WsMessage::Close(None)).await.unwrap();
+                })
+            }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let mut events =
+            tokio::time::timeout(Duration::from_secs(3), cloud_events(&client, Some("d")))
+                .await
+                .unwrap()
+                .unwrap();
+        let event = message_value(events.next().await.unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["sequence"], "8");
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     async fn cloud_output(event: Value) -> (io::Result<()>, Vec<Value>) {
         let (writer, mut reader) = tokio::io::duplex(8192);
         let mut output = CaptureWriter(writer);

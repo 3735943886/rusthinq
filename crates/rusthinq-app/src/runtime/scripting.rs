@@ -175,14 +175,10 @@ impl Runtime {
             context: context.clone(),
             error: outcome.error.as_ref().map(|e| format!("{e:?}")),
         });
-        self.shared
-            .script_states
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                device.clone(),
-                (context.session, context.generation, outcome.error.is_some()),
-            );
+        self.shared.script_state(
+            device.clone(),
+            (context.session, context.generation, outcome.error.is_some()),
+        );
         for output in outcome.outputs {
             if let rusthinq_scripting::Output::Publish(payload) = &output {
                 self.shared.observations.publish(
@@ -272,6 +268,7 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(context.device.clone(), context.clone());
+            self.shared.state_changed.send_replace(());
             for output in outcome.outputs {
                 let result = match output {
                     rusthinq_scripting::Output::Publish(payload) => self
@@ -335,6 +332,7 @@ impl Runtime {
         request
             .compiled
             .set_consumer_enabled(self.script_sink.is_some());
+        let revision = request.compiled.driver_revision();
         let result = if stopped {
             Err(rusthinq_scripting::Error::Stopped)
         } else if let Some(owner) = self.scripts.as_mut() {
@@ -349,16 +347,15 @@ impl Runtime {
             Err(rusthinq_scripting::Error::InvalidConfig)
         };
         if result.is_ok() {
+            self.shared
+                .driver_revision(&request.device, request.session, 1, revision);
             let _ = self
                 .scripts
                 .as_ref()
                 .expect("script owner")
                 .set_shutdown_callback(&request.device, request.callbacks.shutdown.clone());
             self.shared
-                .script_states
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request.device.clone(), (request.session, 1, false));
+                .script_state(request.device.clone(), (request.session, 1, false));
             self.script_schedule
                 .retain_timers(|id, _| id != request.device);
             self.script_callbacks
@@ -402,6 +399,7 @@ impl Runtime {
                     && device.session == Some(request.session)
                     && device.removal.is_none()
             });
+            let revision = request.compiled.driver_revision();
             let result = if !current {
                 Err(rusthinq_scripting::Error::Stale)
             } else if request.initialize
@@ -436,10 +434,9 @@ impl Runtime {
             };
             if let Ok(generation) = result {
                 self.shared
-                    .script_states
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(request.device.clone(), (request.session, generation, false));
+                    .driver_revision(&request.device, request.session, generation, revision);
+                self.shared
+                    .script_state(request.device.clone(), (request.session, generation, false));
                 self.script_schedule
                     .retain_timers(|id, _| id != request.device);
             }
@@ -610,6 +607,15 @@ impl Runtime {
                     d.entry.id == *id && d.session == Some(*session) && d.removal.is_none()
                 })
             });
+        self.shared
+            .driver_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, (session, _, _)| {
+                devices.iter().any(|d| {
+                    d.entry.id == *id && d.session == Some(*session) && d.removal.is_none()
+                })
+            });
         self.script_callbacks.retain(|id, _| {
             self.model.devices().iter().any(|device| {
                 &device.entry.id == id && device.session.is_some() && device.removal.is_none()
@@ -641,6 +647,7 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                     $runtime.reconcile();
                     let current=$runtime.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none()) && $runtime.preparation_policy.is_current(&id,&session,&model);
                     if current {
+                        let revision = prepared.as_ref().ok().and_then(|compiled| compiled.driver_revision());
                         let result=match prepared {
                             Err(error)=>Err(error),
                             Ok(mut compiled)=>{
@@ -651,14 +658,15 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                                     continue;
                                 }
                                 let current=$runtime.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none());
-                                if current && !*$stop.borrow() {$runtime.scripts.as_mut().expect("driver owner").attach(&$runtime.model.devices(),id.clone(),session,compiled,rusthinq_scripting::worker::Config {capacity:16,input_bytes:131072,source_bytes:524288})} else {Err(rusthinq_scripting::Error::Stale)}
+                                if current && !*$stop.borrow() {$runtime.scripts.as_mut().expect("driver owner").attach(&$runtime.model.devices(),id.clone(),session,compiled,$runtime.drivers.as_ref().expect("driver config").engine_config().worker_config())} else {Err(rusthinq_scripting::Error::Stale)}
                             }
                         };
                         if let Err(error)=result {$runtime.script_rejected(id.clone(),error);}
                         else {
                             $runtime.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {cloud:Some("__cloud".into()),response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),shutdown:Some("__drop".into()),data_encoding:crate::scripts::DataEncoding::Hex});
                             let _=$runtime.scripts.as_ref().expect("driver owner").set_shutdown_callback(&id,Some("__drop".into()));
-                            $runtime.shared.script_states.lock().unwrap_or_else(|e|e.into_inner()).insert(id.clone(),(session,1,false));
+                            $runtime.shared.driver_revision(&id,session,1,revision);
+                            $runtime.shared.script_state(id.clone(),(session,1,false));
                             if let Err(error)=$runtime.invoke_script(id.clone(),1,"__init".into(),String::new()) {$runtime.script_rejected(id.clone(),error);}
                             {let queue=$runtime.preparation_policy.take_buffer(&id,&session);
                                 for data in queue {if let Err(error)=$runtime.invoke_script(id.clone(),1,"__data".into(),rusthinq_protocol::hex::encode(data)) {$runtime.script_rejected(id.clone(),error);break;}}

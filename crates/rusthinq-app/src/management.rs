@@ -174,8 +174,7 @@ pub fn router(
     }))
 }
 fn build(app: App) -> Router {
-    #[allow(unused_mut)]
-    let mut routes = Router::new()
+    let routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/diagnostics", get(diagnostics))
         .route("/api/devices/{id}/presentation", get(presentation))
@@ -184,6 +183,7 @@ fn build(app: App) -> Router {
             get(notifications).post(notification_control),
         )
         .route("/api/cloud/notifications/ws", get(notification_socket))
+        .route("/api/services/ws", get(service_socket))
         .route("/api/packets/decode", post(decode_packet))
         .route("/api/cloud/devices", get(cloud_devices))
         .route("/api/cloud/inventory", get(cloud_inventory))
@@ -212,8 +212,8 @@ fn build(app: App) -> Router {
         .route("/device", get(monitor))
         .route("/forget/{id}", post(forget));
     #[cfg(feature = "gui")]
-    if app.config.gui {
-        routes = routes
+    let routes = if app.config.gui {
+        routes
             .route(
                 "/",
                 get(|| async {
@@ -303,8 +303,10 @@ fn build(app: App) -> Router {
                         include_bytes!("../assets/favicon.png").as_slice(),
                     )
                 }),
-            );
-    }
+            )
+    } else {
+        routes
+    };
     routes
         .layer(DefaultBodyLimit::max(1_000_000))
         .layer(middleware::from_fn_with_state(app.clone(), authorize))
@@ -1163,6 +1165,39 @@ async fn monitor_message(app: &App, id: &str, session: Option<SessionKey>, text:
         Ok(None) => json!({"injected":true}),
         Err(reject) => json!({"error":format!("{reject:?}")}),
     }
+}
+// These capabilities are bound during composition; subscribe before announcing
+// the initial invalidation so state changes cannot fall into an HTTP/socket gap.
+async fn service_socket(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
+    let Ok(permit) = app.sockets.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "socket capacity exceeded");
+    };
+    #[cfg(feature = "bridge")]
+    let mut accounts = app
+        .handle
+        .account_handle()
+        .map(|account| account.status_updates());
+    let mut mqtt = app.handle.external_mqtt().map(|handle| handle.status());
+    upgrade.max_message_size(4096).on_upgrade(move |mut socket| async move {
+        let _permit = permit;
+        let mut stop = app.stop.clone();
+        loop {
+            if *stop.borrow() || !write(&mut socket,json!({"type":"servicesChanged"})).await { break; }
+            tokio::select! {
+                _=stop.changed()=>break,
+                message=socket.recv()=>{if matches!(message,None|Some(Err(_))|Some(Ok(Message::Close(_)))) {break;}},
+                result=async {
+                    match mqtt.as_mut() {Some(mqtt)=>mqtt.changed().await,None=>std::future::pending().await}
+                }=>{if result.is_err(){break;}},
+                result=async {
+                    #[cfg(feature = "bridge")]
+                    {match accounts.as_mut(){Some(accounts)=>accounts.changed().await,None=>std::future::pending().await}}
+                    #[cfg(not(feature = "bridge"))]
+                    {std::future::pending::<Result<(),watch::error::RecvError>>().await}
+                }=>{if result.is_err(){break;}},
+            }
+        }
+    }).into_response()
 }
 async fn event_socket(State(app): State<App>, upgrade: WebSocketUpgrade) -> Response {
     let Ok(permit) = app.sockets.clone().try_acquire_owned() else {

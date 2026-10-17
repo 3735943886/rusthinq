@@ -60,6 +60,7 @@ async fn auto_driver(external: bool, watched: bool, command: bool) {
     let driver_config = rusthinq_app::drivers::Config {
         directory: sources.clone(),
         topic_prefix: "rusthinq".into(),
+        limits: Default::default(),
         bindings: Default::default(),
         watch: watched,
     };

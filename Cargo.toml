@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/rusthinq-driver-config",
     "crates/rusthinq-protocol",
     "crates/rusthinq-lifecycle",
     "crates/rusthinq-server",

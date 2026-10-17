@@ -240,6 +240,18 @@ impl From<crate::cloud_account::Error> for CloudError {
     }
 }
 impl AppHandle {
+    pub(crate) fn state_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.0.state_changes()
+    }
+    pub(crate) fn publication_current(
+        &self,
+        ctx: &crate::scripts::Context,
+        retired: bool,
+        durable: bool,
+    ) -> bool {
+        self.0.publication_current(ctx, retired, durable)
+    }
+
     #[cfg(feature = "scripting")]
     pub(crate) fn cloud_notification(&self, value: &serde_json::Value) {
         self.0.cloud_notification(value);
@@ -290,9 +302,6 @@ impl AppHandle {
     }
     pub fn external_mqtt(&self) -> Option<crate::external_mqtt::Handle> {
         self.0.external_mqtt()
-    }
-    pub(crate) fn retired_script(&self, id: &str) -> Option<crate::script_types::Context> {
-        self.0.retired_script(id)
     }
     #[cfg(feature = "scripting")]
     pub(crate) fn driver_error(&self, device: String, reason: String) {

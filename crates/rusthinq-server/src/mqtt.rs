@@ -74,6 +74,9 @@ impl Handle {
     pub fn shares_registry(&self, server: &ServerHandle) -> bool {
         Arc::ptr_eq(&self.shared, &server.0)
     }
+    pub fn generation_changes(&self) -> watch::Receiver<()> {
+        ServerHandle(self.shared.clone()).generation_changes()
+    }
     pub fn generation_budget(&self) -> (u64, u64) {
         ServerHandle(self.shared.clone()).generation_budget()
     }
@@ -203,6 +206,7 @@ impl Broker {
             config: config.clone(),
             events,
             diagnostics: broadcast::channel(config.event_capacity).0,
+            admissions: watch::channel(()).0,
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 generation: config.generation_floor,
@@ -252,6 +256,7 @@ impl Broker {
             state.active.insert(generation);
             generation
         };
+        self.shared.admissions.send_replace(());
         let guard = Guard {
             shared: self.shared.clone(),
             id: None,
@@ -578,6 +583,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 );
                             };
                             state.generation = next;
+                            broker.shared.admissions.send_replace(());
                             state.active.remove(&guard.generation);
                             state.active.insert(next);
                             let previous_generation = guard.generation;
@@ -852,8 +858,11 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+// Appliance compatibility grace; independent of the declared MQTT keep-alive.
+const APPLIANCE_IDLE_GRACE: Duration = Duration::from_secs(300);
+
 fn mqtt_idle_timeout(keep_alive: u16, configured: Duration) -> Duration {
-    let floor = configured.max(Duration::from_secs(300));
+    let floor = configured.max(APPLIANCE_IDLE_GRACE);
     floor.max(Duration::from_millis(u64::from(keep_alive) * 1500))
 }
 

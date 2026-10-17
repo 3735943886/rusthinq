@@ -2,6 +2,7 @@
 use std::{collections::BTreeMap, io, path::PathBuf};
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub limits: rusthinq_driver_config::Limits,
     pub watch: bool,
     pub directory: PathBuf,
     pub topic_prefix: String,

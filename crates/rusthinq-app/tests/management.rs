@@ -263,6 +263,71 @@ async fn sockets_get_initial_snapshot_and_shutdown_joins_idle_http_and_upgrades(
 
 #[cfg(feature = "bridge")]
 #[tokio::test]
+async fn service_socket_pushes_account_changes_without_device_traffic() {
+    let directory = tempfile::tempdir().unwrap();
+    let (cloud, account) = rusthinq_app::cloud_account::open(directory.path().join("account.json"))
+        .await
+        .unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(
+        Storage::open(&directory.path().join("devices.json"), 4).unwrap(),
+        server.handle(),
+        Duration::ZERO,
+        32,
+    )
+    .unwrap();
+    runtime
+        .handle()
+        .attach_cloud_account(cloud.clone())
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let account = tokio::spawn(account.run(stopped.clone()));
+    let management = tokio::spawn(management::serve(
+        listener,
+        runtime.handle(),
+        config(false),
+        stopped,
+    ));
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/api/services/ws"))
+            .await
+            .unwrap();
+    let initial = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(initial.to_text().unwrap()).unwrap()["type"],
+        "servicesChanged"
+    );
+    // Logout is local and durable even when no cloud connection/device exists.
+    cloud.logout().await.unwrap();
+    let changed = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(changed.to_text().unwrap()).unwrap()["type"],
+        "servicesChanged"
+    );
+    // Busy and completed status may be separate invalidations; coalescing is
+    // allowed, so do not require exactly one event for a logout operation.
+    stop.send_replace(true);
+    timeout(Duration::from_secs(4), management)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    account.await.unwrap().unwrap();
+    server.shutdown().await;
+}
+
+#[cfg(feature = "bridge")]
+#[tokio::test]
 async fn cloud_account_api_reports_status_and_durable_logout_without_broker() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("account.json");
@@ -365,6 +430,7 @@ async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_wi
     .with_drivers(drivers::Config {
         directory: directory.path().into(),
         topic_prefix: "test".into(),
+        limits: Default::default(),
         bindings: Default::default(),
         watch: false,
     })
@@ -672,6 +738,7 @@ async fn packet_analysis_asks_the_model_driver_to_describe_the_frame() {
     .with_drivers(drivers::Config {
         directory: directory.path().into(),
         topic_prefix: "test".into(),
+        limits: Default::default(),
         bindings: Default::default(),
         watch: false,
     })

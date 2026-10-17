@@ -7,10 +7,12 @@ license.workspace = true
 [features]
 default = ["bridge", "scripting", "gui"]
 bridge = ["dep:rusthinq-bridge"]
-scripting = ["dep:rusthinq-scripting"]
+scripting = ["dep:rusthinq-scripting", "dep:notify"]
 gui = []
 
 [dependencies]
+rusthinq-driver-config = { path = "../rusthinq-driver-config" }
+notify = { version = "8.2", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "1.1"

@@ -12,8 +12,9 @@ use std::{
 };
 use url::Url;
 
-const GATEWAY: &str = "https://route.lgthinq.com:46030/v1/service/application/gateway-uri";
-const CALLBACK: &str = "https://kr.m.lgaccount.com/login/iabClose";
+use crate::cloud_compat::{
+    APP_HEADERS, APP_KEY, CALLBACK, GATEWAY, IOT_BASE_URL, OAUTH_SIGNING_KEY, SERVICE_CODE,
+};
 const LIMIT: usize = 1_048_576;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -124,8 +125,7 @@ fn nonce() -> Result<String, Error> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 fn signature(path: &str, body: Option<&str>, date: &str) -> Result<String, Error> {
-    let key = openssl::pkey::PKey::hmac(b"c053c2a6ddeb7ad97cb0eed0dcb31cf8")
-        .map_err(|_| Error::Crypto)?;
+    let key = openssl::pkey::PKey::hmac(OAUTH_SIGNING_KEY).map_err(|_| Error::Crypto)?;
     let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha1(), &key)
         .map_err(|_| Error::Crypto)?;
     let signed = match body {
@@ -176,18 +176,7 @@ impl Client {
             .build()
             .map_err(|_| Error::Network)?;
         let mut headers = HeaderMap::new();
-        for (key, value) in [
-            ("accept", "application/json"),
-            ("x-thinq-app-ver", "4.1.5000"),
-            ("x-thinq-app-type", "NUTS"),
-            ("x-thinq-app-level", "PRD"),
-            ("x-thinq-app-os", "ANDROID"),
-            ("x-service-code", "SVC202"),
-            ("x-service-phase", "OP"),
-            ("x-origin", "app-web-ANDROID"),
-            ("x-thinq-app-logintype", "LGE"),
-            ("x-api-key", "VGhpblEyLjAgU0VSVklDRQ=="),
-        ] {
+        for &(key, value) in APP_HEADERS {
             header(&mut headers, key, value)?;
         }
         header(&mut headers, "x-country-code", country)?;
@@ -356,12 +345,12 @@ impl Client {
         url.query_pairs_mut().extend_pairs([
             ("callback_url", CALLBACK),
             ("redirect_url", CALLBACK),
-            ("client_id", "LGAO221A02"),
+            ("client_id", APP_KEY),
             ("country", &self.country),
             ("language", "en"),
             ("svc_integrated", "Y"),
             ("state", "signin"),
-            ("svc_code", "SVC202"),
+            ("svc_code", SERVICE_CODE),
         ]);
         Ok(url.into())
     }
@@ -375,10 +364,10 @@ impl Client {
         let mut headers = HeaderMap::new();
         for (key, value) in [
             ("accept", "application/json"),
-            ("x-lge-appkey", "LGAO221A02"),
+            ("x-lge-appkey", APP_KEY),
             ("x-lge-app-os", "ANDROID"),
-            ("x-application-key", "LGAO221A02"),
-            ("lgemp-x-app-key", "LGAO221A02"),
+            ("x-application-key", APP_KEY),
+            ("lgemp-x-app-key", APP_KEY),
             (
                 "content-type",
                 "application/x-www-form-urlencoded;charset=UTF-8",
@@ -594,7 +583,7 @@ impl Client {
         private_key: String,
         csr: String,
     ) -> Result<crate::notifications::Subscription, Error> {
-        self.notification_subscription_at(private_key, csr, endpoint("https://common.lgthinq.com")?)
+        self.notification_subscription_at(private_key, csr, endpoint(IOT_BASE_URL)?)
             .await
     }
     pub async fn notification_subscription_at(
@@ -714,7 +703,7 @@ impl Client {
             let (otp, key) = self.certificate_otp().await?;
             let paired = crate::pairing::pair_at(
                 self,
-                endpoint("https://common.lgthinq.com")?,
+                endpoint(IOT_BASE_URL)?,
                 &self.country,
                 device.id,
                 &otp,
@@ -1363,29 +1352,40 @@ mod tests {
     }
     #[tokio::test]
     async fn authorization_code_exchange_and_login_url() {
-        let (mut client, task) = mock(vec![(
-            200,
-            json!({"access_token":"access","refresh_token":"refresh","expires_in":"60"})
-                .to_string(),
-        )])
-        .await;
-        let login = Url::parse(&client.sign_in_url().await.unwrap()).unwrap();
-        assert_eq!(login.path(), "/signin");
-        assert!(
-            login
-                .query_pairs()
-                .any(|(k, v)| k == "country" && v == "KR")
-        );
-        assert_eq!(
-            client
-                .exchange_code("code&value", 1000)
-                .await
-                .unwrap()
-                .valid_until_ms,
-            61000
-        );
-        let requests = task.await.unwrap();
-        assert!(requests[0].contains("code=code%26value"));
-        assert!(requests[0].contains("x-lge-oauth-signature:"));
+        for country in ["KR", "US", "DE"] {
+            let (mut client, task) = mock(vec![(
+                200,
+                json!({"access_token":"access","refresh_token":"refresh","expires_in":"60"})
+                    .to_string(),
+            )])
+            .await;
+            client.country = country.into();
+            header(&mut client.headers, "x-country-code", country).unwrap();
+            let login = Url::parse(&client.sign_in_url().await.unwrap()).unwrap();
+            assert_eq!(login.path(), "/signin");
+            let query: std::collections::BTreeMap<_, _> = login.query_pairs().collect();
+            assert_eq!(query["country"], country);
+            // rethink uses the same registered redirect even for non-Korean accounts.
+            assert_eq!(
+                query["callback_url"],
+                "https://kr.m.lgaccount.com/login/iabClose"
+            );
+            assert_eq!(query["redirect_url"], query["callback_url"]);
+            assert_eq!(
+                client
+                    .exchange_code("code&value", 1000)
+                    .await
+                    .unwrap()
+                    .valid_until_ms,
+                61000
+            );
+            let requests = task.await.unwrap();
+            assert!(requests[0].contains("code=code%26value"));
+            assert!(
+                requests[0]
+                    .contains("redirect_uri=https%3A%2F%2Fkr.m.lgaccount.com%2Flogin%2FiabClose")
+            );
+            assert!(requests[0].contains("x-lge-oauth-signature:"));
+        }
     }
 }

@@ -210,7 +210,8 @@ impl Config {
                     .as_object()
                     .ok_or_else(|| invalid("drivers must be an object"))?;
                 if fields.keys().any(|key| {
-                    !["directory", "topic_prefix", "bindings", "watch"].contains(&key.as_str())
+                    !["directory", "topic_prefix", "bindings", "watch", "limits"]
+                        .contains(&key.as_str())
                 }) {
                     return Err(invalid("unknown driver field"));
                 }
@@ -234,6 +235,15 @@ impl Config {
                     directory: parent.join(directory),
                     topic_prefix,
                     bindings,
+                    limits: match drivers.get("limits") {
+                        None => Default::default(),
+                        Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid driver limits: {error}"),
+                            )
+                        })?,
+                    },
                     watch: match drivers.get("watch") {
                         None => false,
                         Some(value) => value

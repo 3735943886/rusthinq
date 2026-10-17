@@ -11,7 +11,8 @@
     pairing = null;
   let mqttConnected = false,
     statusTimer,
-    polling = false;
+    polling = false,
+    servicesDirty = false;
   const pending = new Set(),
     cards = new Map();
   function formatUptime(seconds) {
@@ -42,7 +43,17 @@
     history: true,
   });
   let presentationPending = false,
-    presentationRevision = 0;
+    presentationRevision = 0,
+    presentationDirty = false,
+    presentationTimer = null;
+  function invalidatePresentation() {
+    presentationDirty = true;
+    if (presentationPending || presentationTimer !== null || document.hidden || !$("device-dialog").open) return;
+    presentationTimer = setTimeout(() => {
+      presentationTimer = null;
+      refreshPresentation();
+    }, 50);
+  }
   async function refreshPresentation() {
     if (!selected || presentationPending || !connected) return;
     const target = { ...selected },
@@ -51,6 +62,7 @@
       controls.render([], target, true);
       return;
     }
+    presentationDirty = false;
     presentationPending = true;
     try {
       const query = new URLSearchParams({
@@ -84,11 +96,12 @@
       }
     } finally {
       presentationPending = false;
+      if (presentationDirty) invalidatePresentation();
     }
   }
-  setInterval(() => {
-    if (!document.hidden && $("device-dialog").open) refreshPresentation();
-  }, 2000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) invalidatePresentation();
+  });
   $("download-diagnostics").onclick = () =>
     busy($("download-diagnostics"), async () => {
       const report = await api("api/diagnostics");
@@ -144,6 +157,7 @@
     renderDevices();
     renderDetail();
     renderAccount();
+    if (up) invalidatePresentation();
   }
   function renderDevices() {
     const entries = Object.entries(snapshot.devices);
@@ -556,20 +570,24 @@
     renderDevices();
     renderDetail();
   }
-  async function refreshServices() {
-    if (polling) return;
+  async function refreshServices(telemetryOnly = false) {
+    if (polling) {
+      if (!telemetryOnly) servicesDirty = true;
+      return;
+    }
+    servicesDirty = false;
     polling = true;
     try {
       const results = await Promise.allSettled([
-        api("api/cloud"),
+        telemetryOnly ? Promise.resolve(null) : api("api/cloud"),
         api("api/mqtt"),
         api("api/health"),
       ]);
-      if (results[0].status === "fulfilled") {
+      if (results[0].status === "fulfilled" && results[0].value) {
         account = results[0].value;
         renderAccount();
       }
-      if (results[1].status === "fulfilled") {
+      if (results[1].status === "fulfilled" && results[1].value) {
         const mqtt = results[1].value;
         mqttConnected = mqtt.status === "Connected";
         detailRows($("mqtt-details"), [
@@ -599,11 +617,13 @@
       }
     } finally {
       polling = false;
+      if (servicesDirty) refreshServices();
     }
   }
   async function poll() {
-    await refreshServices();
-    statusTimer = setTimeout(poll, document.hidden ? 15000 : 5000);
+    if (!document.hidden) await refreshServices(true);
+    // Counters and elapsed time are sampled telemetry, not transition state.
+    statusTimer = setTimeout(poll, 30000);
   }
   window.addEventListener("pagehide", () => clearTimeout(statusTimer));
   window.addEventListener("pageshow", (event) => {
@@ -907,6 +927,9 @@
     changeTimer = setTimeout(flushChanges, 300);
   }
   function activity(event) {
+    if (["snapshot", "lost"].includes(event.type) ||
+        (event.context?.device === selected?.id && ["scriptOutput", "scriptStopped", "scriptExecuted"].includes(event.type)))
+      invalidatePresentation();
     controls.event(event);
     if (event.type === "scriptOutput") return driverOutput(event);
     // Packet bytes belong in the studio, not the event list.
@@ -957,6 +980,7 @@
     message: receive,
     error: (error) => toast(error.message, "error"),
   });
-  UI.socket("api/events", { message: activity });
+  UI.socket("api/events", { open: invalidatePresentation, message: activity });
+  UI.socket("api/services/ws", { message: () => refreshServices() });
   poll();
 })();

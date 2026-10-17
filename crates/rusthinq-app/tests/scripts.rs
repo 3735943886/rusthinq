@@ -228,6 +228,7 @@ fn configured_driver_cloud_callback_parses_envelope_and_is_optional() {
         watch: false,
         directory: directory.path().into(),
         topic_prefix: "test".into(),
+        limits: Default::default(),
         bindings: Default::default(),
     };
     for source in [

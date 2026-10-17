@@ -7,6 +7,7 @@ fn config() -> Config {
     Config {
         directory: std::env::temp_dir(),
         topic_prefix: "rusthinq".into(),
+        limits: Default::default(),
         bindings: BTreeMap::new(),
         watch: false,
     }
@@ -86,6 +87,7 @@ fn static_imports_follow_rhai_syntax_and_track_all_dependencies() {
     let options = rusthinq_scripting::drivers::Config {
         directory: directory.path().into(),
         topic_prefix: "rusthinq".into(),
+        limits: Default::default(),
         bindings: BTreeMap::new(),
         watch: false,
     };
@@ -107,6 +109,7 @@ fn dynamic_and_cyclic_imports_fail_during_preparation() {
     let options = rusthinq_scripting::drivers::Config {
         directory: directory.path().into(),
         topic_prefix: "rusthinq".into(),
+        limits: Default::default(),
         bindings: BTreeMap::new(),
         watch: false,
     };
@@ -119,4 +122,65 @@ fn dynamic_and_cyclic_imports_fail_during_preparation() {
         std::fs::write(directory.path().join("model.rhai"), source).unwrap();
         assert!(options.prepare("d", "model", true, true).is_err());
     }
+}
+
+#[test]
+fn configured_limits_cover_module_bundle_and_aggregate_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = config();
+    options.directory = directory.path().into();
+    let source = "import \"helper\" as h; fn start(ctx) {ctx.publish_raw(\"a\",h::value(),false);ctx.publish_raw(\"b\",h::value(),false);}";
+    std::fs::write(directory.path().join("Budget.rhai"), source).unwrap();
+    std::fs::write(
+        directory.path().join("helper.rhai"),
+        "fn value(){\"payload\"}",
+    )
+    .unwrap();
+    let mut host = Host::new(options.prepare("d", "Budget", true, true).unwrap());
+    assert_eq!(host.invoke(1, "__init", "").outputs.len(), 2);
+    options.limits.outputs = 1;
+    let mut host = Host::new(options.prepare("d", "Budget", true, true).unwrap());
+    assert!(host.invoke(1, "__init", "").error.is_some());
+    options.limits.outputs = 256;
+    options.limits.output_bytes = 64;
+    let mut host = Host::new(options.prepare("d", "Budget", true, true).unwrap());
+    assert!(host.invoke(1, "__init", "").error.is_some());
+    // The budget includes generated entry points and module names/sources,
+    // even when every individual file fits.
+    options.limits.source_bytes = source.len() + 25;
+    assert!(options.prepare("d", "Budget", true, true).is_err());
+    options.limits.operations = 0;
+    assert!(options.prepare("d", "Budget", true, true).is_err());
+}
+
+#[test]
+fn compiled_revision_keeps_the_prepared_bundle_when_files_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = config();
+    options.directory = directory.path().into();
+    std::fs::write(
+        directory.path().join("M.rhai"),
+        "import \"c\" as c; fn start(ctx) {}",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("c.rhai"), "fn value(){1}").unwrap();
+    let engine = rusthinq_scripting::drivers::Config {
+        watch: false,
+        directory: options.directory.clone(),
+        topic_prefix: options.topic_prefix.clone(),
+        bindings: Default::default(),
+        limits: options.limits.clone(),
+    };
+    let revision = engine.source_revision("d", "M").unwrap();
+    let compiled = options.prepare("d", "M", true, true).unwrap();
+    std::fs::write(directory.path().join("c.rhai"), "fn value(){2}").unwrap();
+    assert_eq!(compiled.driver_revision(), Some(revision));
+    assert_ne!(
+        compiled.driver_revision(),
+        Some(engine.source_revision("d", "M").unwrap())
+    );
+    assert_eq!(
+        engine.worker_config().source_bytes,
+        options.limits.source_bytes
+    );
 }

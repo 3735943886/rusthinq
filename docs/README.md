@@ -21,6 +21,7 @@ Start with the [project README](../README.md) for the TS rethink / Rust 0.1 / Ru
 | [Runtime implementation](0.2-runtime-implementation.md) | L4 cloud/relay, L5 scripts, L6 application and refactoring evidence |
 | [Validation](0.2-validation.md) | Current milestone ledger, compatibility, non-inferiority audit and replay fixtures |
 | [Polling audit](0.2-polling-audit.md) | Refresh ownership and remaining periodic work |
+| [Current constraints review](0.2-limits-review.md) | Implemented contracts, actual constraints and prioritized improvements |
 
 Each consolidated record has a contents list and section anchors. Implementation
 records retain their development checkpoints; test totals and unresolved items in

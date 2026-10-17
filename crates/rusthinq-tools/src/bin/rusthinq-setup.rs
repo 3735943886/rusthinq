@@ -135,6 +135,61 @@ async fn thinq1_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
     Ok(())
 }
 
+struct AccessPoint<'a> {
+    ssid: &'a str,
+    password: &'a str,
+    format: &'a str,
+    security: &'a str,
+    cipher: &'a str,
+    frequency: Option<&'a str>,
+    bssid: Option<&'a str>,
+    ssid_as_bssid: bool,
+}
+impl AccessPoint<'_> {
+    fn request(&self, extra: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+        let use_b64 = self.format == "B64";
+        let ssid_v = if use_b64 {
+            b64(self.ssid)
+        } else {
+            self.ssid.to_string()
+        };
+        let pass_v = if use_b64 {
+            b64(self.password)
+        } else {
+            self.password.to_string()
+        };
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "format".into(),
+            serde_json::json!(if use_b64 { "B64" } else { "plain" }),
+        );
+        data.insert("ssid".into(), serde_json::json!(ssid_v.clone()));
+        data.insert("password".into(), serde_json::json!(pass_v));
+        data.insert("security".into(), serde_json::json!(self.security));
+        data.insert("cipher".into(), serde_json::json!(self.cipher));
+        data.insert("subCountryCode".into(), serde_json::json!("DE"));
+        data.insert("regionalCode".into(), serde_json::json!("eic"));
+        data.insert("constantConnect".into(), serde_json::json!("Y"));
+        data.insert("multiProfile".into(), serde_json::json!("Y"));
+        if let Some(b) = self.bssid {
+            data.insert("bssid".into(), serde_json::json!(b));
+        } else if self.ssid_as_bssid {
+            data.insert("bssid".into(), serde_json::json!(ssid_v));
+        }
+        if let Some(f) = self.frequency {
+            if let Ok(n) = f.parse::<i64>() {
+                data.insert("frequency".into(), serde_json::json!(n));
+            } else {
+                data.insert("frequency".into(), serde_json::json!(f));
+            }
+        }
+        for (k, v) in extra {
+            data.insert(k, v);
+        }
+        serde_json::Value::Object(data)
+    }
+}
+
 async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
     let security = env::var("SETUP_SECURITY").unwrap_or_else(|_| "WPA2_PSK".into());
     let cipher = env::var("SETUP_CIPHER").unwrap_or_else(|_| "AES".into());
@@ -155,6 +210,17 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
         .map(|v| v != "0")
         .unwrap_or(true);
 
+    let access_point = AccessPoint {
+        ssid,
+        password: pass,
+        format: &format,
+        security: &security,
+        cipher: &cipher,
+        frequency: force_freq.as_deref(),
+        bssid: ap_bssid.as_deref(),
+        ssid_as_bssid,
+    };
+
     println!(
         "Wi-Fi credentials: ssid_len={} pass_len={} security={security} format={format}",
         ssid.len(),
@@ -171,52 +237,6 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
             .await
             .context("SoftAP write timed out")??;
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_ap_info(
-        ssid: &str,
-        pass: &str,
-        format: &str,
-        security: &str,
-        cipher: &str,
-        force_freq: &Option<String>,
-        ap_bssid: &Option<String>,
-        ssid_as_bssid: bool,
-        extra: serde_json::Map<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        let use_b64 = format == "B64";
-        let ssid_v = if use_b64 { b64(ssid) } else { ssid.to_string() };
-        let pass_v = if use_b64 { b64(pass) } else { pass.to_string() };
-        let mut data = serde_json::Map::new();
-        data.insert(
-            "format".into(),
-            serde_json::json!(if use_b64 { "B64" } else { "plain" }),
-        );
-        data.insert("ssid".into(), serde_json::json!(ssid_v.clone()));
-        data.insert("password".into(), serde_json::json!(pass_v));
-        data.insert("security".into(), serde_json::json!(security));
-        data.insert("cipher".into(), serde_json::json!(cipher));
-        data.insert("subCountryCode".into(), serde_json::json!("DE"));
-        data.insert("regionalCode".into(), serde_json::json!("eic"));
-        data.insert("constantConnect".into(), serde_json::json!("Y"));
-        data.insert("multiProfile".into(), serde_json::json!("Y"));
-        if let Some(b) = ap_bssid {
-            data.insert("bssid".into(), serde_json::json!(b));
-        } else if ssid_as_bssid {
-            data.insert("bssid".into(), serde_json::json!(ssid_v));
-        }
-        if let Some(f) = force_freq {
-            if let Ok(n) = f.parse::<i64>() {
-                data.insert("frequency".into(), serde_json::json!(n));
-            } else {
-                data.insert("frequency".into(), serde_json::json!(f));
-            }
-        }
-        for (k, v) in extra {
-            data.insert(k, v);
-        }
-        serde_json::Value::Object(data)
     }
 
     write_json(
@@ -313,17 +333,7 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
                     }
                     "setCertInfo" => {
                         ap_info_pass = 1;
-                        let data = build_ap_info(
-                            ssid,
-                            pass,
-                            &format,
-                            &security,
-                            &cipher,
-                            &force_freq,
-                            &ap_bssid,
-                            ssid_as_bssid,
-                            serde_json::Map::new(),
-                        );
+                        let data = access_point.request(serde_json::Map::new());
                         let keys: Vec<_> = data
                             .as_object()
                             .map(|o| {
@@ -365,17 +375,7 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
                                 hn.and_then(|h| h.get("encryption")),
                                 hn.and_then(|h| h.get("oui")),
                             );
-                            let data = build_ap_info(
-                                ssid,
-                                pass,
-                                &format,
-                                &security,
-                                &cipher,
-                                &force_freq,
-                                &ap_bssid,
-                                ssid_as_bssid,
-                                extra,
-                            );
+                            let data = access_point.request(extra);
                             write_json(
                                 &mut stream,
                                 &serde_json::json!({
@@ -403,10 +403,6 @@ async fn thinq2_setup(host: &str, ssid: &str, pass: &str) -> Result<()> {
                     }
                     "releaseDev" => {
                         println!("Setup completed, the device will now connect to your Wi-Fi");
-                        // Purely a UX pause so the line above is readable before the
-                        // process prints its last line and exits - nothing here is
-                        // waiting on the device itself.
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
                         println!("ThinQ2 setup successful, see rusthinq logs for a follow-up");
                         done = true;
                     }
@@ -579,4 +575,48 @@ fn print_footer() {
     Thanks!
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_point_scan_refinement_preserves_credentials_and_explicit_bssid() {
+        let initial = AccessPoint {
+            ssid: "Wi-Fi",
+            password: "a&b",
+            format: "B64",
+            security: "WPA2_PSK",
+            cipher: "AES",
+            frequency: None,
+            bssid: None,
+            ssid_as_bssid: true,
+        };
+        let first = initial.request(serde_json::Map::new());
+        assert_eq!(first["ssid"], "V2ktRmk=");
+        assert_eq!(first["password"], "YSZi");
+        assert_eq!(first["bssid"], "V2ktRmk=");
+        let extra = serde_json::json!({"frequency": 2412, "security":"WPA3_SAE", "cipher":"CCMP"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let refined = initial.request(extra);
+        assert_eq!(refined["ssid"], first["ssid"]);
+        assert_eq!(refined["password"], first["password"]);
+        assert_eq!(refined["frequency"], 2412);
+        assert_eq!(refined["security"], "WPA3_SAE");
+        assert_eq!(refined["cipher"], "CCMP");
+        let explicit = AccessPoint {
+            format: "plain",
+            bssid: Some("00:11:22:33:44:55"),
+            frequency: Some("auto"),
+            ..initial
+        };
+        let request = explicit.request(serde_json::Map::new());
+        assert_eq!(request["ssid"], "Wi-Fi");
+        assert_eq!(request["password"], "a&b");
+        assert_eq!(request["bssid"], "00:11:22:33:44:55");
+        assert_eq!(request["frequency"], "auto");
+    }
 }

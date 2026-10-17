@@ -129,17 +129,52 @@ struct Shared {
     durable_devices: Mutex<Vec<rusthinq_lifecycle::Entry>>,
     message_seed: u64,
     driver_models: Mutex<BTreeMap<String, (SessionKey, String, bool)>>,
+    #[cfg(feature = "scripting")]
+    driver_revisions: Mutex<BTreeMap<String, (SessionKey, u64, u64)>>,
     script_states: Mutex<BTreeMap<String, (SessionKey, u64, bool)>>,
     #[cfg(feature = "scripting")]
     scripts: mpsc::Sender<ScriptCommand>,
     #[cfg(feature = "scripting")]
     cloud_scripts: mpsc::Sender<CloudNotification>,
     metadata: Mutex<BTreeMap<String, rusthinq_server::thinq1_http::Metadata>>,
-    devices: Mutex<Vec<Device>>,
+    devices: Mutex<BTreeMap<String, Device>>,
+    state_changed: watch::Sender<()>,
     events: broadcast::Sender<Event>,
     commands: mpsc::Sender<ManagementCommand>,
     attach: mpsc::Sender<AttachCleanup>,
     cleanup_status: watch::Sender<CleanupStatus>,
+}
+impl Shared {
+    #[cfg(feature = "scripting")]
+    fn driver_revision(
+        &self,
+        id: &str,
+        session: SessionKey,
+        generation: u64,
+        revision: Option<u64>,
+    ) {
+        let mut revisions = self
+            .driver_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(revision) = revision {
+            revisions.insert(id.to_owned(), (session, generation, revision));
+        } else {
+            revisions.remove(id);
+        }
+    }
+
+    #[cfg(feature = "scripting")]
+    fn script_state(&self, id: String, state: (SessionKey, u64, bool)) {
+        let previous = self
+            .script_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, state);
+        if previous != Some(state) {
+            self.state_changed.send_replace(());
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Handle(Arc<Shared>);
@@ -466,6 +501,8 @@ impl Runtime {
             ),
             retired_scripts: Mutex::new(BTreeMap::new()),
             external_mqtt: Mutex::new(None),
+            #[cfg(feature = "scripting")]
+            driver_revisions: Mutex::new(BTreeMap::new()),
             script_states: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "scripting")]
             scripts: script_sender,
@@ -491,7 +528,14 @@ impl Runtime {
                     })
                     .collect(),
             ),
-            devices: Mutex::new(model.devices()),
+            devices: Mutex::new(
+                model
+                    .devices()
+                    .into_iter()
+                    .map(|d| (d.entry.id.clone(), d))
+                    .collect(),
+            ),
+            state_changed: watch::channel(()).0,
             events,
             commands,
             attach,
@@ -572,8 +616,7 @@ impl Runtime {
         self.script_sink = Some(sink);
         self
     }
-    #[allow(unused_mut)]
-    pub fn with_external_mqtt(mut self, handle: crate::external_mqtt::Handle) -> Self {
+    pub fn with_external_mqtt(self, handle: crate::external_mqtt::Handle) -> Self {
         *self
             .shared
             .external_mqtt
@@ -581,11 +624,14 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
         #[cfg(feature = "scripting")]
         {
-            self.script_sink = Some(Arc::new(ApplicationSink(
-                self.shared.events.clone(),
+            let mut runtime = self;
+            runtime.script_sink = Some(Arc::new(ApplicationSink(
+                runtime.shared.events.clone(),
                 Some(handle),
             )));
+            runtime
         }
+        #[cfg(not(feature = "scripting"))]
         self
     }
     #[cfg(feature = "scripting")]
@@ -1038,11 +1084,26 @@ impl Runtime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|id, _| devices.iter().any(|d| d.entry.id == *id));
-        *self
-            .shared
-            .devices
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = self.model.devices();
+        let next = devices
+            .iter()
+            .map(|d| (d.entry.id.clone(), d.clone()))
+            .collect();
+        let changed = {
+            let mut snapshot = self
+                .shared
+                .devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *snapshot == next {
+                false
+            } else {
+                *snapshot = next;
+                true
+            }
+        };
+        if changed {
+            self.shared.state_changed.send_replace(());
+        }
         self.cleanup_state
             .send_replace((self.model.devices(), false));
         if let Some(error) = outcome.error {
@@ -1260,6 +1321,7 @@ impl Runtime {
     /// Shutdown L3 first, then signal this loop; it reconciles final session state
     /// and drains/join all started storage work, including coalesced final updates.
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) -> io::Result<()> {
+        let mut admissions = self.server.generation_changes();
         self.reconcile();
         let mut stopping = *stop.borrow();
         loop {
@@ -1305,15 +1367,12 @@ impl Runtime {
                     return Ok(());
                 }
             }
-            #[allow(unused_mut)]
-            let mut deadline = self.deadline.map(|value| self.epoch + value);
+            let deadline = self.deadline.map(|value| self.epoch + value);
             #[cfg(feature = "scripting")]
-            {
-                deadline = deadline
-                    .into_iter()
-                    .chain(self.script_schedule.next_deadline())
-                    .min();
-            }
+            let deadline = deadline
+                .into_iter()
+                .chain(self.script_schedule.next_deadline())
+                .min();
             runtime_select! {self,stop,stopping;
                 result = async {self.cleanup.as_mut().expect("cleanup present").await}, if self.cleanup.is_some() => {
                     self.cleanup = None;
@@ -1345,6 +1404,7 @@ impl Runtime {
                     self.write = None;
                     let (storage,result) = result.map_err(io::Error::other)?;
                     *self.shared.durable_devices.lock().unwrap_or_else(|e|e.into_inner())=storage.state().ledger.entries.clone();
+                    self.shared.state_changed.send_replace(());
                     *self.shared.persisted_models.lock().unwrap_or_else(|e|e.into_inner())=storage.state().metadata.clone();
                     self.storage = Some(storage);
                     match result {
@@ -1421,7 +1481,7 @@ impl Runtime {
                 metadata = async {self.metadata.as_mut().expect("metadata source").recv().await}, if !stopping && self.metadata.is_some() => {
                     match metadata {Some(metadata)=>self.observe_metadata(metadata),None=>self.metadata=None}
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)), if !stopping && self.refill.is_some() => {},
+                _ = admissions.changed(), if !stopping && self.refill.is_some() => {},
                 event = self.transport.recv(), if !stopping => match event {
                     Ok(TransportEvent::Up(id)) => self.up(id),
                     Ok(TransportEvent::Down(id,_)) => self.down(id),

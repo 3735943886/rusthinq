@@ -43,6 +43,7 @@ see [operations](docs/0.2-operations.md) for its limits and delivery semantics.
 | `rusthinq-lifecycle` | Device lifecycle, identity and generation transitions |
 | `rusthinq-server` | Local device transports and provisioning services |
 | `rusthinq-bridge` | LG account, cloud protocol and relay adapters |
+| `rusthinq-driver-config` | Shared driver resource defaults and validation, independent of Rhai |
 | `rusthinq-scripting` | Rhai execution and generic host effects |
 | `rusthinq-app` | Composed daemon, durable ownership, management, GUI and external MQTT |
 | `rusthinq-tools` | CLI, MCP, capture/replay, setup and migration utilities |

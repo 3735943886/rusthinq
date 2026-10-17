@@ -19,6 +19,49 @@ async fn until(events: &mut broadcast::Receiver<Event>, predicate: impl Fn(&Even
     .unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn unidentified_admission_refills_without_advancing_a_poll_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let block = storage.reserve_generations(2).unwrap();
+    let mut server = Server::new(Config {
+        generation_floor: block.floor,
+        generation_ceiling: block.ceiling,
+        ..Config::default()
+    })
+    .unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_generation_refill(2, 1)
+        .unwrap();
+    let mut events = runtime.handle().subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    tokio::task::yield_now().await;
+    let before = tokio::time::Instant::now();
+    let (stream, _unidentified) = tokio::io::duplex(64);
+    server.admit(stream).unwrap();
+    let real_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if matches!(
+            events.try_recv(),
+            Ok(Event::GenerationExtended { ceiling: 4 })
+        ) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < real_deadline,
+            "admission notification did not refill"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(tokio::time::Instant::now(), before);
+    assert!(server.handle().snapshot().is_empty());
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn runtime_refills_committed_budget_without_closing_existing_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

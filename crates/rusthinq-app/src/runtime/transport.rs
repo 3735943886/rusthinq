@@ -67,6 +67,14 @@ impl TransportHandle {
             Self::ThinQ2(handle) => handle.close_and_wait(session).await,
         }
     }
+    pub(super) fn generation_changes(&self) -> watch::Receiver<()> {
+        match self {
+            Self::ThinQ1(handle) | Self::Mixed { server: handle, .. } => {
+                handle.generation_changes()
+            }
+            Self::ThinQ2(handle) => handle.generation_changes(),
+        }
+    }
     pub(super) fn generation_budget(&self) -> (u64, u64) {
         match self {
             Self::ThinQ1(handle) | Self::Mixed { server: handle, .. } => handle.generation_budget(),

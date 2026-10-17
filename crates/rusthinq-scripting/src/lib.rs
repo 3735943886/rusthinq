@@ -99,6 +99,7 @@ impl Buffer {
     }
 }
 pub struct Compiled {
+    pub(crate) driver_revision: Option<u64>,
     support_ast: Option<AST>,
     invocation_ast: Option<AST>,
     source_bytes: usize,
@@ -110,6 +111,11 @@ pub struct Compiled {
     limits: Limits,
 }
 impl Compiled {
+    /// Fingerprint of the exact driver/module bundle used to compile this instance.
+    pub fn driver_revision(&self) -> Option<u64> {
+        self.driver_revision
+    }
+
     /// Opt into callbacks taking `(ctx, text)`. Only opaque primitives are installed:
     /// publish/send, `publish_raw(topic, payload, retain)`, device sends and timers.
     pub fn with_context(
@@ -398,6 +404,7 @@ impl Compiled {
             .compile(source)
             .map_err(|error| Error::Compile(error.to_string()))?;
         Ok(Self {
+            driver_revision: None,
             support_ast: None,
             invocation_ast: None,
             source_bytes: source.len(),

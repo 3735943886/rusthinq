@@ -8,9 +8,9 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-const MAX_SOURCE: usize = 524288;
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub limits: rusthinq_driver_config::Limits,
     pub watch: bool,
     pub directory: PathBuf,
     pub topic_prefix: String,
@@ -46,7 +46,7 @@ enum Kind {
     Module,
 }
 
-fn read(root: &Path, name: &str, kind: Kind) -> io::Result<String> {
+fn read(root: &Path, name: &str, kind: Kind, max_source: usize) -> io::Result<String> {
     let (valid, subdirectory) = match kind {
         Kind::Driver => (self::model(name), "drivers"),
         Kind::Module => (self::name(name), "modules"),
@@ -66,9 +66,9 @@ fn read(root: &Path, name: &str, kind: Kind) -> io::Result<String> {
     }
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(MAX_SOURCE as u64 + 1)
+        .take(max_source as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SOURCE {
+    if bytes.len() > max_source {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "driver source exceeded",
@@ -83,6 +83,7 @@ fn modules(
     visiting: &mut BTreeSet<String>,
     bundle: &mut Vec<Source>,
     total: &mut usize,
+    max_source: usize,
 ) -> io::Result<()> {
     // Use Rhai's parser so whitespace, comments, escaped strings and multiple
     // imports per line have the same meaning as the source we later execute.
@@ -120,14 +121,14 @@ fn modules(
                 "cyclic/oversized driver module bundle",
             ));
         }
-        let source = read(root, module, Kind::Module)?;
+        let source = read(root, module, Kind::Module, max_source)?;
         *total = total
             .checked_add(source.len() + module.len())
-            .filter(|total| *total <= MAX_SOURCE)
+            .filter(|total| *total <= max_source)
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "module source budget exceeded")
             })?;
-        modules(root, &source, seen, visiting, bundle, total)?;
+        modules(root, &source, seen, visiting, bundle, total, max_source)?;
         visiting.remove(module);
         seen.insert(module.into());
         bundle.push(Source {
@@ -173,8 +174,27 @@ fn inheritance(bundle: &[Source], source: &str, chain: &mut Vec<String>) -> io::
     }
     Ok(())
 }
+fn fingerprint(model: &str, source: &str, bundle: &[Source]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    model.hash(&mut hash);
+    source.hash(&mut hash);
+    for module in bundle {
+        module.name.hash(&mut hash);
+        module.source.hash(&mut hash);
+    }
+    hash.finish()
+}
 impl Config {
+    pub fn worker_config(&self) -> crate::worker::Config {
+        crate::worker::Config {
+            capacity: self.limits.worker_capacity,
+            input_bytes: self.limits.input_bytes,
+            source_bytes: self.limits.source_bytes,
+        }
+    }
     pub fn validate(&self) -> io::Result<()> {
+        self.limits.validate()?;
         if !self.directory.is_dir()
             || self.topic_prefix.is_empty()
             || self.topic_prefix.len() > 256
@@ -205,10 +225,10 @@ impl Config {
     }
     /// Fingerprint only this model and its static module dependencies.
     pub fn source_revision(&self, id: &str, model: &str) -> io::Result<u64> {
-        use std::hash::{Hash, Hasher};
+        self.limits.validate()?;
         let root = self.directory.canonicalize()?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model, Kind::Driver)?;
+        let source = read(&root, model, Kind::Driver, self.limits.source_bytes)?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -218,15 +238,9 @@ impl Config {
             &mut BTreeSet::new(),
             &mut bundle,
             &mut total,
+            self.limits.source_bytes,
         )?;
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        model.hash(&mut hash);
-        source.hash(&mut hash);
-        for module in bundle {
-            module.name.hash(&mut hash);
-            module.source.hash(&mut hash);
-        }
-        Ok(hash.finish())
+        Ok(fingerprint(model, &source, &bundle))
     }
     pub fn prepare(
         &self,
@@ -245,12 +259,16 @@ impl Config {
         consumer: bool,
         metadata: Option<(&str, &str)>,
     ) -> Result<Compiled, Error> {
+        self.limits
+            .validate()
+            .map_err(|e| Error::Compile(e.to_string()))?;
         let root = self
             .directory
             .canonicalize()
             .map_err(|e| Error::Compile(e.to_string()))?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model, Kind::Driver).map_err(|e| Error::Compile(e.to_string()))?;
+        let source = read(&root, model, Kind::Driver, self.limits.source_bytes)
+            .map_err(|e| Error::Compile(e.to_string()))?;
         let mut bundle = Vec::new();
         let mut total = source.len();
         modules(
@@ -260,6 +278,7 @@ impl Config {
             &mut BTreeSet::new(),
             &mut bundle,
             &mut total,
+            self.limits.source_bytes,
         )
         .map_err(|e| Error::Compile(e.to_string()))?;
         let mut ctx = context::Config::new(id.into(), model.into());
@@ -276,14 +295,14 @@ impl Config {
             .as_millis()
             .try_into()
             .map_err(|_| Error::GenerationExhausted)?;
-        ctx.state_keys = 256;
-        ctx.state_bytes = 262144;
+        ctx.state_keys = self.limits.state_keys;
+        ctx.state_bytes = self.limits.state_bytes;
         let limits = Limits {
-            source_bytes: MAX_SOURCE,
-            string_bytes: 131072,
-            operations: 5_000_000,
-            outputs: 256,
-            output_bytes: 1_048_576,
+            source_bytes: self.limits.source_bytes,
+            string_bytes: self.limits.string_bytes,
+            operations: self.limits.operations,
+            outputs: self.limits.outputs,
+            output_bytes: self.limits.output_bytes,
         };
         let mut chain = Vec::new();
         inheritance(&bundle, &source, &mut chain).map_err(|e| Error::Compile(e.to_string()))?;
@@ -333,7 +352,10 @@ impl Config {
             );
         }
         entry.push_str("}\n");
-        compiled.with_entry(&entry)?.with_modules(bundle)
+        let revision = fingerprint(model, &source, &bundle);
+        let mut compiled = compiled.with_entry(&entry)?.with_modules(bundle)?;
+        compiled.driver_revision = Some(revision);
+        Ok(compiled)
     }
 }
 
@@ -367,6 +389,7 @@ mod tests {
             watch: false,
             directory: root.clone(),
             topic_prefix: "p".into(),
+            limits: Default::default(),
             bindings: BTreeMap::new(),
         };
         let mut host = crate::Host::new(config.prepare("d", "Big", false, true).unwrap());
@@ -398,8 +421,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("F_V8_Y___W.B_2QEUK.rhai"), "fn start(ctx) {}").unwrap();
         let root = root.canonicalize().unwrap();
-        let read_model = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Driver);
-        let read_module = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Module);
+        let read_model = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Driver, 524288);
+        let read_module = read(&root, "F_V8_Y___W.B_2QEUK", Kind::Module, 524288);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(read_model.unwrap(), "fn start(ctx) {}");
         assert_eq!(read_module.unwrap_err().kind(), io::ErrorKind::InvalidInput);
@@ -413,12 +436,12 @@ mod tests {
         std::fs::write(root.join("drivers/M.rhai"), "import \"c\" as c;").unwrap();
         std::fs::write(root.join("modules/c.rhai"), "fn shipped() {}").unwrap();
         let root = root.canonicalize().unwrap();
-        let driver = read(&root, "M", Kind::Driver).unwrap();
-        let shipped = read(&root, "c", Kind::Module).unwrap();
+        let driver = read(&root, "M", Kind::Driver, 524288).unwrap();
+        let shipped = read(&root, "c", Kind::Module, 524288).unwrap();
         std::fs::write(root.join("c.rhai"), "fn local() {}").unwrap();
-        let local = read(&root, "c", Kind::Module).unwrap();
-        let module_as_driver = read(&root, "c", Kind::Driver).unwrap();
-        let missing = read(&root, "M", Kind::Module);
+        let local = read(&root, "c", Kind::Module, 524288).unwrap();
+        let module_as_driver = read(&root, "c", Kind::Driver, 524288).unwrap();
+        let missing = read(&root, "M", Kind::Module, 524288);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(driver, "import \"c\" as c;");
         assert_eq!(shipped, "fn shipped() {}");
@@ -457,6 +480,7 @@ mod tests {
             watch: false,
             directory: root.clone(),
             topic_prefix: "t".into(),
+            limits: Default::default(),
             bindings: Default::default(),
         };
         let compiled = config.prepare("d", "M", true, true);

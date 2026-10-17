@@ -10,11 +10,13 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+type Failure = Arc<Mutex<Option<String>>>;
 type Result<T> = std::result::Result<T, Box<EvalAltResult>>;
 #[derive(Clone)]
 struct Device(Arc<Mutex<State>>);
 struct State {
     host: Host,
+    failure: Failure,
     thinq2: bool,
     properties: BTreeMap<String, String>,
     events: BTreeMap<String, String>,
@@ -26,9 +28,25 @@ struct State {
     error: Option<String>,
 }
 impl State {
-    fn invoke(&mut self, function: &str, input: &str) {
+    fn fail(&mut self, error: String) -> Box<EvalAltResult> {
+        // Keep the first cause even after a caught exception or device disposal.
+        let error = self.error.get_or_insert(error).clone();
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| error.clone());
+        error.into()
+    }
+
+    fn invoke(&mut self, function: &str, input: &str) -> Result<()> {
         let result = self.host.invoke(1, function, input);
-        self.error = result.error.map(|e| format!("{e:?}"));
+        let error = result.error.map(|error| {
+            let detail = match error {
+                crate::Error::Execution(detail) => detail,
+                other => format!("{other:?}"),
+            };
+            format!("driver hook {function}: {detail}")
+        });
         for output in result.outputs {
             match output {
                 Output::Publish(text) => {
@@ -73,34 +91,43 @@ impl State {
                 }
             }
         }
-        if self.sent.len() > 1024
+        let exceeded = self.sent.len() > 1024
             || self.clips.len() > 1024
             || self.properties.len() > 1024
             || self.published.len() > 2048
             || self.events.len() > 128
-            || self.timers.len() > 256
-        {
-            self.error = Some("test effect budget exceeded".into());
+            || self.timers.len() > 256;
+        if exceeded {
             self.sent.truncate(1024);
             self.clips.truncate(1024);
         }
+        if let Some(error) =
+            error.or_else(|| exceeded.then(|| "test effect budget exceeded".into()))
+        {
+            return Err(self.fail(error));
+        }
+        match &self.error {
+            Some(error) => Err(error.clone().into()),
+            None => Ok(()),
+        }
     }
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> Result<()> {
         let input = if self.thinq2 {
             rusthinq_protocol::hex::encode(bytes)
         } else {
             use base64::Engine;
             rusthinq_protocol::hex::encode(serde_json::json!({"Header":{"x-lgedm-deviceId":"test-device"},"Body":{"Cmd":"Mon","Format":"B64","Data":base64::engine::general_purpose::STANDARD.encode(bytes)}}).to_string())
         };
-        self.invoke("__data", &input);
+        self.invoke("__data", &input)
     }
 }
-fn device(config: &Config, model: &str, thinq2: bool) -> Result<Device> {
+fn device(config: &Config, model: &str, thinq2: bool, failure: Failure) -> Result<Device> {
     let compiled = config
         .prepare("test-device", model, thinq2, true)
         .map_err(|e| Box::<EvalAltResult>::from(format!("{e:?}")))?;
     Ok(Device(Arc::new(Mutex::new(State {
         host: Host::new(compiled),
+        failure,
         thinq2,
         properties: Default::default(),
         events: Default::default(),
@@ -156,7 +183,7 @@ fn equal(a: Dynamic, b: Dynamic, reason: &str) -> Result<()> {
         Err(format!("{reason}: actual={a}, expected={b}").into())
     }
 }
-fn engine(config: Config, model: String) -> Engine {
+fn engine(config: Config, model: String, failure: Failure) -> Engine {
     let mut engine = Engine::new();
     engine
         .set_max_operations(10_000_000)
@@ -171,10 +198,15 @@ fn engine(config: Config, model: String) -> Engine {
     crate::codecs::install(&mut engine);
     let other = config.clone();
     let other_model = model.clone();
+    let other_failure = failure.clone();
     engine
         .register_type_with_name::<Device>("Device")
-        .register_fn("device", move || device(&config, &model, true))
-        .register_fn("device_t1", move || device(&other, &other_model, false))
+        .register_fn("device", move || {
+            device(&config, &model, true, failure.clone())
+        })
+        .register_fn("device_t1", move || {
+            device(&other, &other_model, false, other_failure.clone())
+        })
         .register_fn("start", |d: &mut Device| state(d).invoke("__init", ""))
         .register_fn("drop_device", |d: &mut Device| {
             state(d).invoke("__drop", "")
@@ -186,8 +218,7 @@ fn engine(config: Config, model: String) -> Engine {
                 .collect::<String>();
             let bytes = rusthinq_protocol::hex::decode(text)
                 .map_err(|e| Box::<EvalAltResult>::from(e.to_string()))?;
-            state(d).feed(&bytes);
-            Ok(())
+            state(d).feed(&bytes)
         })
         .register_fn("feed", |d: &mut Device, bytes: Vec<u8>| {
             state(d).feed(&bytes)
@@ -201,10 +232,11 @@ fn engine(config: Config, model: String) -> Engine {
                     .collect::<String>();
                 let bytes = rusthinq_protocol::hex::decode(text)
                     .map_err(|e| Box::<EvalAltResult>::from(e.to_string()))?;
-                match state(d).host.describe(&bytes, to_device) {
+                let mut device = state(d);
+                match device.host.describe(&bytes, to_device) {
                     Ok(Some(value)) => rhai::serde::to_dynamic(value),
                     Ok(None) => Ok(Dynamic::UNIT),
-                    Err(error) => Err(format!("{error:?}").into()),
+                    Err(error) => Err(device.fail(format!("driver hook describe: {error:?}"))),
                 }
             },
         )
@@ -212,13 +244,14 @@ fn engine(config: Config, model: String) -> Engine {
             state(d).invoke(
                 "__command",
                 &serde_json::json!({"prop":prop,"value":value}).to_string(),
-            );
+            )
         })
-        .register_fn("fire", |d: &mut Device, name: &str| {
+        .register_fn("fire", |d: &mut Device, name: &str| -> Result<()> {
             let mut d = state(d);
             if d.timers.remove(name).is_some() {
-                d.invoke("__timer", name);
+                d.invoke("__timer", name)?;
             }
+            Ok(())
         })
         .register_fn("property", |d: &mut Device, name: &str| {
             dynamic(state(d).properties.get(name).cloned())
@@ -305,6 +338,7 @@ pub fn run(directory: &Path) -> io::Result<Vec<Report>> {
     let config = Config {
         directory: directory.canonicalize()?,
         topic_prefix: "rusthinq".into(),
+        limits: Default::default(),
         bindings: Default::default(),
         watch: false,
     };
@@ -353,7 +387,8 @@ pub fn run(directory: &Path) -> io::Result<Vec<Report>> {
             ));
         }
         let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-        let engine = engine(config.clone(), model.into());
+        let failure = Failure::default();
+        let engine = engine(config.clone(), model.into(), failure.clone());
         let ast = engine
             .compile(text)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -378,6 +413,15 @@ pub fn run(directory: &Path) -> io::Result<Vec<Report>> {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e.to_string()),
                 Err(_) => Some("test panicked".into()),
+            };
+            // The failure latch survives Rhai try/catch and device disposal.
+            // Prefer the direct exception (which also has the test call site).
+            let hook_error = failure.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let error = match (hook_error, error) {
+                (Some(hook), Some(error)) if !error.contains(&hook) => {
+                    Some(format!("{hook}; {error}"))
+                }
+                (hook, error) => error.or(hook),
             };
             reports.push(Report {
                 model: model.into(),
