@@ -139,7 +139,11 @@ fn modules(
 }
 /// Top-level `import "name";` without `as`: the driver inherits that module's functions.
 fn bases(source: &str) -> io::Result<Vec<String>> {
-    let ast = Engine::new()
+    // The same expression depth as the executing engine: Rhai's default is lower in
+    // debug builds, which would reject sources the driver engine accepts.
+    let mut engine = Engine::new();
+    engine.set_max_expr_depths(200, 100);
+    let ast = engine
         .compile(source)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     Ok(ast
@@ -347,6 +351,14 @@ mod tests {
         }
         assert!(!model(&"a".repeat(129)));
         assert!(!name("a.b"), "module names stay plain");
+    }
+
+    #[test]
+    fn inheritance_scan_accepts_what_the_driver_engine_accepts() {
+        // Deeper than Rhai's debug-build default expression depth, within the engine's 200.
+        let deep = format!("fn f() {{ {}1{} }}", "(".repeat(30), ")".repeat(30));
+        assert!(bases(&deep).unwrap().is_empty());
+        assert_eq!(bases("import \"base\";\nfn f() {}").unwrap(), ["base"]);
     }
 
     #[test]
