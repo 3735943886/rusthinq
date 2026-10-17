@@ -4,7 +4,6 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{collections::BTreeMap, io, path::Path, time::Duration};
 use tokio::sync::watch;
 const DEBOUNCE: Duration = Duration::from_millis(200);
-const CAPACITY_RETRY: Duration = Duration::from_millis(250);
 
 fn relevant(event: &notify::Event, root: &Path) -> bool {
     !matches!(event.kind, EventKind::Access(_))
@@ -102,7 +101,7 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
     let mut scopes = BTreeMap::new();
     let mut revisions = BTreeMap::new();
     let mut initial = true;
-    let mut retry = None;
+    let mut retry = false;
     loop {
         if *stop.borrow() {
             return Ok(());
@@ -116,12 +115,11 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
                     if result.is_err() { return Ok(()); }
                     let current: BTreeMap<_, _> = app.script_states().into_iter()
                         .map(|(id, (session, generation, _))| (id, (session, generation))).collect();
-                    if current == scopes { continue; }
+                    if current == scopes && !retry { continue; }
                 },
-                _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)), if retry.is_some() => {},
             }
         }
-        retry = None;
+        retry = false;
         let models = app.driver_models();
         revisions.retain(|id, _| models.contains_key(id));
         let mut scanned = BTreeMap::new();
@@ -193,8 +191,8 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
             match result {
                 Ok(_) => {}
                 Err(rusthinq_scripting::Error::Busy) => {
-                    // Capacity pressure defers this edit; it does not discard it.
-                    retry = Some(tokio::time::Instant::now() + CAPACITY_RETRY);
+                    // Retry only after runtime progress releases capacity or sources change.
+                    retry = true;
                     if let Some(previous) = previous {
                         revisions.insert(id.clone(), previous);
                     } else {

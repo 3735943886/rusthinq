@@ -24,6 +24,12 @@ use tokio::{
     time::timeout,
 };
 
+const MAX_SOCKETS: u32 = 64;
+const MAX_CONNECTIONS: usize = 128;
+const MAX_ANALYSES: usize = 2;
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -169,8 +175,8 @@ pub fn router(
         names: Names::default(),
         config,
         stop,
-        sockets: Arc::new(Semaphore::new(64)),
-        analysis: Arc::new(Semaphore::new(2)),
+        sockets: Arc::new(Semaphore::new(MAX_SOCKETS as usize)),
+        analysis: Arc::new(Semaphore::new(MAX_ANALYSES)),
     }))
 }
 fn build(app: App) -> Router {
@@ -1416,7 +1422,7 @@ pub async fn serve(
     let handle = handle.into();
     config.validate()?;
     let (owned_stop, owned_stopped) = crate::task::Shutdown::new(*stop.borrow());
-    let sockets = Arc::new(Semaphore::new(64));
+    let sockets = Arc::new(Semaphore::new(MAX_SOCKETS as usize));
     let names = Names::default();
     let refresher = crate::task::OwnedTask::spawn(refresh_names(
         handle.clone(),
@@ -1441,7 +1447,7 @@ pub async fn serve(
         config,
         stop: owned_stopped.clone(),
         sockets: sockets.clone(),
-        analysis: Arc::new(Semaphore::new(2)),
+        analysis: Arc::new(Semaphore::new(MAX_ANALYSES)),
     });
     let mut tasks = JoinSet::new();
     let mut failure = None;
@@ -1449,7 +1455,7 @@ pub async fn serve(
         tokio::select! {
             _=stop.changed()=>break,
             joined=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Err(error))=joined {failure=Some(io::Error::other(error));break;}},
-            accepted=listener.accept(),if tasks.len()<128=> {
+            accepted=listener.accept(),if tasks.len()<MAX_CONNECTIONS=> {
                 let (stream,_) = match accepted {Ok(pair)=>pair,Err(error)=>{failure=Some(error);break;}};
                 let app = app.clone();
                 let mut stopped = owned_stopped.clone();
@@ -1461,8 +1467,8 @@ pub async fn serve(
                     if *stopped.borrow() {connection.as_mut().graceful_shutdown();}
                     tokio::select! {
                         _=&mut connection=>{},
-                        _=stopped.changed()=>{connection.as_mut().graceful_shutdown();let _=timeout(Duration::from_secs(2),&mut connection).await;},
-                        _=tokio::time::sleep(Duration::from_secs(300))=>{},
+                        _=stopped.changed()=>{connection.as_mut().graceful_shutdown();let _=timeout(SHUTDOWN_TIMEOUT,&mut connection).await;},
+                        _=tokio::time::sleep(CONNECTION_LIFETIME)=>{},
                     }
                 });
             }
@@ -1478,7 +1484,7 @@ pub async fn serve(
         }
     }
     // Upgraded futures release their permits on stop; await ownership, not a detached tail.
-    let _ = sockets.acquire_many(64).await;
+    let _ = sockets.acquire_many(MAX_SOCKETS).await;
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
@@ -1637,8 +1643,8 @@ mod tests {
                 raw_inject: Default::default(),
             },
             stop: stopped.clone(),
-            sockets: Arc::new(Semaphore::new(64)),
-            analysis: Arc::new(Semaphore::new(2)),
+            sockets: Arc::new(Semaphore::new(MAX_SOCKETS as usize)),
+            analysis: Arc::new(Semaphore::new(MAX_ANALYSES)),
             observer: crate::cloud_observer::Observer::new(false),
         });
         let task = tokio::spawn(async move {

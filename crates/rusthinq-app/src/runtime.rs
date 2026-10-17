@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
     time::Instant,
 };
 
@@ -286,7 +286,7 @@ impl ScriptCommand {
         }
     }
 }
-type WriteTask = JoinHandle<(Storage, WriteResult)>;
+type WriteTask = crate::task::StorageTask<(Storage, WriteResult)>;
 #[cfg(feature = "scripting")]
 mod scripting;
 #[cfg(feature = "scripting")]
@@ -779,7 +779,7 @@ impl Runtime {
             })
             .collect::<BTreeMap<_, _>>();
         let mut storage = self.storage.take().expect("idle model storage");
-        self.write = Some(tokio::task::spawn_blocking(move || {
+        self.write = Some(crate::task::StorageTask::spawn(move || {
             let result = storage
                 .save_metadata(&batch)
                 .map_err(|error| error.to_string());
@@ -965,7 +965,7 @@ impl Runtime {
             self.deferred_storage = Some(action);
             return;
         };
-        self.write = Some(tokio::task::spawn_blocking(move || {
+        self.write = Some(crate::task::StorageTask::spawn(move || {
             let result = storage.execute(&action).expect("storage effect");
             (storage, WriteResult::Lifecycle(result))
         }));
@@ -1338,7 +1338,7 @@ impl Runtime {
                 let (generation, ceiling) = self.server.generation_budget();
                 if ceiling.saturating_sub(generation) <= low_water {
                     let mut storage = self.storage.take().expect("idle storage worker");
-                    self.write = Some(tokio::task::spawn_blocking(move || {
+                    self.write = Some(crate::task::StorageTask::spawn(move || {
                         let result = storage
                             .reserve_generations(count)
                             .map_err(|error| error.to_string());
@@ -1402,7 +1402,7 @@ impl Runtime {
                 }
                 result = async {self.write.as_mut().expect("write present").await}, if self.write.is_some() => {
                     self.write = None;
-                    let (storage,result) = result.map_err(io::Error::other)?;
+                    let (storage,result) = result?;
                     *self.shared.durable_devices.lock().unwrap_or_else(|e|e.into_inner())=storage.state().ledger.entries.clone();
                     self.shared.state_changed.send_replace(());
                     *self.shared.persisted_models.lock().unwrap_or_else(|e|e.into_inner())=storage.state().metadata.clone();

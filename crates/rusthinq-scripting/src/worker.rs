@@ -196,7 +196,8 @@ impl Handle {
 }
 pub struct Worker {
     handle: Handle,
-    task: Option<JoinHandle<()>>,
+    task: JoinHandle<()>,
+    finished: std::sync::mpsc::Receiver<()>,
 }
 impl Worker {
     pub fn spawn(compiled: Compiled, config: Config) -> Result<Self, Error> {
@@ -223,16 +224,23 @@ impl Worker {
             status,
         });
         let owner = shared.clone();
-        let task = runtime.spawn_blocking(move || run(Host::new(compiled), receive, owner));
+        let (finished, receiver) = std::sync::mpsc::channel();
+        let task = runtime.spawn_blocking(move || {
+            let _finished = finished;
+            run(Host::new(compiled), receive, owner);
+        });
         Ok(Self {
             handle: Handle(shared),
-            task: Some(task),
+            task,
+            finished: receiver,
         })
     }
     pub fn handle(&self) -> Handle {
         self.handle.clone()
     }
     /// Finish the current invocation, cancel unstarted work, and join the worker.
+    /// Cancellation or dropping the worker waits synchronously for bounded execution
+    /// and its shutdown callback. Worker code must not depend on async runtime progress.
     pub async fn shutdown(self) -> Result<(), Error> {
         self.shutdown_with_output().await.map(|_| ())
     }
@@ -240,9 +248,7 @@ impl Worker {
     /// Its opaque outputs remain owned by the caller and require retirement fencing.
     pub async fn shutdown_with_output(mut self) -> Result<Option<Outcome>, Error> {
         self.handle.request_stop();
-        self.task
-            .take()
-            .expect("owned worker")
+        (&mut self.task)
             .await
             .map_err(|error| Error::Worker(error.to_string()))?;
         Ok(self
@@ -257,6 +263,9 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.handle.request_stop();
+        // Keep the join handle owned even when shutdown_with_output is cancelled.
+        // The sender is released on completion, panic, or cancellation before start.
+        let _ = self.finished.recv();
     }
 }
 struct Message {
@@ -334,6 +343,56 @@ mod tests {
         time::Duration,
     };
     use tokio::{sync::Notify, time::timeout};
+
+    #[tokio::test]
+    async fn cancelling_shutdown_waits_for_invocation_and_callback() {
+        let mut compiled = Compiled::new(
+            "fn input(v){gate();} fn bye(v){finished();}",
+            Limits::default(),
+            true,
+        )
+        .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let signal = entered.clone();
+        let gate = release.clone();
+        compiled.engine.register_fn("gate", move || {
+            signal.notify_one();
+            let (lock, changed) = &*gate;
+            let released = lock.lock().unwrap();
+            drop(changed.wait_while(released, |released| !*released).unwrap());
+        });
+        let done = completed.clone();
+        compiled.engine.register_fn("finished", move || {
+            done.store(true, Ordering::Release);
+        });
+        let worker = Worker::spawn(compiled, Config::default()).unwrap();
+        let handle = worker.handle();
+        handle.set_shutdown_callback(Some("bye".into())).unwrap();
+        let invocation = handle.invoke(1, "input".into(), String::new()).unwrap();
+        timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let mut shutdown = Box::pin(worker.shutdown_with_output());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(shutdown.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Release from an independent thread: dropping the future must wait even on
+        // a current-thread runtime, where no other async task can make progress.
+        let releaser = std::thread::spawn(move || {
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_one();
+        });
+        drop(shutdown);
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(*handle.status().borrow(), Status::Stopped { generation: 1 });
+        invocation.wait().await.unwrap();
+        releaser.join().unwrap();
+    }
 
     #[tokio::test]
     async fn stop_finishes_current_invocation_cancels_queue_and_reload_then_joins() {

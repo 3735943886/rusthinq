@@ -309,6 +309,7 @@ impl Runtime {
             rusthinq_scripting::Error,
         >,
     ) {
+        self.shared.state_changed.send_replace(());
         match result {
             Ok((context, Some(outcome))) => self.retirement_outputs(vec![(context, outcome)]),
             Ok((_, None)) => {}

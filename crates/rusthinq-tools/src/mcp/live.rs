@@ -40,6 +40,11 @@ struct Buffer {
     cursor: u64,
     active: bool,
 }
+fn lock_buffer(buffer: &Mutex<Buffer>) -> io::Result<std::sync::MutexGuard<'_, Buffer>> {
+    buffer
+        .lock()
+        .map_err(|_| io::Error::other("live capture buffer poisoned; clear capture to restart"))
+}
 impl Buffer {
     fn push(&mut self, mut event: Value, sequence: &AtomicU64) {
         let seq = sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -57,7 +62,10 @@ impl Buffer {
         self.bytes += size;
         self.events.push_back((seq, size, event));
         while self.events.len() > MAX_EVENTS || self.bytes > MAX_BYTES {
-            let (seq, size, _) = self.events.pop_front().unwrap();
+            let (seq, size, _) = self
+                .events
+                .pop_front()
+                .expect("over-capacity buffer contains events");
             self.bytes -= size;
             self.evicted = seq;
         }
@@ -97,7 +105,7 @@ impl Captures {
     pub(super) async fn start(&mut self, client: &Client, args: &Value) -> io::Result<Value> {
         let id = device(args)?.to_owned();
         if let Some(capture) = self.entries.get(&id) {
-            let buffer = capture.buffer.lock().unwrap();
+            let buffer = lock_buffer(&capture.buffer)?;
             if buffer.active {
                 return Ok(
                     json!({"device_id":id,"active":true,"cursor":buffer.cursor.to_string()}),
@@ -131,7 +139,7 @@ impl Captures {
             .map(|c| c.buffer.clone())
             .unwrap_or_default();
         {
-            let mut b = buffer.lock().unwrap();
+            let mut b = lock_buffer(&buffer)?;
             b.active = true;
             b.push(
                 json!({"type":"session","device":id,"state":snapshot["state"]["devices"][&id]}),
@@ -155,7 +163,10 @@ impl Captures {
                                     event["decoded"] = crate::decode(&json!({"hex":record["hex"],"direction":if record["k"]=="tx" {"toDevice"} else {"fromDevice"}})).unwrap_or(Value::Null);
                                 }
                             }
-                            owned.lock().unwrap().push(event, &sequence);
+                            let Ok(mut buffer) = lock_buffer(&owned) else {
+                                return;
+                            };
+                            buffer.push(event, &sequence);
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -163,7 +174,9 @@ impl Captures {
                     _ => break "stream failed",
                 }
             };
-            let mut b = owned.lock().unwrap();
+            let Ok(mut b) = lock_buffer(&owned) else {
+                return;
+            };
             b.active = false;
             b.push(json!({"type":"lost","reason":reason}), &sequence);
         });
@@ -190,7 +203,7 @@ impl Captures {
                 task.abort();
                 let _ = task.await;
             }
-            let mut b = capture.buffer.lock().unwrap();
+            let mut b = lock_buffer(&capture.buffer)?;
             if b.active {
                 b.active = false;
                 b.push(json!({"type":"stopped"}), &self.sequence);
@@ -216,11 +229,7 @@ impl Captures {
             .entries
             .get(id)
             .ok_or_else(|| io::Error::other("start live capture first"))?;
-        Ok(capture
-            .buffer
-            .lock()
-            .unwrap()
-            .read(cursor, limit, direction))
+        Ok(lock_buffer(&capture.buffer)?.read(cursor, limit, direction))
     }
 }
 
@@ -228,6 +237,32 @@ impl Captures {
 mod tests {
     use super::*;
     use futures_util::SinkExt;
+    #[tokio::test]
+    async fn poisoned_capture_returns_errors_and_can_be_cleared() {
+        let buffer = Arc::new(Mutex::new(Buffer::default()));
+        let poisoned = buffer.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("interrupted buffer update");
+            })
+            .join()
+            .is_err()
+        );
+        let mut captures = Captures::default();
+        captures
+            .entries
+            .insert("d".into(), Capture { buffer, task: None });
+        let error = captures.read(&json!({"device_id":"d"})).unwrap_err();
+        assert!(error.to_string().contains("buffer poisoned"));
+        assert!(captures.stop(&json!({"device_id":"d"})).await.is_err());
+        captures
+            .stop(&json!({"device_id":"d","clear":true}))
+            .await
+            .unwrap();
+        assert!(!captures.entries.contains_key("d"));
+    }
+
     #[test]
     fn eviction_and_filtering_preserve_cursor_and_loss() {
         let sequence = AtomicU64::new(0);
@@ -280,7 +315,7 @@ mod tests {
         let args = json!({"device_id":"d"});
         captures.start(&client, &args).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while captures.entries["d"].buffer.lock().unwrap().active {
+            while lock_buffer(&captures.entries["d"].buffer).unwrap().active {
                 tokio::task::yield_now().await;
             }
         })

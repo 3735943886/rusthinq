@@ -8,6 +8,11 @@ use tokio::{
     time::timeout,
 };
 
+// Two maximum MQTT credential strings plus client ID and CONNECT framing.
+const MAX_CONNECT_PACKET_BYTES: usize = 2 * (u16::MAX as usize + 1) + 3 * 1024;
+// Preserve the existing 1 MiB payload budget plus topic/framing allowance.
+const MAX_PUBLISH_PACKET_BYTES: usize = 1024 * 1024 + 4096;
+
 pub struct Session<S> {
     stream: S,
     deadline: Duration,
@@ -57,7 +62,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             body.extend_from_slice(&(field.len() as u16).to_be_bytes());
             body.extend_from_slice(field.as_bytes());
         }
-        let packet = mqtt::frame(0x10, &body, 134144).map_err(|_| invalid("CONNECT exceeded"))?;
+        let packet = mqtt::frame(0x10, &body, MAX_CONNECT_PACKET_BYTES)
+            .map_err(|_| invalid("CONNECT exceeded"))?;
         timeout(deadline, async {
             stream.write_all(&packet).await?;
             stream.flush().await?;
@@ -85,7 +91,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     }
     /// QoS1 transient output shares this exclusive connection's PUBACK owner.
     pub async fn publish_transient(&mut self, topic: &str, payload: &[u8]) -> io::Result<()> {
-        let _ = mqtt::publish(topic, payload, 1_052_672)
+        let _ = mqtt::publish(topic, payload, MAX_PUBLISH_PACKET_BYTES)
             .map_err(|_| invalid("invalid transient publication"))?;
         self.exchange(topic, payload, false).await
     }
@@ -131,8 +137,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         body.extend_from_slice(topic.as_bytes());
         body.extend_from_slice(&id.to_be_bytes());
         body.extend_from_slice(payload);
-        let frame = mqtt::frame(if retain { 0x33 } else { 0x32 }, &body, 1_052_672)
-            .map_err(|_| invalid("MQTT packet exceeded"))?;
+        let frame = mqtt::frame(
+            if retain { 0x33 } else { 0x32 },
+            &body,
+            MAX_PUBLISH_PACKET_BYTES,
+        )
+        .map_err(|_| invalid("MQTT packet exceeded"))?;
         timeout(self.deadline, async {
             self.stream.write_all(&frame).await?;
             self.stream.flush().await?;

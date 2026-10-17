@@ -331,8 +331,23 @@ impl Handle {
         generation: u64,
         compiled: rusthinq_scripting::Compiled,
     ) -> Result<u64, rusthinq_scripting::Error> {
-        self.reload_prepared(device, session, generation, compiled, true)
+        // The filesystem watcher waits for admission instead of polling a full queue.
+        let (result, received) = oneshot::channel();
+        self.0
+            .scripts
+            .send(ScriptCommand::Reload(Box::new(ReloadScript {
+                device,
+                session,
+                generation,
+                compiled,
+                initialize: true,
+                result,
+            })))
             .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?;
+        received
+            .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?
     }
     #[cfg(feature = "scripting")]
     async fn reload_prepared(
