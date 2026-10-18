@@ -264,6 +264,7 @@ const assert = require("node:assert/strict");
   await page.waitForFunction(() => document.querySelectorAll("#cloud-inventory .inventory-item").length === 20);
   assert.equal(requests.filter(r => r.path === "/api/cloud/inventory").length, beforeCachedLoad);
   await page.locator('[data-view="cloud"]').click();
+  await page.locator("#view-cloud").waitFor({ state: "visible" });
   const inventorySize = await page.locator("#cloud-inventory").evaluate(el => ({ scroll: el.scrollHeight, visible: el.clientHeight, card: el.closest("article").getBoundingClientRect().height }));
   assert.ok(inventorySize.scroll > inventorySize.visible);
   assert.equal(inventorySize.card, 340);
