@@ -1362,7 +1362,16 @@ async fn cloud_device(
     cloud_result(result)
 }
 async fn cloud_status(State(app): State<App>) -> Json<Value> {
-    Json(app.handle.cloud_status())
+    #[cfg(feature = "bridge")]
+    let inventory = app
+        .handle
+        .account_handle()
+        .and_then(|account| account.inventory_snapshot());
+    #[cfg(not(feature = "bridge"))]
+    let inventory: Option<Value> = None;
+    let mut status = app.handle.cloud_status();
+    status["inventory"] = inventory.unwrap_or(Value::Null);
+    Json(status)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

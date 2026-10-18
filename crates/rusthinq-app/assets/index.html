@@ -180,8 +180,8 @@
                 <button id="cloud-login" class="button primary" disabled>
                   Connect LG account</button
                 ><button id="cloud-refresh" class="button secondary" hidden>
-                  Refresh account</button
-                ><button id="cloud-logout" class="button quiet" hidden>
+                  Retry connection</button
+                ><button id="cloud-logout" class="button secondary" hidden>
                   Sign out
                 </button>
               </div>
@@ -189,7 +189,7 @@
                 Local devices remain available without an LG account.
               </p>
             </article>
-            <article class="surface">
+            <article class="surface inventory-card">
               <div class="surface-heading">
                 <h2>Cloud inventory</h2>
                 <button
@@ -216,13 +216,13 @@
               >
             </div>
             <p class="small muted">
-              Account notifications. Starting the feed also delivers new events to
-              active scripts with an LG event callback. The feed resets after
-              restart. Account events without a device ID are
-              labeled separately.
+              Receive live notifications from your LG account and show them below.
+              New events also run LG event callbacks in active scripts.
+              Receiving continues when you leave this page; stop it here to disconnect.
+              Receiving is off after server restart. Events without a device ID are labeled separately.
             </p>
             <button id="cloud-feed-toggle" class="button secondary" disabled>
-              Start LG feed
+              Start receiving LG notifications
             </button>
             <div id="cloud-feed" class="cloud-feed"></div>
           </article>

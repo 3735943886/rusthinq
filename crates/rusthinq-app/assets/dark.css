@@ -689,8 +689,21 @@ small,
 .account-card > .small {
   margin-top: 22px;
 }
+.inventory-card {
+  display: flex;
+  flex-direction: column;
+  height: 340px;
+  min-width: 0;
+}
+.inventory-card > .surface-heading,
+.inventory-card > p {
+  flex-shrink: 0;
+}
 .inventory-list {
   margin-top: 20px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .inventory-item {
   display: flex;

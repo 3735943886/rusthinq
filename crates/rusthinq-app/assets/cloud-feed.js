@@ -43,7 +43,7 @@ window.CloudFeed = class {
       : "LG feed unavailable";
     this.badge.className = `badge ${value.status === "connected" ? "good" : this.enabled ? "warning" : "neutral"}`;
     if (this.button) {
-      this.button.textContent = this.enabled ? "Stop LG feed" : "Start LG feed";
+      this.button.textContent = this.enabled ? "Stop receiving LG notifications" : "Start receiving LG notifications";
       this.button.disabled = !this.available;
     }
   }
