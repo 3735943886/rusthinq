@@ -57,7 +57,7 @@ generate_config() {
         esac
         [ -n "$mqtt_host" ] || die "MQTT host is empty"
         require_port RUSTHINQ_MQTT_URL "$mqtt_port"
-        [ "$mqtt_port" -gt 0 ] && [ "$mqtt_port" -le 65535 ] || die "MQTT port out of range"
+        { [ "$mqtt_port" -gt 0 ] && [ "$mqtt_port" -le 65535 ]; } || die "MQTT port out of range"
         echo '[external_mqtt]'
         printf 'host = %s\nport = %s\ntls = %s\n' "$(toml_str "$mqtt_host")" "$mqtt_port" "$mqtt_tls"
         printf 'inventory = %s\n' "$(toml_str "${p}retained-v2.json")"
@@ -68,7 +68,7 @@ generate_config() {
     if bool "${RUSTHINQ_MANAGEMENT:-true}"; then
         gui_port="${RUSTHINQ_GUI_PORT:-44401}"
         require_port RUSTHINQ_GUI_PORT "$gui_port"
-        [ "$gui_port" -gt 0 ] && [ "$gui_port" -le 65535 ] || die "management port out of range"
+        { [ "$gui_port" -gt 0 ] && [ "$gui_port" -le 65535 ]; } || die "management port out of range"
         echo '[management]'
         printf 'bind = "0.0.0.0:%s"\n' "$gui_port"
         printf 'gui = %s\n' "$(if bool "${RUSTHINQ_GUI:-true}"; then echo true; else echo false; fi)"
@@ -83,7 +83,7 @@ initialize_ca() {
     key="$DATA_DIR/ca.key"
     cert="$DATA_DIR/ca.cert"
     if [ -e "$key" ] || [ -e "$cert" ]; then
-        [ -f "$key" ] && [ -f "$cert" ] || die "incomplete CA: restore both ca.key and ca.cert from backup"
+        { [ -f "$key" ] && [ -f "$cert" ]; } || die "incomplete CA: restore both ca.key and ca.cert from backup"
         return
     fi
     # Old state requires explicit migration, never a fresh identity.

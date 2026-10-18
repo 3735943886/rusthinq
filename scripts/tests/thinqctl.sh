@@ -132,6 +132,50 @@ root="$test_dir/root"
     [ "$(config_management_port "$TEST_DIR/c.toml")" = 44401 ]
 )
 
+# ── Security boundaries (simulate root without requiring privileges) ───────────
+# Mocks below are called indirectly by sourced functions.
+# shellcheck disable=SC2329,SC2031
+(
+    # shellcheck source=thinqctl.sh
+    source "$THINQCTL_SCRIPT"
+    probe="$TEST_DIR/version-probe"
+    printf '#!/bin/sh\ntouch "$TEST_DIR/executed"\necho "rusthinq 0.2.1"\n' > "$probe"
+    chmod 755 "$probe"
+    ln -s "$probe" "$TEST_DIR/probe-link"
+    id() { echo 0; }
+    # Model secure ancestors, then vary the executable and its parent.
+    stat() {
+        local path="${*: -1}"
+        if [ "$1" = -Lc ] && [ "$2" = '%u %a' ]; then
+            if [ "$path" = "$probe" ]; then
+                echo "${PROBE_UID:-0} ${PROBE_MODE:-755}"
+            elif [ "$path" = "$TEST_DIR" ]; then
+                echo "0 ${PARENT_MODE:-755}"
+            else
+                echo '0 755'
+            fi
+        else
+            echo "${REPO_OWNER:-root}"
+        fi
+    }
+    [ "$(binary_version "$TEST_DIR/probe-link")" = 0.2.1 ]
+    [ -f "$TEST_DIR/executed" ]
+    rm "$TEST_DIR/executed"
+    [ -z "$(PROBE_UID=1001 binary_version "$probe")" ]
+    [ -z "$(PROBE_MODE=775 binary_version "$probe")" ]
+    [ -z "$(PARENT_MODE=777 binary_version "$probe")" ]
+    [ ! -e "$TEST_DIR/executed" ]
+    git() { printf 'git %s\n' "$*" >> "$TEST_DIR/security-events"; }
+    runuser() { printf 'runuser %s\n' "$*" >> "$TEST_DIR/security-events"; }
+    : > "$TEST_DIR/security-events"
+    if REPO_OWNER=attacker scripts_git /repo log 2>/dev/null; then exit 1; fi
+    [ ! -s "$TEST_DIR/security-events" ]
+    REPO_OWNER=root scripts_git /repo log
+    REPO_OWNER="$SVC_USER" scripts_git /repo log
+    grep -Fxq 'git -C /repo log' "$TEST_DIR/security-events"
+    grep -Fxq "runuser -u $SVC_USER -- git -C /repo log" "$TEST_DIR/security-events"
+)
+
 # ── Fresh install with defaults ────────────────────────────────────────────────
 reset_root
 run install --prerelease --yes

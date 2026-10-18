@@ -253,10 +253,29 @@ release_tag() {
     fi
 }
 
-# Version of a rusthinq binary; empty for releases before `--version` existed.
+# Trust the entire resolved path, not just the executable: a writable parent
+# would let another user replace even a root-owned binary.
+root_trusted_path() {
+    local path="$1" uid mode
+    while :; do
+        read -r uid mode < <(stat -Lc '%u %a' -- "$path" 2>/dev/null)
+        [[ "$uid" = 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+        (( (8#$mode & 0022) == 0 )) || return 1
+        [ "$path" != / ] || return 0
+        path="$(dirname -- "$path")"
+    done
+}
+
+# Version of a rusthinq binary; empty if unavailable or unsafe to execute.
+# Secure root-owned custom paths remain usable for adopted installations.
 binary_version() {
-    [ -x "$1" ] || return 0
-    "$1" --version 2>/dev/null | awk '$1 == "rusthinq" { print $2 }' || true
+    local bin
+    bin="$(realpath -e -- "$1" 2>/dev/null)" || return 0
+    [[ -f "$bin" && -x "$bin" ]] || return 0
+    if [ "$(id -u)" -eq 0 ]; then
+        root_trusted_path "$bin" || return 0
+    fi
+    "$bin" --version 2>/dev/null | awk '$1 == "rusthinq" { print $2 }' || true
 }
 
 # Echoes `equal`, `newer` (when $1 is newer than $2) or `older`. A pre-release
@@ -703,7 +722,7 @@ render_config() {
             RUSTHINQ_GUI_PORT="$A_GUI_PORT" \
             RUSTHINQ_GUI_USER="$A_GUI_USER" RUSTHINQ_GUI_PASSWORD="$A_GUI_PASSWORD" \
             RUSTHINQ_SCRIPTING="$A_SCRIPTING" RUSTHINQ_PREFIX="$A_PREFIX" \
-            SCRIPTS_DIR="$A_SCRIPTS_DIR" generate_config
+            SCRIPTS_DIR="$A_SCRIPTS_DIR" generate_config ""
     )
 }
 
@@ -724,7 +743,7 @@ adopt_installation() {
     printf '  Binary:  %s\n  Config:  %s\n  User:    %s\n' "$I_BIN" "${I_CONFIG:-unknown}" "${I_USER:-unknown}"
     [ -z "$I_UNIT" ] || printf '  Unit:    %s\n' "$I_UNIT"
     [ -z "$I_PID" ] || printf '  PID:     %s\n' "$I_PID"
-    [ -n "$I_BIN" ] && [ -x "$I_BIN" ] || die "Cannot use the binary of this installation: ${I_BIN:-unknown}"
+    [[ -n "$I_BIN" && -x "$I_BIN" ]] || die "Cannot use the binary of this installation: ${I_BIN:-unknown}"
     confirm "Manage this installation with thinqctl? Its binary location, configuration and data stay as they are." \
         || { log "Aborted."; return 1; }
 
@@ -918,7 +937,7 @@ fresh_install() {
     S_SCRIPTS=""
     if [ "$keep_config" -eq 0 ]; then
         if [ -n "$A_CA_KEY" ]; then
-            [ ! -e "${DATA_DIR}/ca.key" ] && [ ! -e "${DATA_DIR}/ca.cert" ] \
+            [[ ! -e "${DATA_DIR}/ca.key" && ! -e "${DATA_DIR}/ca.cert" ]] \
                 || die "${DATA_DIR} already holds a CA; refusing to overwrite it."
             install -m 600 -o "$SVC_USER" -g "$SVC_USER" "$A_CA_KEY" "${DATA_DIR}/ca.key"
             install -m 644 -o "$SVC_USER" -g "$SVC_USER" "$A_CA_CERT" "${DATA_DIR}/ca.cert"
@@ -981,7 +1000,7 @@ cmd_status() {
     detect_installation
     printf '%srusthinq%s  %s\n' "$C_BOLD" "$C_RESET" "$(describe_kind "$I_KIND")"
 
-    if [ "$I_KIND" != none ] && [ "$I_KIND" != legacy ]; then
+    if [[ "$I_KIND" != none && "$I_KIND" != legacy ]]; then
         cur="$(binary_version "$I_BIN")"
         [ -n "$cur" ] || cur="$S_VERSION"
         printf '  Binary:    %s  (%s%s%s)\n' "$I_BIN" "$C_BOLD" "${cur:-version unknown}" "$C_RESET"
@@ -996,7 +1015,7 @@ cmd_status() {
         if [ -n "$drivers" ]; then
             if [ -d "${drivers}/.git" ]; then
                 printf '  Drivers:   %s  (%s)\n' "$drivers" \
-                    "$(git -c safe.directory="$drivers" -C "$drivers" log -1 --format='%h %cs' 2>/dev/null || echo git)"
+                    "$(git -C "$drivers" log -1 --format='%h %cs' 2>/dev/null || echo git)"
             else
                 printf '  Drivers:   %s\n' "$drivers"
             fi
@@ -1172,10 +1191,27 @@ cmd_rollback() {
     fi
 }
 
+# Never read service-owned repository configuration as root. Git still checks
+# ownership of the repository and its metadata under the selected identity.
+scripts_git() {
+    local dir="$1" owner
+    shift
+    owner="$(stat -Lc %U -- "$dir")" || return 1
+    case "$owner" in
+        root|"$SVC_USER") ;;
+        *) err "Refusing Git operations in ${dir}: untrusted owner ${owner}."; return 1 ;;
+    esac
+    if [ "$(id -u)" -eq 0 ] && [ "$owner" != root ]; then
+        runuser -u "$owner" -- git -C "$dir" "$@"
+    else
+        git -C "$dir" "$@"
+    fi
+}
+
 cmd_scripts() {
-    local action="${1:-status}" dir owner
+    local action="${1:-status}" dir
     detect_installation
-    [ "$I_KIND" != none ] && [ "$I_KIND" != legacy ] || die "rusthinq is not installed."
+    [[ "$I_KIND" != none && "$I_KIND" != legacy ]] || die "rusthinq is not installed."
     [ -r "$I_CONFIG" ] || die "Cannot read ${I_CONFIG:-the configuration}; try sudo."
     dir="$(config_drivers_dir "$I_CONFIG")"
     [ -n "$dir" ] || die "${I_CONFIG:-The configuration} has no [drivers] directory."
@@ -1183,19 +1219,14 @@ cmd_scripts() {
         status)
             printf 'Drivers: %s\n' "$dir"
             if [ -d "${dir}/.git" ]; then
-                git -c safe.directory="$dir" -C "$dir" log -1 --format='  %h %cs %s' 2>/dev/null || true
+                scripts_git "$dir" log -1 --format='  %h %cs %s' 2>/dev/null || true
             fi
             ;;
         update)
             require_root "scripts update"
             if [ -d "${dir}/.git" ]; then
-                owner="$(stat -c %U "$dir")"
-                if [ "$owner" = root ]; then
-                    git -C "$dir" pull --ff-only --quiet
-                else
-                    runuser -u "$owner" -- git -C "$dir" pull --ff-only --quiet
-                fi
-                git -c safe.directory="$dir" -C "$dir" log -1 --format='  %h %cs %s'
+                scripts_git "$dir" pull --ff-only --quiet
+                scripts_git "$dir" log -1 --format='  %h %cs %s'
             elif [ "$dir" = "$SCRIPTS_DIR" ] && [ "$S_SCRIPTS" = tarball ]; then
                 fetch_scripts tarball "$dir"
             else
@@ -1328,7 +1359,7 @@ main() {
             --yes|-y)     ASSUME_YES=1 ;;
             --prerelease) PRERELEASE=1 ;;
             --version)
-                [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] \
+                [[ "$#" -ge 2 && -n "$2" && "$2" != -* ]] \
                     || die "--version requires a release version (e.g. 0.2.0)."
                 [ -z "$REQUESTED_VERSION" ] || die "--version may only be specified once."
                 REQUESTED_VERSION="$2"
