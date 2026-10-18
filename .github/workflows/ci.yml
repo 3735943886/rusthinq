@@ -29,3 +29,30 @@ jobs:
           node-version: '22'
       - name: Run development checks
         run: bash scripts/check-0.2.sh
+
+  browser:
+    name: Browser checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install Playwright
+        run: |
+          npm install --no-save --prefix "$RUNNER_TEMP/gui-deps" playwright@1.64.1
+          "$RUNNER_TEMP/gui-deps/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Run browser checks
+        run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory crates/rusthinq-app/assets &
+          timeout 10 bash -c 'until curl -sf http://127.0.0.1:8765/ >/dev/null; do sleep 0.2; done'
+          NODE_PATH="$RUNNER_TEMP/gui-deps/node_modules" GUI_TEST_ARTIFACTS="$RUNNER_TEMP/gui-check" \
+            node scripts/check-gui.cjs
+      - name: Upload screenshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-check-screenshots
+          path: ${{ runner.temp }}/gui-check
+          if-no-files-found: ignore
