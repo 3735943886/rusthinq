@@ -13,6 +13,7 @@
     statusTimer,
     polling = false,
     servicesDirty = false;
+  let inventoryRequested = false, inventoryEpoch = 0, inventoryLoading = false;
   const pending = new Set(),
     cards = new Map();
   function formatUptime(seconds) {
@@ -558,15 +559,27 @@
           : "Sign in to pair devices and enable cloud bridges.");
     $("cloud-login").hidden = loggedIn;
     $("cloud-login").disabled = !connected || !account.enabled || !!state.busy;
-    $("cloud-refresh").hidden = !state.stored;
+    $("cloud-refresh").hidden = !state.stored || loggedIn || !state.error;
     $("cloud-refresh").disabled = !connected || !!state.busy;
     $("cloud-logout").hidden = !state.stored;
     $("cloud-logout").disabled = !connected || !!state.busy;
-    $("load-inventory").disabled = !connected || !loggedIn || !!state.busy;
-    if (!loggedIn)
-      $("cloud-inventory").replaceChildren(
-        text("p", "Sign in to view LG account devices.", "muted"),
-      );
+    $("load-inventory").disabled = !connected || !loggedIn || !!state.busy || inventoryLoading;
+    if (!loggedIn) {
+      inventoryEpoch++;
+      inventoryRequested = false;
+      renderInventory(null);
+    } else if (Array.isArray(account.inventory)) {
+      inventoryRequested = true;
+      if (!inventoryLoading) renderInventory(account.inventory);
+    } else if (!inventoryRequested && !inventoryLoading && connected && !state.busy) {
+      inventoryRequested = true;
+      $("cloud-inventory").replaceChildren(text("p", "Loading LG account devices…", "muted"));
+      const epoch = inventoryEpoch;
+      loadInventory().catch((error) => {
+        if (epoch === inventoryEpoch && account.account?.loggedIn)
+          $("cloud-inventory").replaceChildren(text("p", `Could not load devices. ${error.message} Use Refresh to retry.`, "muted"));
+      });
+    }
     renderDevices();
     renderDetail();
   }
@@ -584,6 +597,12 @@
         api("api/health"),
       ]);
       if (results[0].status === "fulfilled" && results[0].value) {
+        // A dropped account cache invalidates any displayed or in-flight inventory.
+        if (Array.isArray(account.inventory) && !Array.isArray(results[0].value.inventory)) {
+          inventoryEpoch++;
+          inventoryRequested = false;
+          $("cloud-inventory").replaceChildren();
+        }
         account = results[0].value;
         renderAccount();
       }
@@ -690,7 +709,7 @@
     busy($("cloud-refresh"), async () => {
       await api("api/cloud/refresh", {});
       await refreshServices();
-      toast("Account refreshed.");
+      toast("LG connection retried.");
     });
   $("cloud-logout").onclick = () =>
     busy($("cloud-logout"), async () => {
@@ -709,30 +728,50 @@
         toast("Signed out of LG.");
       }
     });
-  $("load-inventory").onclick = () =>
-    busy($("load-inventory"), async () => {
-      const inventory = await api("api/cloud/inventory");
-      $("cloud-inventory").replaceChildren(
-        ...(Array.isArray(inventory) ? inventory : []).map((device) => {
-          const row = document.createElement("div");
-          row.className = "inventory-item";
-          const symbol = document.createElement("span");
-          symbol.className = "device-symbol";
-          symbol.innerHTML = icon(applianceIcon(device));
-          const info = document.createElement("div");
-          info.append(
-            text("strong", device.alias || device.modelName || "LG device"),
-            text("small", device.deviceId),
-          );
-          row.append(symbol, info, badge(device.platformType || "LG"));
-          return row;
-        }),
-      );
-      if (!$("cloud-inventory").children.length)
-        $("cloud-inventory").append(
-          text("p", "No devices registered to this account.", "muted"),
+  function renderInventory(inventory) {
+    if (inventory === null) {
+      $("cloud-inventory").replaceChildren(text("p", "Sign in to view LG account devices.", "muted"));
+      return;
+    }
+    $("cloud-inventory").replaceChildren(
+      ...(Array.isArray(inventory) ? inventory : []).map((device) => {
+        const row = document.createElement("div");
+        row.className = "inventory-item";
+        const symbol = document.createElement("span");
+        symbol.className = "device-symbol";
+        symbol.innerHTML = icon(applianceIcon(device));
+        const info = document.createElement("div");
+        info.append(
+          text("strong", device.alias || device.modelName || "LG device"),
+          text("small", device.deviceId),
         );
-    });
+        row.append(symbol, info, badge(device.platformType || "LG"));
+        return row;
+      }),
+    );
+    if (!$("cloud-inventory").children.length)
+      $("cloud-inventory").append(
+        text("p", "No devices registered to this account.", "muted"),
+      );
+  }
+  async function loadInventory() {
+    if (inventoryLoading) return;
+    const epoch = inventoryEpoch;
+    inventoryLoading = true;
+    $("load-inventory").disabled = true;
+    try {
+      const inventory = await api("api/cloud/inventory");
+      if (epoch === inventoryEpoch && account.account?.loggedIn) {
+        account.inventory = inventory;
+        renderInventory(inventory);
+      }
+    } finally {
+      inventoryLoading = false;
+      if (epoch !== inventoryEpoch) renderAccount();
+      $("load-inventory").disabled = !connected || !account.account?.loggedIn || !!account.account?.busy;
+    }
+  }
+  $("load-inventory").onclick = () => busy($("load-inventory"), loadInventory);
   $("login-start-form").onsubmit = (event) => {
     event.preventDefault();
     const popup = window.open("about:blank", "_blank");

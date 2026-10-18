@@ -152,6 +152,8 @@ const assert = require("node:assert/strict");
     injectionToggle: true,
     meta: { modelId: "F24VDD", modelName: "Laundry room" },
   };
+  let cachedInventory = null;
+  let cloudAccount = { loggedIn: true, stored: true, busy: false };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     const body = route.request().postDataJSON();
@@ -161,7 +163,8 @@ const assert = require("node:assert/strict");
     else if (url.pathname === "/api/cloud")
       result = {
         enabled: true,
-        account: { loggedIn: true, stored: true, busy: false },
+        inventory: cachedInventory,
+        account: cloudAccount,
       };
     else if (url.pathname === "/api/cloud/notifications") {
       if (body?.enabled !== undefined)
@@ -252,6 +255,35 @@ const assert = require("node:assert/strict");
   await page.locator(".device-card").first().waitFor();
   assert.equal(await page.locator(".device-card").count(), 6);
   assert.equal(await page.locator("h1").first().textContent(), "Devices.");
+  await page.waitForFunction(() => document.querySelectorAll("#cloud-inventory .inventory-item").length === 1);
+  assert.equal(await page.locator("#cloud-refresh").isVisible(), false);
+  assert.ok(await page.locator("#cloud-logout").evaluate(el => el.classList.contains("secondary")));
+  cachedInventory = Array.from({ length: 20 }, (_, i) => ({ deviceId: `cached-${i}`, alias: `Cached device ${i}` }));
+  const beforeCachedLoad = requests.filter(r => r.path === "/api/cloud/inventory").length;
+  await page.reload();
+  await page.waitForFunction(() => document.querySelectorAll("#cloud-inventory .inventory-item").length === 20);
+  assert.equal(requests.filter(r => r.path === "/api/cloud/inventory").length, beforeCachedLoad);
+  await page.locator('[data-view="cloud"]').click();
+  const inventorySize = await page.locator("#cloud-inventory").evaluate(el => ({ scroll: el.scrollHeight, visible: el.clientHeight, card: el.closest("article").getBoundingClientRect().height }));
+  assert.ok(inventorySize.scroll > inventorySize.visible);
+  assert.equal(inventorySize.card, 340);
+  assert.equal(await page.locator("#cloud-feed-toggle").textContent(), "Start receiving LG notifications");
+  await page.locator("#cloud-feed-toggle").click();
+  await page.waitForFunction(() => document.getElementById("cloud-feed-toggle").textContent === "Stop receiving LG notifications");
+  await page.locator("#cloud-feed-toggle").click();
+  await page.screenshot({ path: path.join(artifacts, "cloud-inventory.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: path.join(artifacts, "cloud-inventory-mobile.png"), fullPage: true });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  cloudAccount = { loggedIn: false, stored: true, busy: false, error: "Authentication failed" };
+  sockets.services.send(JSON.stringify({ type: "servicesChanged" }));
+  await page.locator("#cloud-refresh").waitFor({ state: "visible" });
+  assert.equal((await page.locator("#cloud-refresh").textContent()).trim(), "Retry connection");
+  assert.equal(await page.locator("#cloud-inventory .inventory-item").count(), 0);
+  cloudAccount = { loggedIn: true, stored: true, busy: false };
+  sockets.services.send(JSON.stringify({ type: "servicesChanged" }));
+  await page.waitForFunction(() => document.querySelectorAll("#cloud-inventory .inventory-item").length === 20);
+  await page.locator('[data-view="devices"]').click();
   const beforeNameRefresh = requests.filter(request => request.path === "/api/cloud/inventory").length;
   await page.locator("#refresh-devices").click();
   await page.waitForFunction(() => !document.getElementById("refresh-devices").disabled);
