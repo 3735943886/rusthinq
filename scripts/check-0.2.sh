@@ -16,6 +16,7 @@ node --check crates/rusthinq-app/assets/cloud-feed.js
 node --check crates/rusthinq-app/assets/ui.js
 node --check crates/rusthinq-app/assets/panel.js
 node --check crates/rusthinq-app/assets/monitor.js
+bash scripts/tests/thinqctl.sh
 if [[ -n "${RUSTHINQ_SCRIPTS_CHECKOUT:-}" ]]; then
     cargo run -p rusthinq-tools --bin rusthinq-script-test -- "$RUSTHINQ_SCRIPTS_CHECKOUT"
 fi
