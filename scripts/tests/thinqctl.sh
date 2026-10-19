@@ -2,7 +2,8 @@
 # Run with: bash scripts/tests/thinqctl.sh (no root, network, or systemd needed).
 # shellcheck source-path=SCRIPTDIR/..
 # The generated fake binaries test their own $1.
-# shellcheck disable=SC2016
+# Each test subshell intentionally has independent fake system state.
+# shellcheck disable=SC2016,SC2030,SC2031
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
@@ -23,6 +24,10 @@ make_release() {
     ( cd "$test_dir/assets" && sha256sum "$name.tar.gz" rusthinq-config-0.2.sh > SHA256SUMS )
 }
 make_release v0.2.1
+mkdir -p "$test_dir/mock-bin"
+printf '#!/bin/sh\nprintf "%%s\n" "${FAKE_SS:-}" | sed "/^$/d"\n' > "$test_dir/mock-bin/ss"
+chmod +x "$test_dir/mock-bin/ss"
+export PATH="$test_dir/mock-bin:$PATH"
 
 # Each invocation has fresh globals and a fake system. Only system-facing
 # operations are replaced; detection, questions, version comparison, config
@@ -50,7 +55,7 @@ curl() {
         shift
     done
     case "$url" in
-        "$SELF_URL") : > "$out"; return 0 ;;
+        "$SELF_URL") cp "$THINQCTL_SCRIPT" "$out"; return 0 ;;
         */releases/download/*) event "download ${url##*/}"; [[ "${FAIL_DOWNLOAD:-0}" != 1 ]] || return 22 ;;
     esac
     [ -f "$TEST_DIR/assets/${url##*/}" ] || return 22
@@ -172,6 +177,8 @@ root="$test_dir/root"
     [ ! -s "$TEST_DIR/security-events" ]
     REPO_OWNER=root scripts_git /repo log
     REPO_OWNER="$SVC_USER" scripts_git /repo log
+    I_USER=pi REPO_OWNER=pi scripts_git /repo log
+    grep -Fxq 'runuser -u pi -- git -C /repo log' "$TEST_DIR/security-events"
     grep -Fxq 'git -C /repo log' "$TEST_DIR/security-events"
     grep -Fxq "runuser -u $SVC_USER -- git -C /repo log" "$TEST_DIR/security-events"
 )
@@ -323,6 +330,113 @@ assert_output 'Only rusthinq 0.1 is running'
 fails install --yes
 assert_output 'Cannot read the 0.1 configuration /srv/0.1/config.toml'
 unset FAKE_LPID FAKE_LEXE FAKE_CWD
+
+# ── Listener conflicts and address overrides ──────────────────────────────────
+reset_root
+FAKE_SS='LISTEN 0 128 0.0.0.0:443 0.0.0.0:*' fails install --yes
+assert_output 'IN USE'
+assert_no_event '^systemctl (enable|start|stop|daemon-reload)'
+[ ! -e "$root/var/lib/rusthinq/config.toml" ]
+reset_root
+RUSTHINQ_HTTPS_BIND=127.0.0.1:8443 RUSTHINQ_MQTT_BIND=127.0.0.1:18883 \
+    RUSTHINQ_MANAGEMENT_BIND='[::1]:44402' run install --yes
+assert_file_has "$root/var/lib/rusthinq/config.toml" 'https_bind = "127.0.0.1:8443"'
+assert_file_has "$root/var/lib/rusthinq/config.toml" 'mqtt_bind = "127.0.0.1:18883"'
+assert_file_has "$root/var/lib/rusthinq/config.toml" 'bind = "[::1]:44402"'
+reset_root
+RUSTHINQ_HTTPS_BIND=0.0.0.0:8883 fails install --yes
+assert_output 'duplicates 0.0.0.0:8883'
+reset_root
+RUSTHINQ_HTTPS_BIND=0.0.0.0:65536 fails install --yes
+assert_output 'port must be'
+(
+    # shellcheck source=thinqctl.sh
+    source "$THINQCTL_SCRIPT"
+    export FAKE_SS='LISTEN 0 128 [::]:443 [::]:*'
+    if listener_check check 127.0.0.1:443 >/dev/null; then exit 1; fi
+    export FAKE_SS='LISTEN 0 128 127.0.0.1:443 0.0.0.0:*'
+    listener_check check 127.0.0.2:443 >/dev/null
+    export FAKE_SS='LISTEN 0 128 [::ffff:127.0.0.1]:443 [::]:*'
+    if listener_check check 127.0.0.1:443 >/dev/null; then exit 1; fi
+    if listener_check validate '::1:443' 2>/dev/null; then exit 1; fi
+    CONFIG_FILE="$TEST_DIR/listeners.toml"
+    printf 'https_bind = "127.0.0.1:8443"\n[management]\nbind = "127.0.0.1:44402"\n' > "$CONFIG_FILE"
+    check_existing_listeners >/dev/null
+)
+
+# Simulate editing a conflicting default and retrying without touching the host.
+(
+    # shellcheck source=thinqctl.sh
+    source "$THINQCTL_SCRIPT"
+    ASSUME_YES=0 A_GUI_PORT=44401
+    export FAKE_SS='LISTEN 0 128 0.0.0.0:443 0.0.0.0:*'
+    # shellcheck disable=SC2329
+    have_tty() { return 0; }
+    # shellcheck disable=SC2329
+    ask() {
+        local answer="$3"
+        case "$2" in Resolve:*) answer=edit ;; HTTPS_BIND) answer=0.0.0.0:8443 ;; esac
+        printf -v "$1" '%s' "$answer"
+    }
+    configure_listeners > "$TEST_DIR/output"
+    [ "${LISTENER_VALUES[0]}" = 0.0.0.0:8443 ]
+    assert_output 'IN USE'
+    assert_output '0.0.0.0:8443 — available'
+)
+
+# ── Self checks and updates never touch a service ──────────────────────────────
+reset_root
+run self check
+assert_output 'up to date'
+mkdir -p "$root/usr/local/bin"
+printf '#!/usr/bin/env bash\n# old copy\n' > "$root/usr/local/bin/thinqctl"
+run self check
+assert_output 'differs from master'
+run self update --yes
+assert_output 'thinqctl updated'
+cmp "$THINQCTL_SCRIPT" "$root/usr/local/bin/thinqctl"
+assert_no_event '^systemctl'
+(
+    # shellcheck source=thinqctl.sh
+    source "$THINQCTL_SCRIPT"
+    curl() { printf '<html>bad download</html>' > "${*: -1}"; }
+    if self_download "$TEST_DIR/bad-self"; then exit 1; fi
+)
+
+# ── Driver checks query upstream without fetching; update preserves dirty files ─
+(
+    # shellcheck source=thinqctl.sh
+    source "$THINQCTL_SCRIPT"
+    repo="$TEST_DIR/driver-upstream"
+    checkout="$TEST_DIR/driver-checkout"
+    git init -q --initial-branch=master "$repo"
+    printf 'first\n' > "$repo/driver.rhai"
+    git -C "$repo" add .
+    git -C "$repo" -c user.name=Test -c user.email=test@example.invalid commit -qm first
+    git clone -q "$repo" "$checkout"
+    CONFIG_FILE="$TEST_DIR/drivers.toml"
+    printf '[drivers]\ndirectory = "%s"\n' "$checkout" > "$CONFIG_FILE"
+    # These are deliberately invoked indirectly by cmd_scripts.
+    # shellcheck disable=SC2329
+    detect_installation() { I_KIND=systemd I_CONFIG="$CONFIG_FILE" I_USER="$(id -un)"; }
+    cmd_scripts check > "$TEST_DIR/output"
+    assert_output 'HEAD matches'
+    printf 'second\n' >> "$repo/driver.rhai"
+    git -C "$repo" -c user.name=Test -c user.email=test@example.invalid commit -qam second
+    before="$(git -C "$checkout" rev-parse origin/master)"
+    cmd_scripts check > "$TEST_DIR/output"
+    assert_output 'HEAD differs'
+    [ "$(git -C "$checkout" rev-parse origin/master)" = "$before" ]
+    # Test harness may run unprivileged; the update logic itself is unchanged.
+    # shellcheck disable=SC2329
+    require_root() { :; }
+    cmd_scripts update > "$TEST_DIR/output"
+    [ "$(git -C "$checkout" rev-parse HEAD)" = "$(git -C "$repo" rev-parse HEAD)" ]
+    printf 'local edit\n' >> "$checkout/driver.rhai"
+    if (cmd_scripts update) > "$TEST_DIR/output" 2>&1; then exit 1; fi
+    assert_output 'local changes'
+    grep -q 'local edit' "$checkout/driver.rhai"
+)
 
 # ── Arguments ──────────────────────────────────────────────────────────────────
 fails --version 0.2.1 status

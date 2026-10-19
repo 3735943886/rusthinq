@@ -54,8 +54,6 @@ RELEASE_BINARIES="rusthinq rusthinqctl rusthinq-setup rusthinq-migrate rusthinq-
 rusthinq-capture rusthinq-retained-gc rusthinq-script-test packet-parser packet-sender
 lgcloud-monitor"
 LINKED_BINARIES="rusthinq rusthinqctl"
-# Appliance-facing listeners written by config-0.2.sh.
-DEVICE_PORTS="443 8883 46030 47878"
 
 ASSUME_YES=0
 PRERELEASE=0
@@ -652,12 +650,47 @@ EOF
     log "  Wrote ${UNIT_PATH}."
 }
 
-install_self() {
-    log "  Fetching thinqctl to ${SELF_PATH}..."
-    curl -fsSL "$SELF_URL" -o "${SELF_PATH}.tmp" || { warn "Could not fetch thinqctl itself."; return 0; }
-    chmod 755 "${SELF_PATH}.tmp"
-    mv -f "${SELF_PATH}.tmp" "$SELF_PATH"
+# Download into a private temporary file; never execute downloaded code to check it.
+self_download() {
+    curl --connect-timeout 10 --max-time 60 -fsSL "$SELF_URL" -o "$1" || return 1
+    [ -s "$1" ] && head -n1 "$1" | grep -qx '#!/usr/bin/env bash' || return 1
+    bash -n "$1"
 }
+
+install_self() (
+    local tmp
+    tmp="$(mktemp "${LINK_DIR}/.thinqctl.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    log "  Fetching thinqctl to ${SELF_PATH}..."
+    self_download "$tmp" || { warn "Could not fetch a valid thinqctl; existing copy retained."; return 0; }
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$SELF_PATH"
+)
+
+cmd_self() (
+    local self_action="${1:-check}" tmp current
+    case "$self_action" in check) ;; update) require_root "self update" ;; *) die "Unknown self action: $self_action (check, update)" ;; esac
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+    self_download "$tmp/thinqctl" || die "Could not download a valid thinqctl; existing copy retained."
+    current="${BASH_SOURCE[0]}"
+    [ -f "$SELF_PATH" ] && current="$SELF_PATH"
+    if [ -f "$current" ] && cmp -s "$current" "$tmp/thinqctl"; then
+        ok "thinqctl is up to date with master."
+        return
+    fi
+    if [ "$self_action" = check ]; then
+        log "thinqctl differs from master. Update with: sudo thinqctl self update"
+    else
+        confirm "Replace ${SELF_PATH} with thinqctl from master?" || return 0
+        local staged
+        staged="$(mktemp "${LINK_DIR}/.thinqctl.XXXXXX")"
+        trap 'rm -rf -- "$tmp"; rm -f -- "$staged"' EXIT
+        install -m 755 "$tmp/thinqctl" "$staged"
+        mv -f "$staged" "$SELF_PATH"
+        ok "thinqctl updated. Services and configuration were left untouched."
+    fi
+)
 
 # Waits for a started unit to come up and stay up.
 wait_running() {
@@ -684,9 +717,105 @@ stop_pid() {
     die "PID $pid did not exit on SIGTERM."
 }
 
-port_in_use() {
-    command -v ss >/dev/null 2>&1 || return 1
-    [ -n "$(ss -Hltn "sport = :$1" 2>/dev/null)" ]
+# Validate and compare numeric socket addresses without binding or sending traffic.
+# IPv6 wildcard is conservatively treated as dual stack.
+listener_check() {
+    command -v python3 >/dev/null || die "python3 is required to check listener addresses."
+    command -v ss >/dev/null || die "ss (iproute2) is required to check occupied ports."
+    python3 - "$@" <<'PYLISTEN'
+import ipaddress, re, subprocess, sys
+
+def parse(value):
+    host, port = value.rsplit(":", 1)
+    host = host.strip("[]")
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError("port must be 1–65535")
+    if "%" in host and not re.fullmatch(r"[A-Za-z0-9_.-]+", host.split("%", 1)[1]):
+        raise ValueError("invalid IPv6 scope")
+    ip = ipaddress.ip_address(host)
+    if ip.version == 6 and not value.startswith("["):
+        raise ValueError("IPv6 addresses require brackets")
+    if ip.version == 6 and ip.ipv4_mapped is not None: ip = ip.ipv4_mapped
+    return ip, int(port)
+
+def overlap(a, b):
+    if a[1] != b[1]: return False
+    x, y = a[0], b[0]
+    if x.version != y.version:
+        return (x.version == 6 and x.is_unspecified) or (y.version == 6 and y.is_unspecified)
+    return x == y or x.is_unspecified or y.is_unspecified
+
+try:
+    mode, *values = sys.argv[1:]
+    chosen = [parse(v) for v in values]
+    if mode == "validate": sys.exit(0)
+    output = subprocess.run(["ss", "-H", "-ltnp"], check=True, capture_output=True, text=True).stdout
+    occupied = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5: raise ValueError("unexpected ss output")
+        addr = fields[3]
+        if addr.startswith("*:"): addr = "[::]:" + addr[2:]
+        occupied.append((parse(addr), line))
+    conflict = False
+    for i, address in enumerate(chosen):
+        reasons = [line for other, line in occupied if overlap(address, other)]
+        reasons += ["duplicates " + values[j] for j in range(i) if overlap(address, chosen[j])]
+        print("  " + values[i] + (" — IN USE" if reasons else " — available"))
+        for reason in reasons: print("    " + reason)
+        conflict |= bool(reasons)
+    sys.exit(1 if conflict else 0)
+except (ValueError, OSError, subprocess.CalledProcessError) as e:
+    print("Cannot check listeners: " + str(e), file=sys.stderr)
+    sys.exit(2)
+PYLISTEN
+}
+
+configure_listeners() {
+    local edit=0 result key
+    log "Changed device ports require matching appliance routing/port forwarding."
+    local keys=(HTTPS_BIND MQTT_BIND THINQ1_HTTPS_BIND THINQ1_BIND MANAGEMENT_BIND)
+    local defaults=(0.0.0.0:443 0.0.0.0:8883 0.0.0.0:46030 0.0.0.0:47878 "0.0.0.0:${A_GUI_PORT}")
+    LISTENER_VALUES=()
+    for key in "${!keys[@]}"; do
+        local env_key="RUSTHINQ_${keys[$key]}"
+        LISTENER_VALUES+=("${!env_key:-${defaults[$key]}}")
+    done
+    while :; do
+        log "Listeners: HTTPS, device MQTT, ThinQ1 HTTPS, ThinQ1, dashboard"
+        result=0
+        listener_check check "${LISTENER_VALUES[@]}" || result=$?
+        if [ "$result" -eq 0 ]; then
+            if [ "$edit" -eq 1 ] || ! ask_yn "Customize listener addresses?" n; then return; fi
+        else
+            if [ "$ASSUME_YES" -ne 0 ] || ! have_tty; then
+                die "Listener checks failed. Set RUSTHINQ_{HTTPS,MQTT,THINQ1_HTTPS,THINQ1,MANAGEMENT}_BIND and retry."
+            fi
+            log "Changing device ports requires matching appliance routing/port forwarding."
+            local action
+            ask action "Resolve: 'edit', 'retry', or 'cancel'" "edit"
+            case "$action" in retry) continue ;; cancel) die "Installation cancelled." ;; edit) ;; *) continue ;; esac
+        fi
+        log "Use numeric IP:port (IPv6: [address]:port). Device MQTT is separate from the external broker."
+        for key in "${!keys[@]}"; do
+            local value
+            ask value "${keys[$key]}" "${LISTENER_VALUES[$key]}"
+            LISTENER_VALUES[key]="$value"
+        done
+        edit=1
+    done
+}
+
+check_existing_listeners() {
+    local values=()
+    mapfile -t values < <(awk '
+        /^[[:space:]]*\[/ { section=$0; gsub(/[[:space:]]/, "", section) }
+        (section == "" && /^[[:space:]]*(https_bind|mqtt_bind|thinq1_https_bind|thinq1_bind)[[:space:]]*=/) ||
+        (section == "[management]" && /^[[:space:]]*bind[[:space:]]*=/) {
+            sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*(#.*)?$/, ""); print
+        }' "$CONFIG_FILE")
+    [ "${#values[@]}" -gt 0 ] || die "Cannot find listener addresses in $CONFIG_FILE; check configuration manually."
+    listener_check check "${values[@]}" || die "Existing configuration has invalid or occupied listeners; resolve before installing."
 }
 
 # fetch_scripts git|tarball DIR
@@ -722,7 +851,18 @@ render_config() {
             RUSTHINQ_GUI_PORT="$A_GUI_PORT" \
             RUSTHINQ_GUI_USER="$A_GUI_USER" RUSTHINQ_GUI_PASSWORD="$A_GUI_PASSWORD" \
             RUSTHINQ_SCRIPTING="$A_SCRIPTING" RUSTHINQ_PREFIX="$A_PREFIX" \
-            SCRIPTS_DIR="$A_SCRIPTS_DIR" generate_config ""
+            SCRIPTS_DIR="$A_SCRIPTS_DIR" generate_config "" | awk \
+            -v https="${LISTENER_VALUES[0]}" -v mqtt="${LISTENER_VALUES[1]}" \
+            -v t1https="${LISTENER_VALUES[2]}" -v t1="${LISTENER_VALUES[3]}" \
+            -v management="${LISTENER_VALUES[4]}" '
+                /^https_bind =/ { $0="https_bind = \"" https "\"" }
+                /^mqtt_bind =/ { $0="mqtt_bind = \"" mqtt "\"" }
+                /^thinq1_https_bind =/ { $0="thinq1_https_bind = \"" t1https "\"" }
+                /^thinq1_bind =/ { $0="thinq1_bind = \"" t1 "\"" }
+                /^bind =/ { $0="bind = \"" management "\"" }
+                { print }
+            '
+
     )
 }
 
@@ -832,7 +972,7 @@ migrate_legacy() {
 }
 
 fresh_install() {
-    local arch tag tmpdir port keep_config=0 answer
+    local arch tag tmpdir keep_config=0 answer
     arch="$(detect_arch)"
     tag="$(release_tag)"
     tmpdir="$(mktemp -d)"
@@ -898,15 +1038,12 @@ fresh_install() {
         if [ "$A_SCRIPTING" = true ]; then
             ask A_PREFIX "MQTT topic prefix for driver output" "$A_PREFIX"
         fi
+        configure_listeners
         # Fail on a bad answer before anything is installed.
         render_config > /dev/null
     fi
 
-    for port in $DEVICE_PORTS ${A_GUI_PORT:-$(config_management_port "$CONFIG_FILE")}; do
-        if port_in_use "$port"; then
-            warn "Port ${port} is already in use; rusthinq will not start until it is free."
-        fi
-    done
+    [ "$keep_config" -eq 0 ] || check_existing_listeners
 
     log ""
     printf '%sInstall plan%s\n' "$C_BOLD" "$C_RESET"
@@ -1199,6 +1336,7 @@ scripts_git() {
     owner="$(stat -Lc %U -- "$dir")" || return 1
     case "$owner" in
         root|"$SVC_USER") ;;
+        "${I_USER:-}") [ -n "${I_USER:-}" ] || return 1 ;;
         *) err "Refusing Git operations in ${dir}: untrusted owner ${owner}."; return 1 ;;
     esac
     if [ "$(id -u)" -eq 0 ] && [ "$owner" != root ]; then
@@ -1209,7 +1347,7 @@ scripts_git() {
 }
 
 cmd_scripts() {
-    local action="${1:-status}" dir
+    local action="${1:-status}" dir changes
     detect_installation
     [[ "$I_KIND" != none && "$I_KIND" != legacy ]] || die "rusthinq is not installed."
     [ -r "$I_CONFIG" ] || die "Cannot read ${I_CONFIG:-the configuration}; try sudo."
@@ -1222,9 +1360,29 @@ cmd_scripts() {
                 scripts_git "$dir" log -1 --format='  %h %cs %s' 2>/dev/null || true
             fi
             ;;
+        check)
+            [ -d "${dir}/.git" ] || die "Driver freshness checks require a Git checkout; tarball freshness is unknown."
+            local upstream remote ref local_head remote_head
+            upstream="$(scripts_git "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" \
+                || die "Driver checkout has no upstream branch."
+            remote="${upstream%%/*}" ref="${upstream#*/}"
+            local_head="$(scripts_git "$dir" rev-parse HEAD)"
+            remote_head="$(scripts_git "$dir" ls-remote --exit-code "$remote" "refs/heads/$ref")" \
+                || die "Could not query driver upstream; freshness is unknown."
+            remote_head="${remote_head%%[[:space:]]*}"
+            if [ "$local_head" = "$remote_head" ]; then
+                ok "Driver HEAD matches $upstream."
+            else
+                log "Driver HEAD differs from $upstream; update with: sudo thinqctl scripts update"
+            fi
+            changes="$(scripts_git "$dir" --no-optional-locks status --porcelain)" || die "Cannot inspect driver checkout changes."
+            [ -z "$changes" ] || warn "Driver checkout has local changes."
+            ;;
         update)
             require_root "scripts update"
             if [ -d "${dir}/.git" ]; then
+                changes="$(scripts_git "$dir" --no-optional-locks status --porcelain)" || die "Cannot inspect driver checkout changes."
+                [ -z "$changes" ] || die "Driver checkout has local changes; resolve them before updating."
                 scripts_git "$dir" pull --ff-only --quiet
                 scripts_git "$dir" log -1 --format='  %h %cs %s'
             elif [ "$dir" = "$SCRIPTS_DIR" ] && [ "$S_SCRIPTS" = tarball ]; then
@@ -1234,7 +1392,7 @@ cmd_scripts() {
             fi
             ok "Drivers updated; rusthinq reloads changed drivers when watch is on."
             ;;
-        *) die "Unknown scripts action: $action (status, update)" ;;
+        *) die "Unknown scripts action: $action (status, check, update)" ;;
     esac
 }
 
@@ -1326,7 +1484,10 @@ ${C_BOLD}USAGE${C_RESET}
                                   0.1, or install afresh with a few questions
   sudo thinqctl upgrade [opts]    Replace the binaries with the selected release
   sudo thinqctl rollback          Restore the binaries the last upgrade replaced
-  thinqctl scripts [update]       Show or update (sudo) the driver checkout
+  thinqctl scripts [status|check] Show drivers or compare HEAD with the remote upstream
+  sudo thinqctl scripts update    Fast-forward the driver checkout (preserves local changes)
+  thinqctl self check             Compare thinqctl with master
+  sudo thinqctl self update       Update thinqctl itself without restarting services
   sudo thinqctl remove  [opts]    Remove binaries and unit, keep data; an adopted
                                   installation is only forgotten
   sudo thinqctl purge   [opts]    Also delete data, CA and user (thinqctl installs only)
@@ -1337,6 +1498,15 @@ ${C_BOLD}OPTIONS${C_RESET}
                      the defaults). Never switches a running 0.1 over to 0.2.
   --version VERSION  An exact release, e.g. 0.2.0 or v0.2.0 (install, upgrade).
   --prerelease       Include pre-releases (status, install, upgrade).
+
+${C_BOLD}LISTENERS${C_RESET} (fresh installs; numeric IP:port, IPv6 in brackets)
+  RUSTHINQ_HTTPS_BIND          0.0.0.0:443
+  RUSTHINQ_MQTT_BIND           0.0.0.0:8883 (device listener, not external broker)
+  RUSTHINQ_THINQ1_HTTPS_BIND   0.0.0.0:46030
+  RUSTHINQ_THINQ1_BIND         0.0.0.0:47878
+  RUSTHINQ_MANAGEMENT_BIND    0.0.0.0:44401 (RUSTHINQ_GUI_PORT sets default port)
+  Checks require python3 and ss (iproute2). --yes stops on unresolved conflicts.
+  Changed device ports require matching appliance routing/port forwarding.
 
 ${C_BOLD}FILES${C_RESET} (fresh installs)
   Binaries: ${BIN_DIR}/  (rusthinq and rusthinqctl linked into ${LINK_DIR})
@@ -1375,7 +1545,7 @@ main() {
             *)
                 if [ -z "$subcmd" ]; then
                     subcmd="$1"
-                elif [ "$subcmd" = scripts ] && [ -z "$subarg" ]; then
+                elif [[ "$subcmd" = scripts || "$subcmd" = self ]] && [ -z "$subarg" ]; then
                     subarg="$1"
                 else
                     die "Unexpected argument: $1"
@@ -1402,6 +1572,7 @@ main() {
         upgrade)  cmd_upgrade ;;
         rollback) cmd_rollback ;;
         scripts)  cmd_scripts "$subarg" ;;
+        self)     cmd_self "$subarg" ;;
         remove)   cmd_remove ;;
         purge)    cmd_purge ;;
         help)     cmd_help ;;

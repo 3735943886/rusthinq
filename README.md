@@ -64,7 +64,10 @@ A container installation is left to its image.
 thinqctl                           # installation, service and version state
 sudo thinqctl upgrade --prerelease # download and verify, then replace and restart
 sudo thinqctl rollback             # restore the binaries the last upgrade replaced
-sudo thinqctl scripts update       # pull the driver checkout
+thinqctl scripts check             # compare driver HEAD with the upstream branch
+sudo thinqctl scripts update       # update drivers (requires a clean checkout)
+thinqctl self check                # compare thinqctl itself with master
+sudo thinqctl self update          # update thinqctl without restarting rusthinq
 sudo thinqctl remove               # keep data and CA; an adopted install is only forgotten
 sudo thinqctl purge                # also delete data, CA and user (thinqctl installs only)
 ```
@@ -72,6 +75,34 @@ sudo thinqctl purge                # also delete data, CA and user (thinqctl ins
 `--yes` takes every default, and `RUSTHINQ_*` variables set those defaults. For example,
 `sudo RUSTHINQ_HOSTNAME=thinq.lan thinqctl install --yes`. Until 0.2.0 is released,
 only pre-releases exist, so pass `--prerelease`. `thinqctl help` lists every option.
+
+Fresh installs show all five listener addresses and check for occupied ports and
+conflicting selections before changing the system. You can customize all addresses,
+or resolve a conflict by editing an address, retrying the check, or cancelling.
+Checks require `python3` and `ss` (`iproute2`); an unavailable check is an error.
+`--yes` stops on unresolved conflicts instead of choosing another port.
+
+| Listener | Environment variable | Default |
+| --- | --- | --- |
+| Device HTTPS | `RUSTHINQ_HTTPS_BIND` | `0.0.0.0:443` |
+| Device MQTT | `RUSTHINQ_MQTT_BIND` | `0.0.0.0:8883` |
+| ThinQ1 HTTPS | `RUSTHINQ_THINQ1_HTTPS_BIND` | `0.0.0.0:46030` |
+| ThinQ1 | `RUSTHINQ_THINQ1_BIND` | `0.0.0.0:47878` |
+| Management/dashboard | `RUSTHINQ_MANAGEMENT_BIND` | `0.0.0.0:44401` |
+
+Use numeric IP addresses, with brackets around IPv6 addresses (`[::1]:44401`).
+`RUSTHINQ_GUI_PORT` still sets the default dashboard port. Changing a device port
+requires matching appliance routing or port forwarding. Device MQTT is an inbound
+listener, separate from the optional external MQTT broker connection.
+Existing installations keep their configuration when adopted or upgraded.
+
+Driver `scripts check` queries the remote upstream without fetching or changing the
+checkout. `scripts update` uses a fast-forward pull and refuses local changes;
+with driver watching enabled, rusthinq reloads the changes. Tarball installs support
+updates but cannot report whether their current copy matches upstream.
+`self check` compares script contents with master; `self update` downloads and
+syntax-checks the replacement before installing it. These commands update only
+thinqctl; use `upgrade` for the rusthinq binaries.
 
 ## Build and run
 

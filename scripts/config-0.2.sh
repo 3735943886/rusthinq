@@ -20,10 +20,10 @@ generate_config() {
     printf 'ca_key = %s\n' "$(toml_str "${p}ca.key")"
     printf 'ca_certificate = %s\n' "$(toml_str "${p}ca.cert")"
     printf 'device_ledger = %s\n' "$(toml_str "${p}devices-v2.json")"
-    echo 'https_bind = "0.0.0.0:443"'
-    echo 'mqtt_bind = "0.0.0.0:8883"'
-    echo 'thinq1_https_bind = "0.0.0.0:46030"'
-    echo 'thinq1_bind = "0.0.0.0:47878"'
+    printf 'https_bind = %s\n' "$(toml_str "${RUSTHINQ_HTTPS_BIND:-0.0.0.0:443}")"
+    printf 'mqtt_bind = %s\n' "$(toml_str "${RUSTHINQ_MQTT_BIND:-0.0.0.0:8883}")"
+    printf 'thinq1_https_bind = %s\n' "$(toml_str "${RUSTHINQ_THINQ1_HTTPS_BIND:-0.0.0.0:46030}")"
+    printf 'thinq1_bind = %s\n' "$(toml_str "${RUSTHINQ_THINQ1_BIND:-0.0.0.0:47878}")"
     printf 'legacy_tls = %s\n' "$(if bool "${RUSTHINQ_LEGACY_TLS:-true}"; then echo true; else echo false; fi)"
     printf 'advertise_requested_host = %s\n' "$(if bool "${RUSTHINQ_ADVERTISE_REQUESTED_HOST:-true}"; then echo true; else echo false; fi)"
     if bool "${RUSTHINQ_BRIDGE:-true}"; then
@@ -70,7 +70,7 @@ generate_config() {
         require_port RUSTHINQ_GUI_PORT "$gui_port"
         { [ "$gui_port" -gt 0 ] && [ "$gui_port" -le 65535 ]; } || die "management port out of range"
         echo '[management]'
-        printf 'bind = "0.0.0.0:%s"\n' "$gui_port"
+        printf 'bind = %s\n' "$(toml_str "${RUSTHINQ_MANAGEMENT_BIND:-0.0.0.0:$gui_port}")"
         printf 'gui = %s\n' "$(if bool "${RUSTHINQ_GUI:-true}"; then echo true; else echo false; fi)"
         printf 'raw_inject_toggle = %s\n' "$(if bool "${RUSTHINQ_RAW_INJECT_TOGGLE:-false}"; then echo true; else echo false; fi)"
         if [ -n "${RUSTHINQ_GUI_USER:-}" ]; then
