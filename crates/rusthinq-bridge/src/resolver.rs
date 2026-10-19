@@ -663,12 +663,19 @@ mod tests {
         headers: &str,
         body: Vec<u8>,
     ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let headers = headers.to_owned();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
+            // Respond only after receiving the request; an early response races
+            // the client's HTTP connection setup.
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() <= 8192);
+            }
             socket.write_all(headers.as_bytes()).await.unwrap();
             socket.write_all(&body).await.unwrap();
             // Keep the stream open: an oversized body must fail before EOF.
