@@ -49,6 +49,44 @@ see [operations](docs/0.2-operations.md) for its limits and delivery semantics.
 | `rusthinq-app` | Composed daemon, durable ownership, management, GUI and external MQTT |
 | `rusthinq-tools` | CLI, MCP, capture/replay, setup and migration utilities |
 
+## Install as a service
+
+[`scripts/thinqctl.sh`](scripts/thinqctl.sh) installs a release as a systemd service
+on Linux (x86_64, aarch64, armv7) and copies itself to `/usr/local/bin/thinqctl`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/3735943886/rusthinq/master/scripts/thinqctl.sh \
+  | sudo bash -s -- install --prerelease
+```
+
+`install` first looks for a running rusthinq:
+
+- **A running 0.2** is adopted where it is. Its binary directory, configuration and
+  data stay put; later upgrades only replace its binaries. A copy started outside
+  systemd can get a unit, or keep being restarted by hand.
+- **A running 0.1** (`rusthinq-cloud`) is staged into `/var/lib/rusthinq` with
+  `rusthinq-migrate`. 0.1 keeps running until you confirm the switch.
+- **Nothing running** starts a fresh install. It asks for the hostname, an existing CA
+  (or creates one), the LG bridge, MQTT, dashboard login and drivers
+  ([rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts)). The
+  configuration comes from the generator rusthinq-docker uses
+  ([`config-0.2.sh`](scripts/config-0.2.sh)).
+
+A container installation is left to its image.
+
+```sh
+thinqctl                      # installation, service and version state
+sudo thinqctl upgrade         # download and verify, then replace and restart
+sudo thinqctl rollback        # restore the binaries the last upgrade replaced
+sudo thinqctl scripts update  # pull the driver checkout
+sudo thinqctl remove          # keep data and CA; an adopted install is only forgotten
+sudo thinqctl purge           # also delete data, CA and user (thinqctl installs only)
+```
+
+`--yes` takes every default, and `RUSTHINQ_*` variables set those defaults. For example,
+`sudo RUSTHINQ_HOSTNAME=thinq.lan thinqctl install --yes`. Until 0.2.0 is released,
+only pre-releases exist, so pass `--prerelease`. `thinqctl help` lists every option.
+
 ## Build and run
 
 ```sh
@@ -158,8 +196,8 @@ rusthinq-migrate OLD_CONFIG NEW_DIRECTORY
 
 The migrator stages configuration and saved device/retained state without
 modifying the 0.1 source. Follow the migration guide for validation and rollback.
-Model porting and deployment packaging are deferred until the host is complete;
-they are separate from the runtime architecture work.
+Model porting is deferred until the host is complete; it is separate from the
+runtime architecture work.
 
 The [documentation index](docs/README.md) separates operating guides, architecture
 contracts and dated implementation evidence.

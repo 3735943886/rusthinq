@@ -173,6 +173,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: actions/checkout@v7
+        with:
+          path: source
+
+      # thinqctl and rusthinq-docker generate configurations with the release's own copy.
+      - name: Add configuration generator
+        run: cp source/scripts/config-0.2.sh dist/rusthinq-config-0.2.sh
+
       - name: Generate checksums
         working-directory: dist
         run: sha256sum rusthinq-* > SHA256SUMS

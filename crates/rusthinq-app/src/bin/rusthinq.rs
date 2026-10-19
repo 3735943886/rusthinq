@@ -7,6 +7,13 @@ use std::{io, path::PathBuf};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version")
+    {
+        println!("rusthinq {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     logging::init()?;
     let mut args = std::env::args_os().skip(1);
     let path = args.next().map(PathBuf::from).ok_or_else(|| {
