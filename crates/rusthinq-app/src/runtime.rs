@@ -1148,7 +1148,14 @@ impl Runtime {
             match action {
                 Action::Removed { id, .. } => {
                     #[cfg(feature = "bridge")]
-                    self.removal_registrations.remove(&id);
+                    {
+                        self.removal_registrations.remove(&id);
+                        self.shared
+                            .cloud_deploy
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
+                    }
                     self.shared
                         .metadata
                         .lock()
@@ -1624,6 +1631,54 @@ fn command_payload(
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[cfg(feature = "bridge")]
+    #[tokio::test]
+    async fn forgetting_device_releases_only_its_cloud_deploy_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+        let mut server = rusthinq_server::Server::new(Default::default()).unwrap();
+        let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 128).unwrap();
+        let shared = runtime.shared.clone();
+        let handle = runtime.handle();
+        let mut events = handle.subscribe();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(runtime.run(stopped));
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        server.admit(stream).unwrap();
+        let payload =
+            serde_json::json!({"Header":{"x-lgedm-deviceId":"d"},"Body":{"Cmd":"Mon"}}).to_string();
+        peer.write_all(&rusthinq_protocol::thinq1::encode(payload.as_bytes(), 8192).unwrap())
+            .await
+            .unwrap();
+        let size = peer.read_u32().await.unwrap();
+        peer.read_exact(&mut vec![0; size as usize]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(
+                events.recv().await.unwrap(),
+                Event::Lifecycle(Action::LedgerResult { result: Ok(()), .. })
+            ) {}
+        })
+        .await
+        .unwrap();
+        {
+            let mut cache = shared.cloud_deploy.lock().unwrap();
+            cache.insert("d".into(), (1, serde_json::json!({"kind":"deleted"})));
+            cache.insert("other".into(), (2, serde_json::json!({"kind":"retained"})));
+        }
+        handle.forget("d".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(events.recv().await.unwrap(), Event::Lifecycle(Action::Removed { id, .. }) if id == "d") {}
+        }).await.unwrap();
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+        server.shutdown().await;
+        let cache = shared.cloud_deploy.lock().unwrap();
+        assert!(!cache.contains_key("d"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache["other"].1, serde_json::json!({"kind":"retained"}));
+    }
 
     #[tokio::test]
     async fn cancelled_runtime_keeps_storage_locked_until_async_drain() {
