@@ -4,19 +4,7 @@ rusthinq is a local LG ThinQ device server and optional LG cloud bridge written 
 Rust. It accepts appliance connections, runs Rhai device drivers, and exposes a
 management API, web dashboard and MQTT output.
 
-## How 0.2 differs
-
-| Area | TypeScript rethink | Rust 0.1 | Rust 0.2 |
-| --- | --- | --- | --- |
-| Structure | Object/event-driven server with device, cloud and Home Assistant components | Rust port organized around core, devices, cloud, bridge and GUI components | Protocol and lifecycle decisions separated from transport I/O, adapters and application orchestration |
-| Device semantics | Built-in TypeScript model drivers and Home Assistant entity mappings | Rhai drivers and external raw-bus consumers; host also provides IL descriptors and property helpers | Rhai owns model semantics, descriptors, validation and integration output; host carries opaque publications |
-| Management | Web management alongside built-in integrations | MQTT control/state topics plus optional GUI | HTTP/WebSocket API and GUI operate independently of external MQTT |
-| Runtime ownership | Callbacks and event emitters connect components | Shared services and device callbacks connect components | Explicit task ownership, session generations and durable device identity fence stale work |
-| Compatibility | Upstream implementation and model catalog | Archived migration source | Selectively reimplemented contracts with replay, integration and feature checks; full upstream parity is not claimed |
-
-The comparison describes architectural boundaries, not model coverage. Upstream
-references are [rethink](https://github.com/anszom/rethink) and its
-[model/HA bridge](https://github.com/anszom/rethink/blob/30835bdb6eac3fc05c05ca824e29373bf9711d3e/cloud/ha_bridge.ts).
+## Architecture
 
 ### Runtime boundaries
 
@@ -47,7 +35,7 @@ see [operations](docs/0.2-operations.md) for its limits and delivery semantics.
 | `rusthinq-driver-config` | Shared driver resource defaults and validation, independent of Rhai |
 | `rusthinq-scripting` | Rhai execution and generic host effects |
 | `rusthinq-app` | Composed daemon, durable ownership, management, GUI and external MQTT |
-| `rusthinq-tools` | CLI, MCP, capture/replay, setup and migration utilities |
+| `rusthinq-tools` | CLI, MCP, capture/replay and device setup utilities |
 
 ## Install as a service
 
@@ -61,11 +49,9 @@ curl -fsSL https://raw.githubusercontent.com/3735943886/rusthinq/master/scripts/
 
 `install` first looks for a running rusthinq:
 
-- **A running 0.2** is adopted where it is. Its binary directory, configuration and
+- **A running rusthinq** is adopted where it is. Its binary directory, configuration and
   data stay put; later upgrades only replace its binaries. A copy started outside
   systemd can get a unit, or keep being restarted by hand.
-- **A running 0.1** (`rusthinq-cloud`) is staged into `/var/lib/rusthinq` with
-  `rusthinq-migrate`. 0.1 keeps running until you confirm the switch.
 - **Nothing running** starts a fresh install. It asks for the hostname, an existing CA
   (or creates one), the LG bridge, MQTT, dashboard login and drivers
   ([rusthinq-scripts](https://github.com/3735943886/rusthinq-scripts)). The
@@ -75,12 +61,12 @@ curl -fsSL https://raw.githubusercontent.com/3735943886/rusthinq/master/scripts/
 A container installation is left to its image.
 
 ```sh
-thinqctl                      # installation, service and version state
-sudo thinqctl upgrade         # download and verify, then replace and restart
-sudo thinqctl rollback        # restore the binaries the last upgrade replaced
-sudo thinqctl scripts update  # pull the driver checkout
-sudo thinqctl remove          # keep data and CA; an adopted install is only forgotten
-sudo thinqctl purge           # also delete data, CA and user (thinqctl installs only)
+thinqctl                           # installation, service and version state
+sudo thinqctl upgrade --prerelease # download and verify, then replace and restart
+sudo thinqctl rollback             # restore the binaries the last upgrade replaced
+sudo thinqctl scripts update       # pull the driver checkout
+sudo thinqctl remove               # keep data and CA; an adopted install is only forgotten
+sudo thinqctl purge                # also delete data, CA and user (thinqctl installs only)
 ```
 
 `--yes` takes every default, and `RUSTHINQ_*` variables set those defaults. For example,
@@ -159,10 +145,10 @@ cargo build --release -p rusthinq-tools --bins
 ```
 
 The tool suite includes CLI management, an MCP server, device/cloud capture,
-packet encode/decode, replay, SoftAP setup, migration and retained-output cleanup.
+packet encode/decode, replay, SoftAP setup and retained-output cleanup.
 MCP supports live device observation through `device_start`, `read_device` and
 `device_stop`, with bounded capture buffers, cursors, loss reporting and session
-snapshots. See [tool migration](docs/0.2-tools-migration.md#tools-migration) for commands and
+snapshots. See the [tools guide](docs/0.2-tools-migration.md#tools-migration) for commands and
 configuration.
 
 Model-specific Rhai drivers, shared helpers and their tests are maintained in
@@ -181,23 +167,6 @@ rusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok
 Replay requires the management injection capability to be enabled. Command
 admission, transport write and appliance acknowledgement are distinct results;
 management events expose them separately where supported.
-
-## Upgrading from 0.1
-
-Read the [release notes](docs/0.2-tools-migration.md#release-notes),
-[compatibility inventory](docs/0.2-validation.md#compatibility) and
-[tool migration guide](docs/0.2-tools-migration.md#tools-migration) before switching runtimes.
-Configuration, management contracts and script host APIs have changed; this is
-not a drop-in binary replacement.
-
-```sh
-rusthinq-migrate OLD_CONFIG NEW_DIRECTORY
-```
-
-The migrator stages configuration and saved device/retained state without
-modifying the 0.1 source. Follow the migration guide for validation and rollback.
-Model porting is deferred until the host is complete; it is separate from the
-runtime architecture work.
 
 The [documentation index](docs/README.md) separates operating guides, architecture
 contracts and dated implementation evidence.
