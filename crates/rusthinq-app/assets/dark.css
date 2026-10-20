@@ -1373,13 +1373,33 @@ select:focus {
   .page-heading {
     gap: 10px;
   }
-  .page-heading > .button {
-    padding: 9px;
-    min-width: 38px;
-    font-size: 0;
+  .heading-with-action {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 10px;
+    row-gap: 0;
+    align-items: center;
   }
-  .page-heading > .button svg {
-    width: 18px;
+  .heading-with-action > div {
+    display: contents;
+  }
+  .heading-with-action .eyebrow {
+    grid-column: 1 / -1;
+  }
+  .heading-with-action h1 {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .heading-with-action > .button {
+    grid-column: 2;
+    grid-row: 2;
+    min-height: 44px;
+    padding: 10px 12px;
+    flex-shrink: 0;
+  }
+  .heading-with-action .subtitle {
+    grid-column: 1 / -1;
+    grid-row: 3;
   }
   .system-grid,
   .studio-side {
