@@ -4,6 +4,11 @@ rusthinq is a local LG ThinQ device server and optional LG cloud bridge written 
 Rust. It accepts appliance connections, runs Rhai device drivers, and exposes a
 management API, web dashboard and MQTT output.
 
+## Status
+
+0.2 is mostly working and in daily use with ThinQ2 appliances.
+ThinQ1 has not been tested with real hardware; reports are welcome.
+
 ## Architecture
 
 ### Runtime boundaries
