@@ -183,6 +183,23 @@ pub struct Runtime {
     shared: Arc<Shared>,
     transient: mpsc::Receiver<Publication>,
     removals: mpsc::Receiver<Removal>,
+    /// The scope whose retained topics each owner last settled, kept across broker reconnects.
+    scopes: BTreeMap<String, Scope>,
+}
+/// Who publishes an owner's retained topics. A new session or generation running the same
+/// driver revision continues the same topics; only a different driver may have dropped some.
+#[derive(Clone)]
+struct Scope {
+    revision: Option<u64>,
+    context: Context,
+}
+impl Scope {
+    fn continues(&self, next: &Scope) -> bool {
+        match (self.revision, next.revision) {
+            (Some(previous), Some(current)) => previous == current,
+            _ => self.context == next.context,
+        }
+    }
 }
 pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
     config.validate()?;
@@ -209,6 +226,7 @@ pub fn new(config: Config) -> io::Result<(Handle, Runtime)> {
             shared,
             transient: receiver,
             removals: removal_receiver,
+            scopes: BTreeMap::new(),
         },
     ))
 }
@@ -417,7 +435,6 @@ impl Runtime {
     ) -> io::Result<()> {
         let mut states = app.state_changes(); // before recovery snapshot
         let mut versions = BTreeMap::new();
-        let mut scopes = BTreeMap::<String, Context>::new();
         let mut ping = Instant::now() + Duration::from_secs(30);
         self.shared.status.send_replace(Status::Connected);
         loop {
@@ -484,9 +501,20 @@ impl Runtime {
                 if !current(app, &message) {
                     continue;
                 }
-                if !message.retired && scopes.get(&message.owner) != Some(&message.context) {
-                    // Remove only what the current scope no longer publishes. A reconnect
-                    // (fresh `scopes`) must not clear and re-create the device's state.
+                let scope = Scope {
+                    revision: app.driver_revision(&message.context),
+                    context: message.context.clone(),
+                };
+                let settled = self
+                    .scopes
+                    .get(&message.owner)
+                    .is_some_and(|previous| previous.continues(&scope));
+                if !message.retired && settled {
+                    // A device reconnect keeps its retained state for the same driver to update.
+                    self.scopes.insert(message.owner.clone(), scope);
+                } else if !message.retired {
+                    // Remove only what the current scope no longer publishes. A broker
+                    // reconnect keeps `scopes` and must not clear and re-create the state.
                     let live: std::collections::BTreeSet<String> = self
                         .shared
                         .cache
@@ -511,7 +539,7 @@ impl Runtime {
                         }
                         ledger = session.delete_one(ledger, item.topic).await?;
                     }
-                    scopes.insert(message.owner.clone(), message.context.clone());
+                    self.scopes.insert(message.owner.clone(), scope);
                     versions.retain(|topic, _| {
                         self.shared
                             .cache

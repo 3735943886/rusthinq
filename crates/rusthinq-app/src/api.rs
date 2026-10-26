@@ -251,6 +251,18 @@ impl AppHandle {
     ) -> bool {
         self.0.publication_current(ctx, retired, durable)
     }
+    /// The bundle revision of the driver that published under `ctx`, if it is still loaded.
+    pub(crate) fn driver_revision(&self, ctx: &crate::scripts::Context) -> Option<u64> {
+        #[cfg(feature = "scripting")]
+        return self
+            .0
+            .driver_revision(&ctx.device, ctx.session, ctx.generation);
+        #[cfg(not(feature = "scripting"))]
+        {
+            let _ = ctx;
+            None
+        }
+    }
 
     #[cfg(feature = "scripting")]
     pub(crate) fn cloud_notification(&self, value: &serde_json::Value) {

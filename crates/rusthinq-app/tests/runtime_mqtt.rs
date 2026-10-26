@@ -1012,3 +1012,184 @@ async fn script_command(
         Err(rusthinq_app::api::Reject::StaleSession)
     );
 }
+
+#[tokio::test]
+async fn device_reconnect_keeps_retained_state_until_the_driver_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 8).unwrap();
+    let broker = Broker::new(Config::default(), Arc::new(SystemClock)).unwrap();
+    let sources = directory.path().join("drivers");
+    std::fs::create_dir(&sources).unwrap();
+    let driver = sources.join("Retain.rhai");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/host-drivers/Retain.rhai"),
+        &driver,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (sink, adapter) = rusthinq_app::external_mqtt::new(rusthinq_app::external_mqtt::Config {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        tls: false,
+        ca: None,
+        client: "host-script".into(),
+        username: None,
+        password: None,
+        inventory: directory.path().join("retained.json"),
+    })
+    .unwrap();
+    let runtime = Runtime::new_mqtt(storage, broker.handle(), Duration::ZERO, 128)
+        .unwrap()
+        .with_drivers(rusthinq_app::drivers::Config {
+            directory: sources,
+            topic_prefix: "rusthinq".into(),
+            limits: Default::default(),
+            bindings: Default::default(),
+            watch: false,
+        })
+        .unwrap()
+        .with_external_mqtt(sink.clone());
+    let (adapter_stop, adapter_stopped) = watch::channel(false);
+    let adapter_task = tokio::spawn(adapter.run(runtime.handle(), adapter_stopped));
+    // Every retained publication the broker receives, in order; an empty payload deletes.
+    let (wire, mut retained) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let remote = tokio::spawn(async move {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        async fn frame(peer: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+            let header = peer.read_u8().await?;
+            let mut len = 0usize;
+            let mut shift = 0;
+            loop {
+                let byte = peer.read_u8().await?;
+                len |= usize::from(byte & 127) << shift;
+                if byte & 128 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let mut bytes = vec![0; len];
+            peer.read_exact(&mut bytes).await?;
+            Ok((header, bytes))
+        }
+        assert_eq!(frame(&mut peer).await.unwrap().0, 0x10);
+        peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+        while let Ok((header, body)) = frame(&mut peer).await {
+            if header & 0xf0 == 0xc0 {
+                peer.write_all(&[0xd0, 0]).await.unwrap();
+                continue;
+            }
+            assert_eq!(header, 0x33);
+            let length = usize::from(u16::from_be_bytes([body[0], body[1]]));
+            let topic = String::from_utf8(body[2..2 + length].to_vec()).unwrap();
+            let id = &body[2 + length..4 + length];
+            let _ = wire.send((topic, body[4 + length..].to_vec()));
+            peer.write_all(&[0x40, 2, id[0], id[1]]).await.unwrap();
+        }
+    });
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let app = tokio::spawn(runtime.run(stopped));
+
+    async fn attach(
+        broker: &Broker,
+        events: &mut broadcast::Receiver<Event>,
+    ) -> (DuplexStream, tokio::task::JoinHandle<()>) {
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        let running = broker.clone();
+        let device = tokio::spawn(async move { running.run(stream).await.unwrap() });
+        connect(&mut peer).await;
+        publish(
+            &mut peer,
+            "clip/provisioning/devices/d",
+            json!({"did":"d","cmd":"deploy","kind":"Retain","data":{}}),
+        )
+        .await;
+        packet(&mut peer).await;
+        publish(
+            &mut peer,
+            "clip/message/devices/d",
+            json!({"did":"d","cmd":"completeProvisioning_ack"}),
+        )
+        .await;
+        until(events, |event| {
+            matches!(event, Event::ScriptOutput {payload, ..}
+            if serde_json::from_str::<serde_json::Value>(payload).unwrap()
+                == json!({"topic":"rusthinq/d/available","payload":"true","retain":true}))
+        })
+        .await;
+        (peer, device)
+    }
+    async fn detach(
+        peer: DuplexStream,
+        device: tokio::task::JoinHandle<()>,
+        events: &mut broadcast::Receiver<Event>,
+    ) {
+        drop(peer);
+        until(events, |event| {
+            matches!(event, Event::ScriptStopped { error: None, .. })
+        })
+        .await;
+        device.await.unwrap();
+    }
+    let drained = |retained: &mut mpsc::UnboundedReceiver<(String, Vec<u8>)>| {
+        std::iter::from_fn(|| retained.try_recv().ok()).collect::<Vec<_>>()
+    };
+
+    let (peer, device) = attach(&broker, &mut events).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .invoke_script(
+            "d".into(),
+            session,
+            1,
+            "__command".into(),
+            json!({"prop":"status","value":"off"}).to_string(),
+        )
+        .await
+        .unwrap();
+    until(&mut events, |event| {
+        matches!(event, Event::ScriptOutput {payload, ..}
+        if payload.contains("rusthinq/d/status"))
+    })
+    .await;
+    timeout(Duration::from_secs(5), sink.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(drained(&mut retained).contains(&("rusthinq/d/status".into(), b"off".to_vec())));
+    detach(peer, device, &mut events).await;
+
+    // The same driver on a new session continues the device's state: nothing is deleted.
+    let (peer, device) = attach(&broker, &mut events).await;
+    assert_ne!(handle.snapshot()[0].session.unwrap(), session);
+    timeout(Duration::from_secs(5), sink.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    let wire = drained(&mut retained);
+    assert!(
+        wire.iter().all(|(_, payload)| !payload.is_empty()),
+        "{wire:?}"
+    );
+    detach(peer, device, &mut events).await;
+
+    // A changed driver removes what it does not publish.
+    let source = std::fs::read_to_string(&driver).unwrap();
+    std::fs::write(&driver, format!("{source}\n// changed\n")).unwrap();
+    let (peer, device) = attach(&broker, &mut events).await;
+    timeout(Duration::from_secs(5), sink.flush())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(drained(&mut retained).contains(&("rusthinq/d/status".into(), Vec::new())));
+    detach(peer, device, &mut events).await;
+
+    broker.stop();
+    stop.send_replace(true);
+    app.await.unwrap().unwrap();
+    adapter_stop.send_replace(true);
+    adapter_task.await.unwrap().unwrap();
+    remote.await.unwrap();
+}
