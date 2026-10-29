@@ -656,6 +656,7 @@ impl Runtime {
         }
         let mut device_states = self.app.state_changes();
         let mut accounts = self.account.clients();
+        let mut account_error = None;
         let mut empty_inventory = None;
         let mut reconcile_at = tokio::time::Instant::now();
         while !*stop.borrow() {
@@ -667,6 +668,15 @@ impl Runtime {
                 changed=accounts.changed()=>{
                     if changed.is_err() { break; }
                     accounts.borrow_and_update();
+                    // The account error carries LG's answer; log each change once.
+                    let status = self.account.status();
+                    if status.error != account_error {
+                        match &status.error {
+                            Some(error) => tracing::warn!(%error, logged_in = status.logged_in, "cloud account failed"),
+                            None => tracing::info!(logged_in = status.logged_in, "cloud account recovered"),
+                        }
+                        account_error = status.error;
+                    }
                     empty_inventory = None;
                     reconcile_at = tokio::time::Instant::now();
                     continue;

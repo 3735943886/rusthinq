@@ -231,11 +231,11 @@ impl From<crate::cloud_account::Error> for CloudError {
             E::Stopped => Self::Stopped,
             E::InvalidInput => Self::InvalidInput,
             E::Unavailable => Self::Unavailable,
-            E::Remote => Self::Remote,
+            E::Remote(_) => Self::Remote,
             E::Storage => Self::Storage,
             E::Cancelled => Self::Cancelled,
-            E::Authentication => Self::Authentication,
-            E::Rejected => Self::Rejected,
+            E::Authentication(_) => Self::Authentication,
+            E::Rejected(_) => Self::Rejected,
         }
     }
 }

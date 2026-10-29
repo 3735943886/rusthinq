@@ -37,11 +37,12 @@ pub enum Error {
     Stopped,
     InvalidInput,
     Unavailable,
-    Remote,
+    /// The LG error behind each remote outcome, so status and logs can say what LG answered.
+    Remote(crate::cloud::Error),
     Storage,
     Cancelled,
-    Authentication,
-    Rejected,
+    Authentication(crate::cloud::Error),
+    Rejected(crate::cloud::Error),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -195,7 +196,7 @@ impl Handle {
                     if changed.is_err() || !clients.borrow().as_ref().is_some_and(|c| c.authenticated() && c.account_identity() == Some(account.as_str())) { return Err(Error::Cancelled); }
                 }
                 result = &mut request => {
-                    let devices = result.map_err(|_| Error::Remote)?;
+                    let devices = result.map_err(Error::Remote)?;
                     self.publish_inventory(&account, epoch, serde_json::json!(devices));
                     return Ok(serde_json::json!({"devices":devices}));
                 },
@@ -312,23 +313,28 @@ async fn owned_operation<T>(
 fn remote(error: crate::cloud::Error) -> Error {
     use crate::cloud::Error as Cloud;
     match error {
-        Cloud::Http(401 | 403) => Error::Authentication,
+        Cloud::Http(401 | 403) => Error::Authentication(error),
         Cloud::Network | Cloud::InvalidResponse | Cloud::Http(408 | 429 | 500..=599) => {
-            Error::Remote
+            Error::Remote(error)
         }
-        _ => Error::Rejected,
+        _ => Error::Rejected(error),
     }
 }
 
+/// Seconds between renewal retries after a transient failure, at most; a refusal starts here.
+const RETRY_CAP: u64 = 300;
 struct Renewal {
     next: Option<tokio::time::Instant>,
     delay: u64,
+    /// The lifetime of the last token, the normal renewal period.
+    period: Option<std::time::Duration>,
 }
 impl Renewal {
     fn new(stored: bool) -> Self {
         Self {
             next: stored.then(tokio::time::Instant::now),
             delay: 1,
+            period: None,
         }
     }
     fn succeeded(&mut self, expires: tokio::time::Instant) {
@@ -337,14 +343,26 @@ impl Renewal {
         let margin = (remaining / 10).min(std::time::Duration::from_secs(60));
         self.next = Some(now + remaining - margin);
         self.delay = 1;
+        self.period = Some(remaining);
     }
+    /// A network or server failure retries within seconds. LG refusing the token, which it
+    /// also does transiently, retries from RETRY_CAP and backs off to the token's lifetime, so
+    /// one refusal does not end the account until someone logs in again. Local errors stop.
     fn failed(&mut self, error: &Error) {
-        self.next = if matches!(error, Error::Remote) {
-            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(self.delay))
-        } else {
-            None
+        let (delay, cap) = match error {
+            Error::Remote(_) => (self.delay, RETRY_CAP),
+            Error::Authentication(_) | Error::Rejected(_) => (
+                self.delay.max(RETRY_CAP),
+                self.period
+                    .map_or(RETRY_CAP, |p| p.as_secs().max(RETRY_CAP)),
+            ),
+            _ => {
+                self.next = None;
+                return;
+            }
         };
-        self.delay = (self.delay * 2).min(300);
+        self.next = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(delay));
+        self.delay = (delay * 2).min(cap);
     }
 }
 impl Runtime {
@@ -525,7 +543,7 @@ impl Runtime {
                     }
                     Err(error) => {
                         renewal.failed(error);
-                        if matches!(error, Error::Authentication) {
+                        if matches!(error, Error::Authentication(_)) {
                             active = None;
                         }
                     }
@@ -587,7 +605,7 @@ mod tests {
         }
     }
     #[tokio::test(start_paused = true)]
-    async fn renewal_precedes_expiry_and_transient_backoff_stops_for_terminal_errors() {
+    async fn renewal_precedes_expiry_and_refusals_retry_slowly_while_local_errors_stop() {
         let now = tokio::time::Instant::now();
         let mut renewal = Renewal::new(true);
         assert_eq!(renewal.next, Some(now));
@@ -598,20 +616,39 @@ mod tests {
         );
         renewal.succeeded(now + std::time::Duration::from_secs(30));
         assert_eq!(renewal.next, Some(now + std::time::Duration::from_secs(27)));
+        let remote = || Error::Remote(crate::cloud::Error::Network);
         for delay in [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
-            renewal.failed(&Error::Remote);
+            renewal.failed(&remote());
             assert_eq!(
                 renewal.next,
                 Some(now + std::time::Duration::from_secs(delay))
             );
         }
-        renewal.failed(&Error::Authentication);
-        assert!(renewal.next.is_none());
+        // A refusal retries from five minutes, backing off to the token's lifetime.
+        renewal.succeeded(now + std::time::Duration::from_secs(3600));
+        for delay in [300, 600, 1200, 2400, 3600, 3600] {
+            renewal.failed(&Error::Rejected(crate::cloud::Error::Http(400)));
+            assert_eq!(
+                renewal.next,
+                Some(now + std::time::Duration::from_secs(delay))
+            );
+        }
+        renewal.failed(&Error::Authentication(crate::cloud::Error::Http(401)));
+        assert_eq!(
+            renewal.next,
+            Some(now + std::time::Duration::from_secs(3600))
+        );
         renewal.failed(&Error::Storage);
         assert!(renewal.next.is_none());
         renewal.succeeded(now + std::time::Duration::from_secs(600));
-        renewal.failed(&Error::Remote);
+        renewal.failed(&remote());
         assert_eq!(renewal.next, Some(now + std::time::Duration::from_secs(1)));
+        // Without a token lifetime yet, a refusal retries every five minutes.
+        let mut fresh = Renewal::new(true);
+        for _ in 0..3 {
+            fresh.failed(&Error::Rejected(crate::cloud::Error::Api("0110".into())));
+            assert_eq!(fresh.next, Some(now + std::time::Duration::from_secs(300)));
+        }
         let (commands, _) = mpsc::channel(1);
         let (logout, _) = mpsc::channel(1);
         let (epoch, _) = watch::channel(0);
