@@ -27,5 +27,6 @@ tempfile = "3"
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
 rusthinq-lifecycle = { path = "../rusthinq-lifecycle" }
+rusthinq-bridge = { path = "../rusthinq-bridge" }
 rusthinq-app = { path = "../rusthinq-app", default-features = false, features = ["scripting", "gui", "bridge"] }
 rusthinq-server = { path = "../rusthinq-server" }

@@ -60,7 +60,17 @@ fn migration_stages_preserves_secrets_and_refuses_unsupported_cutover() {
     std::fs::write(&source, original).unwrap();
     let credential = "{\"refreshToken\":\"private-secret\",\"env\":{\"countryCode\":\"KR\"}}";
     std::fs::write(state.join("oauth2.json"), credential).unwrap();
-    std::fs::write(dir.path().join("mqtt_state.json"), br#"{"d":["power"]}"#).unwrap();
+    std::fs::write(
+        state.join("device_d.json"),
+        br#"{"httpServer":"https://api.example","rtiServer":"cloud.example:5222"}"#,
+    )
+    .unwrap();
+    std::fs::write(state.join("device_bad.json"), br#"{"apiServer":"x"}"#).unwrap();
+    std::fs::write(
+        dir.path().join("mqtt_state.json"),
+        br#"{"d":["power"],"gone":["power"]}"#,
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("known_devices.json"),
         br#"{"d":{"modelId":"m","modelName":"D140110","platform":"thinq1","last_seen_unix":123}}"#,
@@ -71,15 +81,40 @@ fn migration_stages_preserves_secrets_and_refuses_unsupported_cutover() {
     assert_eq!(report["requiresReview"], true);
     assert_eq!(report["retainedTopics"], 1);
     assert_eq!(report["migratedDevices"], 1);
+    let warnings = report["warnings"].to_string();
+    assert!(warnings.contains("1 retained 0.1 topics belong to devices absent"));
+    assert!(warnings.contains("legacy-cloud/device_bad.json was not migrated"));
     let imported =
         rusthinq_app::lifecycle_storage::Storage::open(&dest.join("devices.json"), 4096).unwrap();
     assert_eq!(imported.state().metadata["d"].model_name, "D140110");
-    let retained = std::fs::read(dest.join("retained-import.json")).unwrap();
+    // The 0.1 registration is staged as the pairing material adoption takes.
+    assert_eq!(
+        report["archivedCloudFiles"],
+        json!(["device_d.json", "oauth2.json"])
+    );
+    let material: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dest.join("legacy-cloud/device_d.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        material,
+        json!({"platform":"thinq1","http_server":"https://api.example","rti_server":"cloud.example:5222"})
+    );
     assert!(
-        rusthinq_server::retained::Cleanup::restore(16384, &retained)
+        serde_json::from_value::<rusthinq_bridge::pairing::Material>(material)
             .unwrap()
-            .requested()
-            .is_empty()
+            .validate_stored()
+            .is_ok()
+    );
+    // Imported retained topics belong to the migrated device incarnation.
+    let retained = std::fs::read(dest.join("retained-import.json")).unwrap();
+    let retained = rusthinq_server::retained::Cleanup::restore(16384, &retained).unwrap();
+    assert!(retained.requested().is_empty());
+    assert_eq!(
+        retained.pending(),
+        [rusthinq_server::retained::Tombstone {
+            owner: rusthinq_app::lifecycle_cleanup::device_owner("d", 1).unwrap(),
+            topic: "rusthinq/d/power".into(),
+        }]
     );
     assert!(!report.to_string().contains("private-secret"));
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
@@ -192,6 +227,11 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
          [gui]\ngui_port=8080\n",
     )
     .unwrap();
+    std::fs::write(
+        dir.path().join("known_devices.json"),
+        br#"{"d":{"modelName":"D140110","platform":"thinq1"}}"#,
+    )
+    .unwrap();
     let dest = dir.path().join("open-gui");
     rusthinq_tools::migration::migrate(&source, &dest).unwrap();
     let config = rusthinq_app::daemon::Config::load(&dest.join("config.toml")).unwrap();
@@ -207,31 +247,24 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
     assert!(mqtt.inventory.ends_with("retained-import.json"));
     let mut ledger = rusthinq_app::retained_cleanup::Ledger::open(&mqtt.inventory, 16384).unwrap();
     assert!(ledger.requested().is_empty());
+    let owner = rusthinq_app::lifecycle_cleanup::device_owner("d", 1).unwrap();
     let imported = rusthinq_server::retained::Tombstone {
-        owner: format!("{}d", rusthinq_app::retained_cleanup::IMPORTED_OWNER),
+        owner: owner.clone(),
         topic: "home/d/power".into(),
     };
     assert_eq!(ledger.pending(), std::slice::from_ref(&imported));
-    // 0.2's driver republishing a 0.1 topic takes it over instead of failing...
+    // The migrated device's 0.2 driver republishes the 0.1 topic as its own...
     ledger
-        .inventory_topic("device:d:1".into(), "home/d/power".into())
+        .inventory_topic(owner, "home/d/power".into())
         .unwrap();
-    assert_eq!(ledger.pending()[0].owner, "device:d:1");
-    // ...but two live owners still conflict, and a requested deletion is not overridden.
+    assert_eq!(ledger.pending(), std::slice::from_ref(&imported));
+    // ...and another owner still conflicts.
     assert!(
         ledger
-            .inventory_topic("device:d:2".into(), "home/d/power".into())
-            .is_err()
-    );
-    let dest = dir.path().join("requested");
-    rusthinq_tools::migration::migrate(&source, &dest).unwrap();
-    let mut ledger =
-        rusthinq_app::retained_cleanup::Ledger::open(&dest.join("retained-import.json"), 16384)
-            .unwrap();
-    ledger.request_delete(&[imported]).unwrap();
-    assert!(
-        ledger
-            .inventory_topic("device:d:1".into(), "home/d/power".into())
+            .inventory_topic(
+                rusthinq_app::lifecycle_cleanup::device_owner("d", 2).unwrap(),
+                "home/d/power".into()
+            )
             .is_err()
     );
     assert_eq!(
@@ -241,28 +274,46 @@ fn every_legacy_listener_proxy_mqtt_gui_and_dns_setting_carries_over() {
 }
 
 #[test]
-fn legacy_retained_inventory_preserves_exact_topics_and_requires_explicit_cleanup() {
+fn legacy_retained_inventory_belongs_to_migrated_devices_and_requires_explicit_cleanup() {
     use rusthinq_server::retained::Cleanup;
-    let old = br#"{"d":["temperature","power"],"other":["power"]}"#;
-    let current=br#"{"d":{"properties":["power","temperature"],"last_seen_unix":123},"other":{"properties":["power"],"last_seen_unix":0}}"#;
-    let plan = rusthinq_tools::migration::legacy_retained(old, "home/lg").unwrap();
+    let old = br#"{"d":["temperature","power"],"other":["power"],"gone":["power"]}"#;
+    let current=br#"{"d":{"properties":["power","temperature"],"last_seen_unix":123},"other":{"properties":["power"],"last_seen_unix":0},"gone":{"properties":["power"],"last_seen_unix":0}}"#;
+    let ledger = rusthinq_tools::migration::legacy_devices(
+        br#"{"d":{"modelName":"m","platform":"thinq2"},"other":{"modelName":"m","platform":"thinq2"}}"#,
+    )
+    .unwrap();
+    let (plan, omitted) =
+        rusthinq_tools::migration::legacy_retained(old, "home/lg", &ledger).unwrap();
+    assert_eq!(omitted, 1);
     assert_eq!(
-        plan,
-        rusthinq_tools::migration::legacy_retained(current, "home/lg").unwrap()
+        (plan.clone(), omitted),
+        rusthinq_tools::migration::legacy_retained(current, "home/lg", &ledger).unwrap()
     );
     let bytes = serde_json::to_vec(&plan).unwrap();
-    let mut ledger = Cleanup::restore(16384, &bytes).unwrap();
-    assert_eq!(ledger.pending().len(), 3);
-    assert!(ledger.requested().is_empty());
-    assert_eq!(ledger.pending()[0].topic, "home/lg/d/power");
-    assert!(
-        ledger
+    let mut ledger_state = Cleanup::restore(16384, &bytes).unwrap();
+    assert_eq!(ledger_state.pending().len(), 3);
+    assert!(ledger_state.requested().is_empty());
+    assert_eq!(ledger_state.pending()[0].topic, "home/lg/d/power");
+    let owner = |topic: &str| {
+        ledger_state
             .pending()
-            .iter()
-            .all(|item| item.owner.starts_with("legacy/0.1:"))
+            .into_iter()
+            .find(|item| item.topic == topic)
+            .unwrap()
+            .owner
+    };
+    assert_eq!(
+        owner("home/lg/d/temperature"),
+        rusthinq_app::lifecycle_cleanup::device_owner("d", 1).unwrap()
     );
-    ledger.request_delete(&ledger.pending()).unwrap();
-    let mut restarted = Cleanup::restore(16384, &ledger.checkpoint()).unwrap();
+    assert_eq!(
+        owner("home/lg/other/power"),
+        rusthinq_app::lifecycle_cleanup::device_owner("other", 2).unwrap()
+    );
+    ledger_state
+        .request_delete(&ledger_state.pending())
+        .unwrap();
+    let mut restarted = Cleanup::restore(16384, &ledger_state.checkpoint()).unwrap();
     assert_eq!(restarted.requested().len(), 3);
     let attempt = restarted.begin("home/lg/d/power").unwrap();
     assert!(restarted.complete(&attempt, false));
@@ -271,8 +322,70 @@ fn legacy_retained_inventory_preserves_exact_topics_and_requires_explicit_cleanu
     let attempt = restarted.begin("home/lg/d/power").unwrap();
     assert!(restarted.complete(&attempt, true));
     assert_eq!(restarted.pending().len(), 2);
-    assert!(rusthinq_tools::migration::legacy_retained(br##"{"d":["#"]}"##, "home/lg").is_err());
-    assert!(rusthinq_tools::migration::legacy_retained(old, "home/+").is_err());
+    assert!(
+        rusthinq_tools::migration::legacy_retained(br##"{"d":["#"]}"##, "home/lg", &ledger)
+            .is_err()
+    );
+    assert!(rusthinq_tools::migration::legacy_retained(old, "home/+", &ledger).is_err());
+}
+
+#[test]
+fn legacy_registrations_become_pairing_material_without_invented_deploy_information() {
+    use rusthinq_bridge::pairing::Material;
+    use rusthinq_tools::migration::legacy_material;
+    let thinq2 = json!({
+        "countryCode": "KR", "apiServer": "https://kic-api.example", "mqttServer": "ssl://mqtt.example:8883",
+        "caCertificate": "ca", "privateKey": "key", "certificate": "cert",
+        "pubTopic": "pub", "provTopic": "prov", "subTopic": "sub",
+        "deployAppInfo": {"protocolVer": "7"}
+    });
+    let material = legacy_material(thinq2.clone(), None).unwrap();
+    assert_eq!(material["platform"], "thinq2");
+    assert_eq!(material["country"], "KR");
+    assert_eq!(material["certificate"], "cert");
+    assert!(serde_json::from_value::<Material>(material).is_ok());
+    // snake_case keys read the same; both spellings of one key are ambiguous.
+    let mut snake = thinq2.clone();
+    let api = snake.as_object_mut().unwrap().remove("apiServer").unwrap();
+    snake["api_server"] = api;
+    assert_eq!(
+        legacy_material(snake, None).unwrap(),
+        legacy_material(thinq2.clone(), None).unwrap()
+    );
+    let mut ambiguous = thinq2.clone();
+    ambiguous["country_code"] = json!("US");
+    assert!(legacy_material(ambiguous, None).is_err());
+    // An older registration without a country takes the 0.1 account's, never a placeholder.
+    let mut no_country = thinq2.clone();
+    no_country.as_object_mut().unwrap().remove("countryCode");
+    assert!(legacy_material(no_country.clone(), None).is_err());
+    assert_eq!(
+        legacy_material(no_country, Some("US")).unwrap()["country"],
+        "US"
+    );
+    assert_eq!(
+        legacy_material(thinq2, Some("US")).unwrap()["country"],
+        "KR"
+    );
+    // ThinQ1 needs no country; a contradicting platform and missing fields are refused.
+    let thinq1 = legacy_material(
+        json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","platform":"thinq1","privateKey":"unused"}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        thinq1,
+        json!({"platform":"thinq1","http_server":"https://api.example","rti_server":"cloud.example:5222"})
+    );
+    assert!(
+        serde_json::from_value::<Material>(thinq1)
+            .unwrap()
+            .validate()
+            .is_ok()
+    );
+    assert!(legacy_material(json!({"httpServer":"https://api.example","rtiServer":"cloud.example:5222","platform":"thinq2"}), None).is_err());
+    assert!(legacy_material(json!({"rtiServer":"cloud.example:5222"}), None).is_err());
+    assert!(legacy_material(json!([]), None).is_err());
 }
 
 #[test]

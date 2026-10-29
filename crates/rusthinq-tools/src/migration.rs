@@ -244,11 +244,38 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .and_then(toml::Value::as_str)
             .unwrap_or("mqtt_state.json"),
     );
+    let mut warnings: Vec<String> = [
+        "Legacy device registrations are converted under legacy-cloud/ and stay disabled; adopt each one (rusthinqctl adopt) after reconciling account identity and registration.",
+        "Rollback: stop 0.2 and restart 0.1 with the untouched original configuration and state.",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let ledger = match read(&base.join("known_devices.json")) {
+        Ok(bytes) => {
+            let ledger = legacy_devices(&bytes)?;
+            write(&stage.path().join("known-devices.0.1.json"), &bytes)?;
+            write(
+                &stage.path().join("devices.json"),
+                &serde_json::to_vec_pretty(&ledger).map_err(io::Error::other)?,
+            )?;
+            Some(ledger)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let migrated_devices = ledger
+        .as_ref()
+        .and_then(|ledger| ledger["entries"].as_array())
+        .map_or(0, Vec::len);
     let mut retained_imported = false;
     let retained_topics = match read(&retained_path) {
         Ok(bytes) => {
             retained_imported = true;
-            let inventory = legacy_retained(&bytes, prefix)?;
+            let (inventory, omitted) =
+                legacy_retained(&bytes, prefix, ledger.as_ref().unwrap_or(&Value::Null))?;
+            if omitted > 0 {
+                warnings.push(format!("{omitted} retained 0.1 topics belong to devices absent from known_devices.json and were not imported; remove them at the broker if they are stale."));
+            }
             write(&stage.path().join("mqtt-state.0.1.json"), &bytes)?;
             write(
                 &stage.path().join("retained-import.json"),
@@ -259,26 +286,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error),
     };
-    let migrated_devices = match read(&base.join("known_devices.json")) {
-        Ok(bytes) => {
-            let ledger = legacy_devices(&bytes)?;
-            write(&stage.path().join("known-devices.0.1.json"), &bytes)?;
-            write(
-                &stage.path().join("devices.json"),
-                &serde_json::to_vec_pretty(&ledger).map_err(io::Error::other)?,
-            )?;
-            ledger["entries"].as_array().map_or(0, Vec::len)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error),
-    };
     let mut archived = Vec::new();
-    let mut warnings: Vec<String> = [
-        "Legacy device pairing files remain archived; reconcile account identity and registration before enabling cloud sessions.",
-        "Rollback: stop 0.2 and restart 0.1 with the untouched original configuration and state.",
-    ]
-    .map(str::to_owned)
-    .to_vec();
     if let Some(bridge) = legacy.get("bridge") {
         let storage = absolute(
             base,
@@ -289,7 +297,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         );
         let archive = stage.path().join("legacy-cloud");
         fs::create_dir(&archive)?;
-        let mut count = 0;
+        let mut files = std::collections::BTreeMap::new();
         for entry in fs::read_dir(&storage)? {
             let entry = entry?;
             let kind = entry.file_type()?;
@@ -303,35 +311,53 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             if !name.ends_with(".json") {
                 continue;
             }
-            count += 1;
-            if count > 4096 {
+            if files.len() >= 4096 {
                 return Err(invalid("cloud archive exceeded"));
             }
             let bytes = read(&entry.path())?;
-            let _: Value =
+            let value: Value =
                 serde_json::from_slice(&bytes).map_err(|_| invalid("invalid legacy cloud JSON"))?;
-            write(&archive.join(name), &bytes)?;
-            archived.push(name.to_owned());
-            if name == "oauth2.json" {
-                let account: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                let refresh = account["refreshToken"]
-                    .as_str()
-                    .filter(|s| !s.is_empty() && s.len() <= 16384)
-                    .ok_or_else(|| invalid("invalid refresh token"))?;
-                let country = account["env"]["countryCode"]
-                    .as_str()
-                    .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
-                    .ok_or_else(|| invalid("invalid account country"))?;
-                write(
-                    &stage.path().join("account.json"),
-                    serde_json::to_string(
-                        &json!({"schema":1,"credentials":{"country":country,"refresh":refresh}}),
-                    )
-                    .unwrap()
-                    .as_bytes(),
-                )?;
-                config["cloud_account"] = json!("account.json");
-            }
+            files.insert(name.to_owned(), (bytes, value));
+        }
+        // The account comes first: its country completes older ThinQ2 registrations.
+        let mut country = None;
+        if let Some((_, account)) = files.get("oauth2.json") {
+            let refresh = account["refreshToken"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 16384)
+                .ok_or_else(|| invalid("invalid refresh token"))?;
+            let code = account["env"]["countryCode"]
+                .as_str()
+                .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
+                .ok_or_else(|| invalid("invalid account country"))?;
+            write(
+                &stage.path().join("account.json"),
+                serde_json::to_string(
+                    &json!({"schema":1,"credentials":{"country":code,"refresh":refresh}}),
+                )
+                .unwrap()
+                .as_bytes(),
+            )?;
+            config["cloud_account"] = json!("account.json");
+            country = Some(code.to_owned());
+        }
+        for (name, (bytes, value)) in files {
+            // A device registration is stored as 0.2 pairing material, the form adoption takes.
+            let bytes = if name.starts_with("device_") {
+                match legacy_material(value, country.as_deref()) {
+                    Ok(material) => {
+                        serde_json::to_vec_pretty(&material).map_err(io::Error::other)?
+                    }
+                    Err(error) => {
+                        warnings.push(format!("legacy-cloud/{name} was not migrated: {error}."));
+                        continue;
+                    }
+                }
+            } else {
+                bytes
+            };
+            write(&archive.join(&name), &bytes)?;
+            archived.push(name);
         }
         if let Some(dns) = bridge.get("dns") {
             let servers = dns
@@ -466,9 +492,15 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
     Ok(report)
 }
 
-/// Convert both 0.1 retained-state formats into a schema-2 inventory. Legacy
-/// ownership never impersonates a new device incarnation. No deletion is requested.
-pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
+/// The retained owner of a device incarnation, as `rusthinq_app::lifecycle_cleanup::device_owner`.
+fn device_owner(id: &str, incarnation: u64) -> String {
+    format!("device/{}:{id}/{incarnation}", id.len())
+}
+
+/// Convert both 0.1 retained-state formats into a schema-2 inventory owned by the devices
+/// of the migrated `ledger` (`legacy_devices`), so 0.2 maintains them as its own state.
+/// Topics of devices absent from the ledger are omitted and counted. No deletion is requested.
+pub fn legacy_retained(bytes: &[u8], prefix: &str, ledger: &Value) -> io::Result<(Value, usize)> {
     if bytes.len() > 1_048_576
         || prefix.is_empty()
         || prefix.len() > 256
@@ -484,7 +516,14 @@ pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
         .as_object()
         .filter(|d| d.len() <= 4096)
         .ok_or_else(|| invalid("invalid legacy retained device inventory"))?;
+    let incarnations: std::collections::BTreeMap<&str, u64> = ledger["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some((entry["id"].as_str()?, entry["incarnation"].as_u64()?)))
+        .collect();
     let mut topics = std::collections::BTreeMap::new();
+    let mut omitted = 0;
     for (device, state) in devices {
         if device.is_empty()
             || device.len() > 256
@@ -493,6 +532,9 @@ pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
         {
             return Err(invalid("invalid legacy retained device id"));
         }
+        let owner = incarnations
+            .get(device.as_str())
+            .map(|incarnation| device_owner(device, *incarnation));
         let properties = if state.is_array() {
             state.as_array()
         } else {
@@ -525,16 +567,82 @@ pub fn legacy_retained(bytes: &[u8], prefix: &str) -> io::Result<Value> {
             if topic.len() > 1024 {
                 return Err(invalid("legacy retained topic exceeded"));
             }
-            // rusthinq_app::retained_cleanup::IMPORTED_OWNER: new owners adopt these.
-            topics.insert(topic, format!("legacy/0.1:{device}"));
+            let Some(owner) = &owner else {
+                omitted += 1;
+                continue;
+            };
+            topics.insert(topic, owner.clone());
             if topics.len() > 16384 {
                 return Err(invalid("legacy retained inventory exceeded"));
             }
         }
     }
-    Ok(
+    Ok((
         json!({"version":2,"next":0,"pending":topics.into_iter().map(|(topic,owner)|json!({"topic":topic,"owner":owner})).collect::<Vec<_>>(),"deleting":[]}),
-    )
+        omitted,
+    ))
+}
+
+/// Convert a 0.1 device registration (`device_<id>.json`) into 0.2 pairing material
+/// (`rusthinq_bridge::pairing::Material`) without inventing deploy information. Keys may be
+/// camelCase or snake_case, not both; other keys are ignored, as 0.1 read these files (real
+/// archives carry fields such as `httpsServer`). An older ThinQ2 registration without a
+/// country takes the 0.1 account's. The daemon validates the material when it is adopted.
+pub fn legacy_material(value: Value, country: Option<&str>) -> io::Result<Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("not a registration object"))?;
+    let field = |camel: &str, snake: &str| -> io::Result<String> {
+        let snake_value = if camel == snake {
+            None
+        } else {
+            object.get(snake)
+        };
+        match (object.get(camel), snake_value) {
+            (Some(_), Some(_)) => Err(invalid(&format!("both {camel} and {snake} are set"))),
+            (Some(v), None) | (None, Some(v)) => v
+                .as_str()
+                .filter(|s| s.len() <= 65536)
+                .map(str::to_owned)
+                .ok_or_else(|| invalid(&format!("invalid {camel}"))),
+            (None, None) => Err(invalid(&format!("{camel} missing"))),
+        }
+    };
+    let thinq1 = object.contains_key("rtiServer") || object.contains_key("rti_server");
+    if object
+        .get("platform")
+        .is_some_and(|v| v.as_str() != Some(if thinq1 { "thinq1" } else { "thinq2" }))
+    {
+        return Err(invalid("platform contradicts the registration fields"));
+    }
+    if thinq1 {
+        return Ok(json!({
+            "platform": "thinq1",
+            "http_server": field("httpServer", "http_server")?,
+            "rti_server": field("rtiServer", "rti_server")?,
+        }));
+    }
+    let region = match field("countryCode", "country_code") {
+        Ok(region) => region,
+        Err(_) if !object.contains_key("countryCode") && !object.contains_key("country_code") => {
+            country
+                .ok_or_else(|| invalid("countryCode missing and no 0.1 account country"))?
+                .to_owned()
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(json!({
+        "platform": "thinq2",
+        "country": region,
+        "api_server": field("apiServer", "api_server")?,
+        "mqtt_server": field("mqttServer", "mqtt_server")?,
+        "ca_certificate": field("caCertificate", "ca_certificate")?,
+        "private_key": field("privateKey", "private_key")?,
+        "certificate": field("certificate", "certificate")?,
+        "pub_topic": field("pubTopic", "pub_topic")?,
+        "prov_topic": field("provTopic", "prov_topic")?,
+        "sub_topic": field("subTopic", "sub_topic")?,
+    }))
 }
 
 /// Assign fresh, deterministic incarnation identities to archived 0.1 devices.

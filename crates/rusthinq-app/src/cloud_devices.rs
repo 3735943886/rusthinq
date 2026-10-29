@@ -51,6 +51,7 @@ pub struct Pair {
 #[derive(Clone)]
 pub enum Operation {
     Pair(Pair),
+    /// `archive` is pairing material as `rusthinq-migrate` converts a 0.1 registration.
     Adopt {
         device: String,
         incarnation: u64,
@@ -252,15 +253,17 @@ impl Runtime {
                 }
                 let epoch = *self.account.cancellation().borrow();
                 let client = self.account.authenticated_client().map_err(|_| stale())?;
-                let country = client.country().to_owned();
                 let material = self
                     .storage(move |_| {
-                        Material::from_legacy_in_country(archive, &country).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "invalid archived pairing material",
-                            )
-                        })
+                        serde_json::from_value::<Material>(archive)
+                            .ok()
+                            .filter(|material| material.validate_stored().is_ok())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "invalid archived pairing material",
+                                )
+                            })
                     })
                     .await?;
                 if let Some(meta) = self.app.persisted_models().get(&device)

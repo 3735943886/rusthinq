@@ -961,7 +961,7 @@ migrate_legacy() {
         systemctl start "$SERVICE"
         if wait_running "${SERVICE}.service"; then
             ok "0.2 is running."
-            log "  Adopt archived LG registrations per device: rusthinqctl adopt <id>"
+            log "  Adopt archived LG registrations per device: rusthinqctl adopt <id> ${DATA_DIR}/legacy-cloud/device_<id>.json"
         else
             log "  Roll back: sudo systemctl stop ${SERVICE}, then start 0.1 again."
             exit 1
