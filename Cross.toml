@@ -1,0 +1,6 @@
+# Release builds link a prebuilt static OpenSSL (see .github/workflows/release.yml).
+# `volumes` mounts OPENSSL_DIR into the build container; `passthrough` also forwards its
+# value, which cross 0.2.5 does not set from `volumes` alone.
+[build.env]
+volumes = ["OPENSSL_DIR"]
+passthrough = ["OPENSSL_DIR", "OPENSSL_STATIC", "OPENSSL_NO_VENDOR"]

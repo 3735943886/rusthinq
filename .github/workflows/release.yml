@@ -7,9 +7,18 @@ on:
         description: "Release tag to create (e.g. v0.2.0 or v0.2.0-dev1)"
         required: true
         type: string
+      publish:
+        description: "Create the tag and release (off: build and check only)"
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Release binaries link this OpenSSL, built from source below, instead of openssl-src.
+  # Stay on the current LTS line; move to the next LTS when it is designated.
+  OPENSSL_VERSION: "3.5.9"
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
   # Release archives carry the daemon, the CLI (every tool is a subcommand) and
   # SoftAP setup. The daemon's default features (bridge, scripting, gui) are the full set.
   BUILD_ARGS: -p rusthinq-app --bin rusthinq -p rusthinq-tools --bin rusthinqctl --bin rusthinq-setup
@@ -43,6 +52,7 @@ jobs:
               raise SystemExit(f"Release tag {tag!r} must match workspace version v{version}")
           PYTHON
       - name: Reject an existing tag
+        if: inputs.publish
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
@@ -98,20 +108,84 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # The `openssl` dependency uses the `vendored` feature (builds
-      # OpenSSL from source and statically links it), so no system OpenSSL is
-      # needed anywhere below — only a working C toolchain for that target.
+      # OpenSSL is built from the pinned source and linked statically
+      # (OPENSSL_NO_VENDOR overrides the crates' `vendored` feature), so no
+      # system OpenSSL is needed anywhere below, only a C toolchain for the target.
       - name: Install musl-tools (native linux-amd64 build)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install NASM (needed by vendored OpenSSL's asm on Windows)
+      - name: Install NASM (needed by OpenSSL's asm on Windows)
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
       - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@cross
+
+      - name: Download OpenSSL source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/openssl-$OPENSSL_VERSION.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+          sum=$(command -v sha256sum >/dev/null && echo sha256sum || echo "shasum -a 256")
+          echo "$OPENSSL_SHA256  $tarball" | $sum -c -
+          echo "OPENSSL_TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      - name: Build OpenSSL
+        if: runner.os != 'Windows' && !matrix.cross
+        shell: bash
+        env:
+          CC: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'musl-gcc' || 'cc' }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/openssl"
+          scripts/build-openssl.sh ${{ matrix.target }} "$OPENSSL_TARBALL" "$prefix"
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+
+      # Built in the image `cross build` uses, with its cross compiler; Cross.toml
+      # mounts OPENSSL_DIR into the build container at the same path.
+      - name: Build OpenSSL (cross)
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/openssl"
+          version=$(cross --version | sed -n 's/^cross \([0-9.]*\).*/\1/p')
+          cc_var="CC_$(echo ${{ matrix.target }} | tr - _)"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w "$GITHUB_WORKSPACE" \
+            "ghcr.io/cross-rs/${{ matrix.target }}:$version" \
+            bash -c "CC=\"\$$cc_var\" scripts/build-openssl.sh ${{ matrix.target }} '$OPENSSL_TARBALL' '$prefix'"
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The options mirror scripts/build-openssl.sh and openssl-src's MSVC build.
+      # Strawberry Perl comes first on the pwsh PATH (see Build below).
+      - name: Build OpenSSL (MSVC)
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = "$env:RUNNER_TEMP/openssl-src"
+          $prefix = "$env:RUNNER_TEMP/openssl".Replace('\', '/')
+          New-Item -ItemType Directory -Force $work | Out-Null
+          tar -xzf $env:OPENSSL_TARBALL -C $work --strip-components=1
+          Push-Location $work
+          perl Configure VC-WIN64A no-shared no-module no-tests no-comp no-zlib no-zlib-dynamic `
+            --libdir=lib no-ssl3 no-md2 no-rc5 no-weak-ssl-ciphers no-camellia no-idea no-seed `
+            no-capieng "--prefix=$prefix" '--openssldir=SYS$MANAGER:[OPENSSL]'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          nmake build_libs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          nmake install_dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+          "OPENSSL_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build
         if: ${{ !matrix.cross }}
@@ -121,12 +195,25 @@ jobs:
         # Perl on PATH and break the Windows build.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "1"
         run: cargo build --release --target ${{ matrix.target }} ${{ env.BUILD_ARGS }}
 
       - name: Build (cross)
         if: matrix.cross
         shell: bash
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "1"
         run: cross build --release --target ${{ matrix.target }} ${{ env.BUILD_ARGS }}
+
+      - name: Check linked OpenSSL
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/rusthinq"
+          [ -f "$bin" ] || bin="$bin.exe"
+          grep -a -q "OpenSSL $OPENSSL_VERSION " "$bin" \
+            || { echo "rusthinq does not link OpenSSL $OPENSSL_VERSION" >&2; exit 1; }
 
       - name: Package
         env:
@@ -161,6 +248,7 @@ jobs:
   release:
     name: Publish release
     needs: build
+    if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
