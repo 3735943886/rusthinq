@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 rusthinq-task = { path = "../rusthinq-task" }
 rusthinq-driver-config = { path = "../rusthinq-driver-config" }
-rhai = { version = "=1.26.1", features = ["sync", "internals", "serde"] }
+rhai = { version = "=1.27.0", features = ["sync", "internals", "serde"] }
 tokio.workspace = true
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 serde_json.workspace = true
