@@ -51,7 +51,7 @@ pub struct Pair {
 #[derive(Clone)]
 pub enum Operation {
     Pair(Pair),
-    /// `archive` is pairing material as `rusthinq-migrate` converts a 0.1 registration.
+    /// `archive` is pairing material as `rusthinqctl migrate` converts a 0.1 registration.
     Adopt {
         device: String,
         incarnation: u64,

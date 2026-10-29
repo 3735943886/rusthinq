@@ -194,7 +194,7 @@ the checkout being tested without requiring a fixed scripts revision.
 
 ```sh
 # Run the device-driver compatibility suite from a separate scripts checkout
-rusthinq-script-test /path/to/rusthinq-scripts
+cargo run -p rusthinq-tools --bin rusthinq-script-test -- /path/to/rusthinq-scripts
 
 # Replay recorded receive packets through explicit management injection
 rusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok

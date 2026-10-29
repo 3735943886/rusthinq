@@ -49,11 +49,13 @@ SCRIPTS_GIT="https://github.com/${GH_OWNER}/${SCRIPTS_REPO}.git"
 SCRIPTS_TARBALL="https://github.com/${GH_OWNER}/${SCRIPTS_REPO}/archive/refs/heads/master.tar.gz"
 
 # Every executable of a release archive. Only the daemon and the CLI go on PATH;
-# the rest keep generic names (packet-parser, ...) under BIN_DIR.
-RELEASE_BINARIES="rusthinq rusthinqctl rusthinq-setup rusthinq-migrate rusthinq-mcp
-rusthinq-capture rusthinq-retained-gc rusthinq-script-test packet-parser packet-sender
-lgcloud-monitor"
+# rusthinq-setup stays under BIN_DIR.
+RELEASE_BINARIES="rusthinq rusthinqctl rusthinq-setup"
 LINKED_BINARIES="rusthinq rusthinqctl"
+# Tools of releases up to 0.2.0-rc5, now rusthinqctl subcommands. Installing removes
+# them; backups keep them, so a rollback restores the release that had them.
+OBSOLETE_BINARIES="rusthinq-migrate rusthinq-mcp rusthinq-capture rusthinq-retained-gc
+rusthinq-script-test packet-parser packet-sender lgcloud-monitor"
 
 ASSUME_YES=0
 PRERELEASE=0
@@ -569,6 +571,9 @@ install_binaries() {
         [ ! -e "${dest}/${bin}" ] || chown --reference="${dest}/${bin}" "${dest}/.${bin}.thinqctl-new"
         mv -f "${dest}/.${bin}.thinqctl-new" "${dest}/${bin}"
     done
+    for bin in $OBSOLETE_BINARIES; do
+        rm -f "${dest}/${bin}"
+    done
 }
 
 link_binaries() {
@@ -592,7 +597,7 @@ backup_binaries() {
     local dir="$1" version="$2" bin
     rm -rf "$BACKUP_DIR"
     install -d -m 755 "$BACKUP_DIR"
-    for bin in $RELEASE_BINARIES; do
+    for bin in $RELEASE_BINARIES $OBSOLETE_BINARIES; do
         [ ! -e "${dir}/${bin}" ] || cp -p "${dir}/${bin}" "${BACKUP_DIR}/${bin}"
     done
     printf '%s\n' "$dir" > "${BACKUP_DIR}/.dir"
@@ -930,8 +935,8 @@ migrate_legacy() {
     link_binaries
     ensure_user
 
-    report="$("${BIN_DIR}/rusthinq-migrate" "$L_CONFIG" "$DATA_DIR")" \
-        || die "rusthinq-migrate failed; nothing of 0.1 was changed."
+    report="$("${BIN_DIR}/rusthinqctl" migrate "$L_CONFIG" "$DATA_DIR")" \
+        || die "rusthinqctl migrate failed; nothing of 0.1 was changed."
     printf '%s\n' "$report"
     chown -R "${SVC_USER}:${SVC_USER}" "$DATA_DIR"
     chmod 750 "$DATA_DIR"
@@ -1309,7 +1314,7 @@ cmd_rollback() {
         was_active=1
         systemctl stop "$I_UNIT"
     fi
-    for bin in $RELEASE_BINARIES; do
+    for bin in $RELEASE_BINARIES $OBSOLETE_BINARIES; do
         [ -e "${BACKUP_DIR}/${bin}" ] || continue
         cp -p "${BACKUP_DIR}/${bin}" "${dir}/.${bin}.thinqctl-new"
         mv -f "${dir}/.${bin}.thinqctl-new" "${dir}/${bin}"

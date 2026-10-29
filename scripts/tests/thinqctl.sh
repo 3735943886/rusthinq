@@ -14,8 +14,7 @@ export THINQCTL_SCRIPT="$script_dir/thinqctl.sh" TEST_DIR="$test_dir"
 make_release() {
     local version="${1#v}" name="rusthinq-$1-linux-amd64" bin
     mkdir -p "$test_dir/build/$name" "$test_dir/assets"
-    for bin in rusthinq rusthinqctl rusthinq-setup rusthinq-migrate rusthinq-mcp rusthinq-capture \
-        rusthinq-retained-gc rusthinq-script-test packet-parser packet-sender lgcloud-monitor; do
+    for bin in rusthinq rusthinqctl rusthinq-setup; do
         printf '#!/bin/sh\n[ "$1" = --version ] && echo "rusthinq %s"\n' "$version" > "$test_dir/build/$name/$bin"
         chmod +x "$test_dir/build/$name/$bin"
     done
@@ -250,6 +249,8 @@ adopted="$test_dir/adopted"
 rm -rf "$adopted"; mkdir -p "$adopted/bin"
 printf '#!/bin/sh\n[ "$1" = --version ] && echo "rusthinq 0.2.0"\n' > "$adopted/bin/rusthinq"
 cp "$adopted/bin/rusthinq" "$adopted/bin/rusthinqctl"
+# A tool of releases up to 0.2.0-rc5, now a rusthinqctl subcommand.
+cp "$adopted/bin/rusthinq" "$adopted/bin/rusthinq-mcp"
 chmod +x "$adopted/bin/"*
 export FAKE_PID=4242 FAKE_EXE="$adopted/bin/rusthinq" FAKE_CONFIG=config.toml FAKE_CWD="$adopted"
 export FAKE_CGROUP=0::/system.slice/thinq.service
@@ -278,7 +279,7 @@ wait thinq.service"
 [ "$(cat "$test_dir/events")" = "$expected" ] || { cat "$test_dir/events" >&2; exit 1; }
 [ "$("$adopted/bin/rusthinq" --version)" = "rusthinq 0.2.1" ]
 [ "$("$adopted/bin/rusthinqctl" --version)" = "rusthinq 0.2.1" ]
-[ ! -e "$adopted/bin/packet-parser" ]
+[ ! -e "$adopted/bin/packet-parser" ] && [ ! -e "$adopted/bin/rusthinq-mcp" ]
 [ ! -e "$root/opt/rusthinq" ]
 assert_file_has "$root/etc/thinqctl.conf" 'VERSION=0.2.1'
 [ "$(cat "$root/var/lib/thinqctl/previous/.version")" = 0.2.0 ]
@@ -287,6 +288,7 @@ run rollback --yes
 assert_event 'systemctl stop thinq.service'
 assert_event 'systemctl start thinq.service'
 [ "$("$adopted/bin/rusthinq" --version)" = "rusthinq 0.2.0" ]
+[ "$("$adopted/bin/rusthinq-mcp" --version)" = "rusthinq 0.2.0" ]
 assert_file_has "$root/etc/thinqctl.conf" 'VERSION=0.2.0'
 
 # A failed download leaves the service alone.

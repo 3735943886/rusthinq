@@ -10,13 +10,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Release archives carry the daemon and the consolidated tool suite. The
-  # daemon's default features (bridge, scripting, gui) are the full set.
-  BUILD_ARGS: -p rusthinq-app --bin rusthinq -p rusthinq-tools --bins
-  BINARIES: >-
-    rusthinq rusthinqctl rusthinq-setup rusthinq-migrate rusthinq-mcp
-    rusthinq-capture rusthinq-retained-gc rusthinq-script-test
-    packet-parser packet-sender lgcloud-monitor
+  # Release archives carry the daemon, the CLI (every tool is a subcommand) and
+  # SoftAP setup. The daemon's default features (bridge, scripting, gui) are the full set.
+  BUILD_ARGS: -p rusthinq-app --bin rusthinq -p rusthinq-tools --bin rusthinqctl --bin rusthinq-setup
+  BINARIES: rusthinq rusthinqctl rusthinq-setup
 
 concurrency:
   group: release-${{ inputs.tag }}

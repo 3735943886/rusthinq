@@ -465,7 +465,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
         .get("mqtt")
         .is_some_and(|m| m.get("raw_prefix").is_some() || m.get("raw").is_some())
     {
-        warnings.push("0.1 MQTT raw observation streams (raw/rx, raw/tx, clip, lg) are retired; use the management device monitor or rusthinq-capture. Raw injection, if 0.1 enabled it, moves to the $raw/{inject,emit}/set routes.".to_owned());
+        warnings.push("0.1 MQTT raw observation streams (raw/rx, raw/tx, clip, lg) are retired; use the management device monitor or rusthinqctl capture. Raw injection, if 0.1 enabled it, moves to the $raw/{inject,emit}/set routes.".to_owned());
     }
     if legacy.get("log").is_some() {
         warnings.push("0.1 log categories are not migrated; 0.2 writes application events to stderr without categories.".to_owned());

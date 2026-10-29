@@ -111,7 +111,7 @@ async fn dispatch_inner(
     }
     let result: io::Result<Value> = match request["method"].as_str() {
         Some("initialize") => Ok(
-            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"rusthinq-mcp","version":env!("CARGO_PKG_VERSION")}}),
+            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"rusthinqctl","version":env!("CARGO_PKG_VERSION")}}),
         ),
         Some("ping") => Ok(json!({})),
         Some("tools/list") => Ok(json!({"tools":tools()})),

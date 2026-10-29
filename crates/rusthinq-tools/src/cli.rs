@@ -13,11 +13,11 @@ rusthinqctl raw-inject on|off|status
 rusthinqctl retained-delete JSON
 rusthinqctl capture DEVICE OUTPUT.jsonl [--cloud]
 rusthinqctl replay DEVICE CAPTURE.jsonl --inject-ok
-packet-parser [-message|-message-raw] HEX
-packet-sender DEVICE HEX --inject-ok [--from-device]
-rusthinq-capture DEVICE OUTPUT.jsonl [--cloud]
-lgcloud-monitor [--inventory]
 rusthinqctl cloud-watch
+Offline, without a daemon:
+rusthinqctl decode [--message-raw] HEX
+rusthinqctl migrate CONFIG_0.1 DESTINATION_DIRECTORY
+rusthinqctl mcp
 RUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication.";
 
 fn required(args: &[String], index: usize) -> io::Result<&str> {
@@ -62,13 +62,7 @@ async fn archive(path: &str, id: &str) -> io::Result<Value> {
 }
 
 pub async fn run(args: Vec<String>) -> io::Result<()> {
-    let mut arguments = args.into_iter();
-    let executable = arguments.next().unwrap_or_default();
-    let name = Path::new(&executable)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("rusthinqctl");
-    let mut args: Vec<_> = arguments.collect();
+    let args: Vec<_> = args.into_iter().skip(1).collect();
     if args
         .first()
         .is_some_and(|arg| arg == "--help" || arg == "-h")
@@ -77,29 +71,24 @@ pub async fn run(args: Vec<String>) -> io::Result<()> {
         println!("{HELP}");
         return Ok(());
     }
-    match name {
-        "packet-parser" => {
-            let raw = args.first().is_some_and(|arg| arg == "-message-raw");
-            if args.first().is_some_and(|arg| arg.starts_with('-')) {
-                args.remove(0);
-            }
-            let text = args.join("");
+    match args[0].as_str() {
+        "decode" => {
+            // A raw message has no AABB header; the decoder expects its four hex digits.
+            let raw = args.get(1).is_some_and(|arg| arg == "--message-raw");
+            let text = args[if raw { 2 } else { 1 }..].join("");
             let text = if raw { format!("0000{text}") } else { text };
             println!("{}", crate::decode(&json!({"hex":text}))?);
             return Ok(());
         }
-        "packet-sender" => args.insert(0, "inject".into()),
-        "lgcloud-monitor" => args.insert(
-            0,
-            if has_flag(&args, "--inventory") {
-                "cloud-inventory"
-            } else {
-                "cloud-watch"
-            }
-            .into(),
-        ),
-        "rusthinq-capture" => args.insert(0, "capture".into()),
-        "rusthinq-retained-gc" => args.insert(0, "retained-delete".into()),
+        "migrate" => {
+            let report = crate::migration::migrate(
+                Path::new(required(&args, 1)?),
+                Path::new(required(&args, 2)?),
+            )?;
+            println!("{report}");
+            return Ok(());
+        }
+        "mcp" => return crate::mcp::run().await,
         _ => {}
     }
     let client = Client::environment()?;
