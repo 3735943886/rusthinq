@@ -350,7 +350,7 @@ impl Renewal {
     /// one refusal does not end the account until someone logs in again. Local errors stop.
     fn failed(&mut self, error: &Error) {
         let (delay, cap) = match error {
-            Error::Remote(_) => (self.delay, RETRY_CAP),
+            Error::Remote(_) => (self.delay.min(RETRY_CAP), RETRY_CAP),
             Error::Authentication(_) | Error::Rejected(_) => (
                 self.delay.max(RETRY_CAP),
                 self.period
@@ -637,6 +637,12 @@ mod tests {
         assert_eq!(
             renewal.next,
             Some(now + std::time::Duration::from_secs(3600))
+        );
+        // A network failure after refusals retries within RETRY_CAP again.
+        renewal.failed(&remote());
+        assert_eq!(
+            renewal.next,
+            Some(now + std::time::Duration::from_secs(300))
         );
         renewal.failed(&Error::Storage);
         assert!(renewal.next.is_none());

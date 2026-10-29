@@ -656,6 +656,8 @@ impl Runtime {
         }
         let mut device_states = self.app.state_changes();
         let mut accounts = self.account.clients();
+        let mut account_status = self.account.status_updates();
+        let mut account_status_open = true;
         let mut account_error = None;
         let mut empty_inventory = None;
         let mut reconcile_at = tokio::time::Instant::now();
@@ -668,17 +670,23 @@ impl Runtime {
                 changed=accounts.changed()=>{
                     if changed.is_err() { break; }
                     accounts.borrow_and_update();
-                    // The account error carries LG's answer; log each change once.
-                    let status = self.account.status();
-                    if status.error != account_error {
+                    empty_inventory = None;
+                    reconcile_at = tokio::time::Instant::now();
+                    continue;
+                },
+                changed=account_status.changed(),if account_status_open=>{
+                    // A stopped account runtime only ends its log, not the bridges.
+                    if changed.is_err() { account_status_open = false; continue; }
+                    // The account error carries LG's answer; log each change once. An attempt
+                    // in progress publishes no error, which is not a recovery.
+                    let status = account_status.borrow_and_update().clone();
+                    if !status.busy && status.error != account_error {
                         match &status.error {
                             Some(error) => tracing::warn!(%error, logged_in = status.logged_in, "cloud account failed"),
                             None => tracing::info!(logged_in = status.logged_in, "cloud account recovered"),
                         }
                         account_error = status.error;
                     }
-                    empty_inventory = None;
-                    reconcile_at = tokio::time::Instant::now();
                     continue;
                 },
                 changed=device_states.changed()=>{if changed.is_err(){break;} continue;},
