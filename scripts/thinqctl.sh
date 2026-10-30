@@ -272,8 +272,9 @@ binary_version() {
     local bin
     bin="$(realpath -e -- "$1" 2>/dev/null)" || return 0
     [[ -f "$bin" && -x "$bin" ]] || return 0
-    if [ "$(id -u)" -eq 0 ]; then
-        root_trusted_path "$bin" || return 0
+    if [ "$(id -u)" -eq 0 ] && ! root_trusted_path "$bin"; then
+        warn "Not running ${bin} as root: other users can write to its path; its version is unknown."
+        return 0
     fi
     "$bin" --version 2>/dev/null | awk '$1 == "rusthinq" { print $2 }' || true
 }

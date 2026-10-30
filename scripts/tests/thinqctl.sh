@@ -6,7 +6,18 @@
 # shellcheck disable=SC2016,SC2030,SC2031
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-test_dir=$(mktemp -d)
+# As root, thinqctl runs a binary only from a path no other user can write to, and
+# the adopted fake below must be one. /tmp is not, so pick a parent that is.
+test_parent="${TMPDIR:-/tmp}"
+if [ "$(id -u)" -eq 0 ]; then
+    for test_parent in "$test_parent" "$HOME" /var/lib; do
+        # shellcheck source=/dev/null
+        (source "$script_dir/thinqctl.sh" && root_trusted_path "$test_parent") && break
+        test_parent=
+    done
+    [ -n "$test_parent" ] || { echo "No root-owned, write-protected parent for test files; set TMPDIR." >&2; exit 1; }
+fi
+test_dir=$(mktemp -d -p "$test_parent")
 trap 'rm -rf -- "$test_dir"' EXIT
 export THINQCTL_SCRIPT="$script_dir/thinqctl.sh" TEST_DIR="$test_dir"
 
