@@ -12,6 +12,7 @@ tokio.workspace = true
 rusthinq-protocol = { path = "../rusthinq-protocol" }
 serde_json.workspace = true
 base64 = "0.23"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -191,8 +191,17 @@ impl Handle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .filter(|(s, g, _)| *s == session && *g == generation)
-            .map(|(_, _, r)| *r)
+            .filter(|loaded| loaded.session == session && loaded.generation == generation)
+            .map(|loaded| loaded.revision)
+    }
+    /// The driver bundle behind each device's current script generation.
+    #[cfg(feature = "scripting")]
+    pub fn loaded_drivers(&self) -> BTreeMap<String, super::LoadedDriver> {
+        self.0
+            .driver_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     pub fn script_states(&self) -> BTreeMap<String, (SessionKey, u64, bool)> {
         self.0

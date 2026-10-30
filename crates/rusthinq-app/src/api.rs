@@ -231,11 +231,12 @@ impl From<crate::cloud_account::Error> for CloudError {
             E::Stopped => Self::Stopped,
             E::InvalidInput => Self::InvalidInput,
             E::Unavailable => Self::Unavailable,
-            E::Remote(_) => Self::Remote,
+            // `{ .. }` also matches the local-only build's unit variants.
+            E::Remote { .. } => Self::Remote,
             E::Storage => Self::Storage,
             E::Cancelled => Self::Cancelled,
-            E::Authentication(_) => Self::Authentication,
-            E::Rejected(_) => Self::Rejected,
+            E::Authentication { .. } => Self::Authentication,
+            E::Rejected { .. } => Self::Rejected,
         }
     }
 }
@@ -290,6 +291,12 @@ impl AppHandle {
     }
     pub fn script_states(&self) -> std::collections::BTreeMap<String, (SessionKey, u64, bool)> {
         self.0.script_states()
+    }
+    #[cfg(feature = "scripting")]
+    pub fn loaded_drivers(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::runtime::LoadedDriver> {
+        self.0.loaded_drivers()
     }
     pub fn persisted_models(
         &self,
