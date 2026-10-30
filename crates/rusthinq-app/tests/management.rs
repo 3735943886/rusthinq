@@ -468,6 +468,35 @@ async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_wi
     })
     .await;
     assert!(handle.script_states()["d"].2);
+    // The running driver names its file and content; a failed reload keeps it.
+    let get = |path: &'static str| {
+        let router = router.clone();
+        async move {
+            let response = router
+                .oneshot(request(path, "GET", json!({})))
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 65536).await.unwrap())
+                .unwrap()
+        }
+    };
+    let sha256 = |text: &str| {
+        openssl::sha::sha256(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let loaded = get("/api/devices").await["devices"]["d"]["driver"].clone();
+    assert_eq!(loaded["file"], "model.rhai");
+    assert_eq!(loaded["sha256"], sha256(original));
+    assert_eq!(loaded["modules"], json!([]));
+    assert_eq!(
+        loaded["digest"],
+        sha256(&format!("{}  model.rhai\n", sha256(original)))
+    );
+    let health = get("/api/health").await;
+    assert_eq!(health["drivers"]["watch"], false);
+    assert_eq!(health["drivers"]["source"], json!({"kind":"unknown"}));
     std::fs::write(&source, "fn broken(").unwrap();
     let response = router
         .clone()
@@ -477,6 +506,7 @@ async fn configured_driver_reload_preserves_failed_compile_and_recovers_fault_wi
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     until(&mut events, |event| matches!(event,Event::Rejected {reason,..} if reason.contains("driver reload preparation"))).await;
     assert_eq!(handle.script_states()["d"], (session, 1, true));
+    assert_eq!(get("/api/devices").await["devices"]["d"]["driver"], loaded);
     std::fs::write(&source, original).unwrap();
     let response = router
         .clone()

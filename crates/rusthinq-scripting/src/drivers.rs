@@ -47,6 +47,15 @@ enum Kind {
 }
 
 fn read(root: &Path, name: &str, kind: Kind, max_source: usize) -> io::Result<String> {
+    read_located(root, name, kind, max_source).map(|(_, source)| source)
+}
+/// The source and where it was found, relative to the root.
+fn read_located(
+    root: &Path,
+    name: &str,
+    kind: Kind,
+    max_source: usize,
+) -> io::Result<(PathBuf, String)> {
     let (valid, subdirectory) = match kind {
         Kind::Driver => (self::model(name), "drivers"),
         Kind::Module => (self::name(name), "modules"),
@@ -65,7 +74,7 @@ fn read(root: &Path, name: &str, kind: Kind, max_source: usize) -> io::Result<St
         ));
     }
     let mut bytes = Vec::new();
-    File::open(path)?
+    File::open(&path)?
         .take(max_source as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > max_source {
@@ -74,14 +83,19 @@ fn read(root: &Path, name: &str, kind: Kind, max_source: usize) -> io::Result<St
             "driver source exceeded",
         ));
     }
-    String::from_utf8(bytes).map_err(io::Error::other)
+    let source = String::from_utf8(bytes).map_err(io::Error::other)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(io::Error::other)?
+        .to_owned();
+    Ok((relative, source))
 }
 fn modules(
     root: &Path,
     source: &str,
     seen: &mut BTreeSet<String>,
     visiting: &mut BTreeSet<String>,
-    bundle: &mut Vec<Source>,
+    bundle: &mut Vec<(Source, PathBuf)>,
     total: &mut usize,
     max_source: usize,
 ) -> io::Result<()> {
@@ -121,7 +135,7 @@ fn modules(
                 "cyclic/oversized driver module bundle",
             ));
         }
-        let source = read(root, module, Kind::Module, max_source)?;
+        let (path, source) = read_located(root, module, Kind::Module, max_source)?;
         *total = total
             .checked_add(source.len() + module.len())
             .filter(|total| *total <= max_source)
@@ -131,10 +145,13 @@ fn modules(
         modules(root, &source, seen, visiting, bundle, total, max_source)?;
         visiting.remove(module);
         seen.insert(module.into());
-        bundle.push(Source {
-            name: module.into(),
-            source,
-        });
+        bundle.push((
+            Source {
+                name: module.into(),
+                source,
+            },
+            path,
+        ));
     }
     Ok(())
 }
@@ -184,6 +201,54 @@ fn fingerprint(model: &str, source: &str, bundle: &[Source]) -> u64 {
         module.source.hash(&mut hash);
     }
     hash.finish()
+}
+/// One file of a prepared bundle: its path relative to the driver directory and the
+/// SHA-256 of its content, as `sha256sum` prints it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceFile {
+    pub path: String,
+    pub sha256: String,
+}
+/// What a prepared driver was read from. `digest` is the SHA-256 of `sha256sum`'s output
+/// for the driver followed by its modules in path order, so from the driver directory
+/// `sha256sum DRIVER MODULES... | sha256sum` reproduces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub driver: SourceFile,
+    pub modules: Vec<SourceFile>,
+    pub digest: String,
+}
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+impl Identity {
+    fn new(driver: &Path, source: &str, bundle: &[Source], paths: &[PathBuf]) -> Self {
+        let file = |path: &Path, source: &str| SourceFile {
+            path: path.to_string_lossy().into_owned(),
+            sha256: sha256(source.as_bytes()),
+        };
+        let driver = file(driver, source);
+        let mut modules: Vec<_> = bundle
+            .iter()
+            .zip(paths)
+            .map(|(module, path)| file(path, &module.source))
+            .collect();
+        modules.sort_by(|a, b| a.path.cmp(&b.path));
+        let listing: String = std::iter::once(&driver)
+            .chain(&modules)
+            .map(|file| format!("{}  {}\n", file.sha256, file.path))
+            .collect();
+        let digest = sha256(listing.as_bytes());
+        Self {
+            driver,
+            modules,
+            digest,
+        }
+    }
 }
 impl Config {
     pub fn worker_config(&self) -> crate::worker::Config {
@@ -240,6 +305,7 @@ impl Config {
             &mut total,
             self.limits.source_bytes,
         )?;
+        let bundle: Vec<_> = bundle.into_iter().map(|(module, _)| module).collect();
         Ok(fingerprint(model, &source, &bundle))
     }
     pub fn prepare(
@@ -267,20 +333,21 @@ impl Config {
             .canonicalize()
             .map_err(|e| Error::Compile(e.to_string()))?;
         let model = self.bindings.get(id).map(String::as_str).unwrap_or(model);
-        let source = read(&root, model, Kind::Driver, self.limits.source_bytes)
+        let (path, source) = read_located(&root, model, Kind::Driver, self.limits.source_bytes)
             .map_err(|e| Error::Compile(e.to_string()))?;
-        let mut bundle = Vec::new();
+        let mut located = Vec::new();
         let mut total = source.len();
         modules(
             &root,
             &source,
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
-            &mut bundle,
+            &mut located,
             &mut total,
             self.limits.source_bytes,
         )
         .map_err(|e| Error::Compile(e.to_string()))?;
+        let (bundle, paths): (Vec<_>, Vec<_>) = located.into_iter().unzip();
         let mut ctx = context::Config::new(id.into(), model.into());
         if let Some((name, version)) = metadata {
             ctx.model_name = name.into();
@@ -353,8 +420,10 @@ impl Config {
         }
         entry.push_str("}\n");
         let revision = fingerprint(model, &source, &bundle);
+        let identity = Identity::new(&path, &source, &bundle, &paths);
         let mut compiled = compiled.with_entry(&entry)?.with_modules(bundle)?;
         compiled.driver_revision = Some(revision);
+        compiled.driver_identity = Some(std::sync::Arc::new(identity));
         Ok(compiled)
     }
 }
@@ -454,6 +523,49 @@ mod tests {
             "the root stays flat for both"
         );
         assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn identity_names_each_file_and_reproduces_with_sha256sum() {
+        let root = tempfile_dir("identity");
+        std::fs::create_dir_all(root.join("drivers")).unwrap();
+        std::fs::create_dir_all(root.join("modules")).unwrap();
+        std::fs::write(
+            root.join("drivers/M.rhai"),
+            "import \"z\" as z; import \"a\" as a;",
+        )
+        .unwrap();
+        std::fs::write(root.join("modules/z.rhai"), "fn z() {}").unwrap();
+        // A root file overrides the shipped module and is named as such.
+        std::fs::write(root.join("a.rhai"), "fn a() {}").unwrap();
+        let config = Config {
+            watch: false,
+            directory: root.clone(),
+            topic_prefix: "t".into(),
+            limits: Default::default(),
+            bindings: Default::default(),
+        };
+        let identity = config
+            .prepare("d", "M", true, true)
+            .unwrap()
+            .driver_identity()
+            .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(sha256(b""), empty);
+        assert_eq!(identity.driver.path, "drivers/M.rhai");
+        assert_eq!(
+            identity.driver.sha256,
+            sha256(b"import \"z\" as z; import \"a\" as a;")
+        );
+        let paths: Vec<_> = identity.modules.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["a.rhai", "modules/z.rhai"], "modules in path order");
+        assert_eq!(identity.modules[0].sha256, sha256(b"fn a() {}"));
+        let listing = format!(
+            "{}  drivers/M.rhai\n{}  a.rhai\n{}  modules/z.rhai\n",
+            identity.driver.sha256, identity.modules[0].sha256, identity.modules[1].sha256
+        );
+        assert_eq!(identity.digest, sha256(listing.as_bytes()));
     }
 
     fn tempfile_dir(tag: &str) -> PathBuf {

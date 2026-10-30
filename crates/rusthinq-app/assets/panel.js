@@ -4,7 +4,8 @@
   let snapshot = { devices: {}, features: {} },
     connected = false,
     received = false,
-    diagnostics = {};
+    diagnostics = {},
+    drivers;
   let account = { enabled: false, account: {} },
     filter = "all",
     selected = null,
@@ -160,7 +161,36 @@
     renderAccount();
     if (up) invalidatePresentation();
   }
+  function driverSource(source) {
+    const commit = (source?.commit || "").slice(0, 7);
+    if (source?.kind === "git")
+      return commit
+        ? `Git ${commit}${source.branch ? ` (${source.branch})` : ""}`
+        : "Git (commit unresolved)";
+    if (source?.kind === "archive") return `Archive ${commit}, ${source.date}`;
+    return "Unknown";
+  }
+  function renderDrivers() {
+    if (drivers === undefined) return;
+    const devices = Object.values(snapshot.devices),
+      faulted = devices.filter((d) => d.scriptFaulted).length;
+    detailRows(
+      $("driver-details"),
+      drivers
+        ? [
+            ["Directory", drivers.directory, true],
+            ["Source", driverSource(drivers.source)],
+            ["Watch", drivers.watch ? "On" : "Off"],
+            [
+              "Loaded",
+              `${devices.filter((d) => d.driver).length}${faulted ? ` (${faulted} faulted)` : ""}`,
+            ],
+          ]
+        : [["Status", "Not configured"]],
+    );
+  }
   function renderDevices() {
+    renderDrivers();
     const entries = Object.entries(snapshot.devices);
     $("nav-count").textContent = entries.length;
     $("stat-total").textContent = entries.length;
@@ -355,6 +385,13 @@
             ? "Ready"
             : "Not attached",
       ],
+      ...(device?.driver
+        ? [
+            ["Driver file", device.driver.file, true],
+            ["Driver hash", device.driver.digest.slice(0, 12), true],
+            ["Driver loaded", relative(device.driver.loadedUnix)],
+          ]
+        : []),
       [
         "Cloud",
         device?.bridged
@@ -485,6 +522,14 @@
           ? new Date(signals.lastSentMs).toLocaleString()
           : "—",
       ],
+      // Each file as `sha256sum` prints it, so it can be compared on the host.
+      ...(device?.driver
+        ? [device.driver, ...device.driver.modules].map((file, index) => [
+            index ? "Module" : "Driver",
+            `${file.sha256}  ${file.path ?? file.file}`,
+            true,
+          ])
+        : []),
     ]);
     $("device-actions").replaceChildren(...actions);
     controls.fence(blocked || !device?.online || !!device?.scriptFaulted);
@@ -618,6 +663,8 @@
       if (results[2].status === "fulfilled") {
         const health = results[2].value;
         diagnostics = health.diagnostics || {};
+        drivers = health.drivers;
+        renderDrivers();
         renderDetail();
         detailRows($("runtime-details"), [
           ["Status", health.running ? "Running" : "Stopped"],

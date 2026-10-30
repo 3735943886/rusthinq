@@ -100,6 +100,7 @@ impl Buffer {
 }
 pub struct Compiled {
     pub(crate) driver_revision: Option<u64>,
+    pub(crate) driver_identity: Option<Arc<drivers::Identity>>,
     support_ast: Option<AST>,
     invocation_ast: Option<AST>,
     source_bytes: usize,
@@ -114,6 +115,10 @@ impl Compiled {
     /// Fingerprint of the exact driver/module bundle used to compile this instance.
     pub fn driver_revision(&self) -> Option<u64> {
         self.driver_revision
+    }
+    /// The files that bundle was read from, for display.
+    pub fn driver_identity(&self) -> Option<Arc<drivers::Identity>> {
+        self.driver_identity.clone()
     }
 
     /// Opt into callbacks taking `(ctx, text)`. Only opaque primitives are installed:
@@ -405,6 +410,7 @@ impl Compiled {
             .map_err(|error| Error::Compile(error.to_string()))?;
         Ok(Self {
             driver_revision: None,
+            driver_identity: None,
             support_ast: None,
             invocation_ast: None,
             source_bytes: source.len(),

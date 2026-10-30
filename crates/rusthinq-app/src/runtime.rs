@@ -130,7 +130,7 @@ struct Shared {
     message_seed: u64,
     driver_models: Mutex<BTreeMap<String, (SessionKey, String, bool)>>,
     #[cfg(feature = "scripting")]
-    driver_revisions: Mutex<BTreeMap<String, (SessionKey, u64, u64)>>,
+    driver_revisions: Mutex<BTreeMap<String, LoadedDriver>>,
     script_states: Mutex<BTreeMap<String, (SessionKey, u64, bool)>>,
     #[cfg(feature = "scripting")]
     scripts: mpsc::Sender<ScriptCommand>,
@@ -144,21 +144,46 @@ struct Shared {
     attach: mpsc::Sender<AttachCleanup>,
     cleanup_status: watch::Sender<CleanupStatus>,
 }
+/// The driver bundle a device's current script generation was built from.
+#[cfg(feature = "scripting")]
+#[derive(Clone)]
+pub struct LoadedDriver {
+    pub session: SessionKey,
+    pub generation: u64,
+    pub revision: u64,
+    pub identity: Option<Arc<rusthinq_scripting::drivers::Identity>>,
+    pub loaded_unix: u64,
+}
+/// What `Shared::driver_revision` records from a compiled driver before it is moved.
+#[cfg(feature = "scripting")]
+type Revision = Option<(u64, Option<Arc<rusthinq_scripting::drivers::Identity>>)>;
+#[cfg(feature = "scripting")]
+fn revision(compiled: &rusthinq_scripting::Compiled) -> Revision {
+    compiled
+        .driver_revision()
+        .map(|revision| (revision, compiled.driver_identity()))
+}
 impl Shared {
     #[cfg(feature = "scripting")]
-    fn driver_revision(
-        &self,
-        id: &str,
-        session: SessionKey,
-        generation: u64,
-        revision: Option<u64>,
-    ) {
+    fn driver_revision(&self, id: &str, session: SessionKey, generation: u64, revision: Revision) {
         let mut revisions = self
             .driver_revisions
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(revision) = revision {
-            revisions.insert(id.to_owned(), (session, generation, revision));
+        if let Some((revision, identity)) = revision {
+            let loaded_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            revisions.insert(
+                id.to_owned(),
+                LoadedDriver {
+                    session,
+                    generation,
+                    revision,
+                    identity,
+                    loaded_unix,
+                },
+            );
         } else {
             revisions.remove(id);
         }

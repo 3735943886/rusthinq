@@ -571,7 +571,7 @@ async fn presentation(
 }
 async fn diagnostics(State(app): State<App>) -> Json<Value> {
     Json(
-        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":app.handle.diagnostics(),"devices":snapshot(&app.handle,&app.names)["devices"],"cloud":{"enabled":app.handle.cloud_status()["enabled"],"loggedIn":app.handle.cloud_status()["account"]["loggedIn"]},"notifications":app.observer.snapshot(0,0,None),"mqtt":app.handle.external_mqtt().map(|m|json!({"status":format!("{:?}",*m.status().borrow()),"droppedTransient":m.dropped_transient()})),"privacy":"No credentials, certificates or wire payloads are included."}),
+        json!({"version":env!("CARGO_PKG_VERSION"),"runtime":app.handle.diagnostics(),"devices":snapshot(&app.handle,&app.names)["devices"],"drivers":drivers_status(&app.handle),"cloud":{"enabled":app.handle.cloud_status()["enabled"],"loggedIn":app.handle.cloud_status()["account"]["loggedIn"]},"notifications":app.observer.snapshot(0,0,None),"mqtt":app.handle.external_mqtt().map(|m|json!({"status":format!("{:?}",*m.status().borrow()),"droppedTransient":m.dropped_transient()})),"privacy":"No credentials, certificates or wire payloads are included."}),
     )
 }
 #[derive(Default, Deserialize)]
@@ -674,7 +674,7 @@ async fn notification_socket(
 }
 async fn health(State(app): State<App>) -> Json<Value> {
     Json(
-        json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow()),"diagnostics":app.handle.diagnostics()}),
+        json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"retainedCleanup":format!("{:?}", &*app.handle.cleanup_status().borrow()),"diagnostics":app.handle.diagnostics(),"drivers":drivers_status(&app.handle)}),
     )
 }
 /// Device state and account changes only request reads; one owner performs LG I/O.
@@ -768,6 +768,31 @@ async fn refresh_names(handle: Handle, names: Names, mut stop: watch::Receiver<b
     }
 }
 
+/// The files behind each device's running driver, keyed by device.
+#[cfg(feature = "scripting")]
+fn loaded_drivers(handle: &Handle) -> std::collections::BTreeMap<String, (SessionKey, u64, Value)> {
+    let file = |file: &rusthinq_scripting::drivers::SourceFile| json!({"path":file.path,"sha256":file.sha256});
+    handle
+        .loaded_drivers()
+        .into_iter()
+        .map(|(id, loaded)| {
+            let identity = loaded.identity.as_deref().map(|identity| {
+                json!({"file":identity.driver.path,"sha256":identity.driver.sha256,"digest":identity.digest,"modules":identity.modules.iter().map(file).collect::<Vec<_>>(),"loadedUnix":loaded.loaded_unix})
+            });
+            (id, (loaded.session, loaded.generation, identity.unwrap_or(Value::Null)))
+        })
+        .collect()
+}
+#[cfg(not(feature = "scripting"))]
+fn loaded_drivers(_: &Handle) -> std::collections::BTreeMap<String, (SessionKey, u64, Value)> {
+    std::collections::BTreeMap::new()
+}
+/// The configured driver directory and where its files came from.
+fn drivers_status(handle: &Handle) -> Value {
+    handle.driver_config().map_or(Value::Null, |config| {
+        json!({"directory":config.directory,"watch":config.watch,"source":crate::driver_source::describe(&config.directory)})
+    })
+}
 fn snapshot(handle: &Handle, names: &Names) -> Value {
     let names = names.lock().clone();
     let metadata = handle.metadata_snapshot();
@@ -775,6 +800,7 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
     let persisted_models = handle.persisted_models();
     let states = handle.script_states();
     let cloud = handle.cloud_devices();
+    let drivers = loaded_drivers(handle);
     let mut devices = serde_json::Map::new();
     for device in handle.snapshot() {
         let meta = metadata
@@ -787,6 +813,13 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
         let script = states
             .get(&device.entry.id)
             .filter(|(session, _, _)| Some(*session) == device.session);
+        let driver = drivers
+            .get(&device.entry.id)
+            .filter(|(session, generation, _)| {
+                script
+                    .is_some_and(|(current, script, _)| current == session && script == generation)
+            })
+            .map_or(&Value::Null, |(_, _, driver)| driver);
         let bridge = cloud["devices"].as_array().and_then(|ds| {
             ds.iter().find(|d| {
                 d["device"] == device.entry.id
@@ -810,7 +843,7 @@ fn snapshot(handle: &Handle, names: &Names) -> Value {
                 "deviceType":meta.map(|m|m.device_type.as_str()).filter(|v| !v.is_empty()).or_else(||saved.map(|m|m.device_type.as_str())),
                 "platform":model.map(|(_,_,t2)|if *t2 {"ThinQ2"} else {"ThinQ1"}).unwrap_or(if meta.is_some() {"ThinQ1"} else {""}),
                 "modelPersisted":persisted_models.get(&device.entry.id).is_some_and(|persisted|persisted.incarnation==device.entry.incarnation && model.is_some_and(|(_,name,t2)|(if persisted.model_id.is_empty(){&persisted.model_name}else{&persisted.model_id})==name && persisted.thinq2==*t2)),
-                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some() && (!handle.driver_watch() || script.is_some_and(|(_,_,faulted)|*faulted)),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
+                "driverReloadable":handle.driver_reload_configured() && script.is_some() && model.is_some() && (!handle.driver_watch() || script.is_some_and(|(_,_,faulted)|*faulted)),"mapped":script.is_some(),"scriptGeneration":script.map(|(_,generation,_)|generation.to_string()),"scriptFaulted":script.is_some_and(|(_,_,faulted)|*faulted),"driver":driver,"bridgePaired":bridge.is_some_and(|b|b["paired"]==true),"bridgeEnabled":bridge.is_some_and(|b|b["enabled"]==true),"bridged":bridge.is_some_and(|b|b["connected"]==true),"bridgePending":bridge.is_some_and(|b|b["paired"]==false),"bridgeError":bridge.map(|b|b["error"].clone()),
                 "removal":device.removal.map(|r|format!("{r:?}")),
                 "name":names.get(&device.entry.id)
             }),

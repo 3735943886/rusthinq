@@ -292,6 +292,12 @@ impl AppHandle {
     pub fn script_states(&self) -> std::collections::BTreeMap<String, (SessionKey, u64, bool)> {
         self.0.script_states()
     }
+    #[cfg(feature = "scripting")]
+    pub fn loaded_drivers(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::runtime::LoadedDriver> {
+        self.0.loaded_drivers()
+    }
     pub fn persisted_models(
         &self,
     ) -> std::collections::BTreeMap<String, crate::lifecycle_storage::DeviceMetadata> {

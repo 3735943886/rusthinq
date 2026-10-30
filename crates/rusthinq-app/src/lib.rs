@@ -34,6 +34,7 @@ pub mod scripts {
 }
 
 pub mod driver_config;
+pub(crate) mod driver_source;
 #[cfg(not(feature = "scripting"))]
 pub mod drivers {
     pub use crate::driver_config::Config;

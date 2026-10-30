@@ -333,7 +333,7 @@ impl Runtime {
         request
             .compiled
             .set_consumer_enabled(self.script_sink.is_some());
-        let revision = request.compiled.driver_revision();
+        let revision = super::revision(&request.compiled);
         let result = if stopped {
             Err(rusthinq_scripting::Error::Stopped)
         } else if let Some(owner) = self.scripts.as_mut() {
@@ -400,7 +400,7 @@ impl Runtime {
                     && device.session == Some(request.session)
                     && device.removal.is_none()
             });
-            let revision = request.compiled.driver_revision();
+            let revision = super::revision(&request.compiled);
             let result = if !current {
                 Err(rusthinq_scripting::Error::Stale)
             } else if request.initialize
@@ -612,9 +612,9 @@ impl Runtime {
             .driver_revisions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|id, (session, _, _)| {
+            .retain(|id, loaded| {
                 devices.iter().any(|d| {
-                    d.entry.id == *id && d.session == Some(*session) && d.removal.is_none()
+                    d.entry.id == *id && d.session == Some(loaded.session) && d.removal.is_none()
                 })
             });
         self.script_callbacks.retain(|id, _| {
@@ -648,7 +648,7 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                     $runtime.reconcile();
                     let current=$runtime.model.devices().iter().any(|d|d.entry.id==id && d.session==Some(session) && d.online && d.removal.is_none()) && $runtime.preparation_policy.is_current(&id,&session,&model);
                     if current {
-                        let revision = prepared.as_ref().ok().and_then(|compiled| compiled.driver_revision());
+                        let revision = prepared.as_ref().ok().and_then($crate::runtime::revision);
                         let result=match prepared {
                             Err(error)=>Err(error),
                             Ok(mut compiled)=>{
