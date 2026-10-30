@@ -18,7 +18,7 @@ Offline, without a daemon:
 rusthinqctl decode [--message-raw] HEX
 rusthinqctl migrate CONFIG_0.1 DESTINATION_DIRECTORY
 rusthinqctl mcp
-RUSTHINQ_API=http://127.0.0.1:8080/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication.";
+RUSTHINQ_API=http://127.0.0.1:44401/; RUSTHINQ_USER/RUSTHINQ_PASSWORD for authentication.";
 
 fn required(args: &[String], index: usize) -> io::Result<&str> {
     args.get(index).map(String::as_str).ok_or_else(|| {

@@ -186,7 +186,7 @@ pub fn migrate(source: &Path, destination: &Path) -> io::Result<Value> {
             .ok_or_else(|| invalid("advertise_requested_host must be boolean"))?,
     };
     // 0.1 always served the legacy RTL8711am TLS profile (TLS1.0+, SECLEVEL=0) to devices.
-    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","legacy_tls":true,"advertise_requested_host":advertise_requested_host,"management":{"bind":"127.0.0.1:8080","gui":true}});
+    let mut config = json!({"hostname":legacy.get("hostname").and_then(toml::Value::as_str).unwrap_or("rusthinq.lan"),"ca_key":absolute(base,legacy.get("ca_key_file").and_then(toml::Value::as_str).unwrap_or("ca.key")),"ca_certificate":absolute(base,legacy.get("ca_cert_file").and_then(toml::Value::as_str).unwrap_or("ca.cert")),"device_ledger":"devices.json","legacy_tls":true,"advertise_requested_host":advertise_requested_host,"management":{"bind":"127.0.0.1:44401","gui":true}});
     // Listeners keep 0.1's addresses; a port without `bind` stays unbound. As in 0.1,
     // `advertise` only reaches devices for HTTPS and MQTTS (`/route`).
     for (key, bind, advertise, default) in [

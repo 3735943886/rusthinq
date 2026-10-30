@@ -74,7 +74,7 @@ impl Client {
     }
     pub fn environment() -> io::Result<Self> {
         let endpoint =
-            std::env::var("RUSTHINQ_API").unwrap_or_else(|_| "http://127.0.0.1:8080/".into());
+            std::env::var("RUSTHINQ_API").unwrap_or_else(|_| "http://127.0.0.1:44401/".into());
         Self::new(
             &endpoint,
             std::env::var("RUSTHINQ_USER").ok().as_deref(),
