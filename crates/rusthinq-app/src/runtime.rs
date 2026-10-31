@@ -1579,9 +1579,8 @@ impl Runtime {
                                 && let Some(model)=deploy["kind"].as_str() {
                                 self.stage_model(&id.device,session,model,true);
                                 if let Some(record) = self.pending_metadata.get_mut(&id.device) {
-                                    for (field, destination) in [("modelName", &mut record.model_name), ("softVer", &mut record.sw_version), ("DeviceType", &mut record.device_type)] {
-                                        if let Some(value) = deploy.pointer(&format!("/data/appInfo/{field}")).and_then(serde_json::Value::as_str)
-                                            && !value.is_empty() && value.len() <= if field == "DeviceType" {128} else {256} && !value.chars().any(char::is_control) {
+                                    for (value, destination) in [(deploy_field(deploy, "modelName", 256), &mut record.model_name), (deploy_sw_version(deploy), &mut record.sw_version), (deploy_field(deploy, "DeviceType", 128), &mut record.device_type)] {
+                                        if let Some(value) = value {
                                             *destination = value.into();
                                         }
                                     }
@@ -1633,6 +1632,20 @@ impl Runtime {
     fn buffer_driver(&mut self, _id: &SessionId, _data: &[u8]) {}
     fn script_transport(&mut self, _event: &TransportEvent) {}
     fn fire_timers(&mut self) {}
+}
+
+/// A ThinQ2 deploy's `data.appInfo` string field, unless empty, oversized or with controls.
+fn deploy_field<'a>(deploy: &'a serde_json::Value, field: &str, max: usize) -> Option<&'a str> {
+    deploy
+        .pointer(&format!("/data/appInfo/{field}"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= max && !v.chars().any(char::is_control))
+}
+
+/// Some modems leave `softVer` empty and report their firmware only in `appVersion`
+/// (upstream rethink d52f6457; 1WPU4CIGCR__2 and 2RSFL2DBN3K_Z show no version here).
+fn deploy_sw_version(deploy: &serde_json::Value) -> Option<&str> {
+    deploy_field(deploy, "softVer", 256).or_else(|| deploy_field(deploy, "appVersion", 256))
 }
 
 fn command_payload(
@@ -1747,5 +1760,38 @@ mod cancellation_tests {
         let reopened = Storage::open(&path, 4).unwrap();
         assert_eq!(reopened.state().generation_floor, 7);
         server.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod deploy_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn deploy(app_info: serde_json::Value) -> serde_json::Value {
+        json!({"did":"d","cmd":"deploy","kind":"MODEL","data":{"appInfo":app_info}})
+    }
+
+    #[test]
+    fn sw_version_prefers_soft_ver() {
+        let deploy = deploy(json!({"softVer":"2.10.119","appVersion":"clip_hna_v1.9.237"}));
+        assert_eq!(deploy_sw_version(&deploy), Some("2.10.119"));
+    }
+
+    #[test]
+    fn sw_version_falls_back_to_app_version_when_soft_ver_is_empty_or_missing() {
+        let empty = deploy(json!({"softVer":"","appVersion":"clip_bkn_v1.9.238"}));
+        assert_eq!(deploy_sw_version(&empty), Some("clip_bkn_v1.9.238"));
+        let missing = deploy(json!({"appVersion":"clip_bkn_v1.9.238"}));
+        assert_eq!(deploy_sw_version(&missing), Some("clip_bkn_v1.9.238"));
+        assert_eq!(deploy_sw_version(&deploy(json!({"softVer":""}))), None);
+    }
+
+    #[test]
+    fn deploy_fields_reject_oversized_and_control_values() {
+        let deploy =
+            deploy(json!({"DeviceType":"x".repeat(129),"softVer":"1\n2","appVersion":"ok"}));
+        assert_eq!(deploy_field(&deploy, "DeviceType", 128), None);
+        assert_eq!(deploy_sw_version(&deploy), Some("ok"));
     }
 }
