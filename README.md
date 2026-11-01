@@ -1,3 +1,5 @@
+<img src="crates/rusthinq-app/assets/logo.svg" alt="" width="96" align="right" />
+
 # rusthinq
 
 rusthinq is a local LG ThinQ device server and optional LG cloud bridge written in
