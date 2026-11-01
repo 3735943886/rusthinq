@@ -1,4 +1,4 @@
-<img src="crates/rusthinq-app/assets/logo.svg" alt="" width="96" align="right" />
+<p align="center"><img src="crates/rusthinq-app/assets/logo.svg" alt="" width="128" /></p>
 
 # rusthinq
 
