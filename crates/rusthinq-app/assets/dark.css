@@ -190,23 +190,10 @@ small,
   margin-top: 3px;
 }
 .brand-mark {
-  width: 39px;
+  width: 42px;
   height: 42px;
-  display: grid;
-  place-content: center;
-  background: var(--brand);
-  border-radius: 12px;
-  color: var(--surface);
-  font-size: 32px;
-  line-height: 1;
-  position: relative;
-}
-.brand-mark span {
-  color: var(--accent);
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
-  font-size: 26px;
+  flex: none;
+  color: var(--brand);
 }
 .nav-label {
   font-size: 9px;
