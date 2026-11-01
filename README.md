@@ -51,7 +51,7 @@ on Linux (x86_64, aarch64, armv7) and copies itself to `/usr/local/bin/thinqctl`
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/3735943886/rusthinq/master/scripts/thinqctl.sh \
-  | sudo bash -s -- install --prerelease
+  | sudo bash -s -- install
 ```
 
 `install` first looks for a running rusthinq:
@@ -69,8 +69,10 @@ A container installation is left to its image.
 
 ```sh
 thinqctl                           # installation, service and version state
-sudo thinqctl upgrade --prerelease # download and verify, then replace and restart
+sudo thinqctl upgrade              # download and verify, then replace and restart
 sudo thinqctl rollback             # restore the binaries the last upgrade replaced
+sudo thinqctl backup [FILE]        # archive config, CA, devices and LG account
+sudo thinqctl restore FILE          # put such an archive back, service stopped
 thinqctl scripts check             # compare driver HEAD with the upstream branch
 sudo thinqctl scripts update       # update drivers (requires a clean checkout)
 thinqctl self check                # compare thinqctl itself with master
@@ -79,9 +81,15 @@ sudo thinqctl remove               # keep data and CA; an adopted install is onl
 sudo thinqctl purge                # also delete data, CA and user (thinqctl installs only)
 ```
 
+A backup is a tar archive of `config.toml` and the files it names: CA, device ledger,
+LG account and pairings, retained-topic inventory. The dashboard offers the same archive
+(System → Download backup) when the management API has a user and password or listens on
+loopback only. It holds the CA key and LG tokens, so keep it private. `restore` keeps the
+files it replaces as another archive under `/var/lib/thinqctl/` that undoes it.
+
 `--yes` takes every default, and `RUSTHINQ_*` variables set those defaults. For example,
-`sudo RUSTHINQ_HOSTNAME=thinq.lan thinqctl install --yes`. Until 0.2.0 is released,
-only pre-releases exist, so pass `--prerelease`. `thinqctl help` lists every option.
+`sudo RUSTHINQ_HOSTNAME=thinq.lan thinqctl install --yes`. `--prerelease` also considers
+pre-releases. `thinqctl help` lists every option.
 
 Fresh installs show all five listener addresses and check for occupied ports and
 conflicting selections before changing the system. You can customize all addresses,

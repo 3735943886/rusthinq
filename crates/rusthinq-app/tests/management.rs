@@ -26,6 +26,7 @@ fn config(gui: bool) -> Config {
         gui: gui && cfg!(feature = "gui"),
         credentials: None,
         raw_inject_toggle: false,
+        backup: None,
         raw_inject: Default::default(),
     }
 }
@@ -914,5 +915,51 @@ async fn notification_socket_resets_old_cursor_and_joins_on_management_shutdown(
         .unwrap()
         .unwrap()
         .unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn backup_is_served_only_behind_credentials_or_a_loopback_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    let server = Server::new(Default::default()).unwrap();
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 128).unwrap();
+    let (_, stop) = watch::channel(false);
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "hostname = \"x\"\n").unwrap();
+    std::fs::write(dir.path().join("ca.key"), "KEY").unwrap();
+    let source =
+        rusthinq_app::backup::Source::new(&config_path, [dir.path().join("ca.key")]).unwrap();
+
+    let get = || {
+        Request::builder()
+            .uri("/api/backup")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mut open = config(false);
+    open.bind = "0.0.0.0:0".parse().unwrap();
+    open.backup = Some(source.clone());
+    let app = management::router(runtime.handle(), open, stop.clone()).unwrap();
+    assert_eq!(
+        app.oneshot(get()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let mut local = config(false);
+    local.backup = Some(source);
+    let app = management::router(runtime.handle(), local, stop.clone()).unwrap();
+    let response = app.oneshot(get()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/x-tar");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.windows(6).any(|w| w == b"ca.key"));
+    assert!(body.windows(3).any(|w| w == b"KEY"));
+
+    let app = management::router(runtime.handle(), config(false), stop).unwrap();
+    assert_eq!(
+        app.oneshot(get()).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
     server.shutdown().await;
 }

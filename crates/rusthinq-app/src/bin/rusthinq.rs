@@ -6,13 +6,30 @@ use rusthinq_app::{
 use std::{io, path::PathBuf};
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // The message, not the Debug form `main` would print for an io::Error.
+            eprintln!("rusthinq: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> io::Result<()> {
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--version")
     {
         println!("rusthinq {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--backup")
+    {
+        return backup();
     }
     logging::init()?;
     let mut args = std::env::args_os().skip(1);
@@ -61,6 +78,33 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+}
+
+/// `rusthinq --backup CONFIG.toml OUTPUT.tar`: the archive `GET /api/backup` serves, read
+/// from the files themselves, so it works with the daemon stopped (`thinqctl backup`).
+fn backup() -> io::Result<()> {
+    let usage = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: rusthinq --backup CONFIG.toml OUTPUT.tar",
+        )
+    };
+    let args: Vec<_> = std::env::args_os().skip(2).collect();
+    let [config, output] = args.as_slice() else {
+        return Err(usage());
+    };
+    let archive = Config::backup_source(config.as_ref())?.archive(env!("CARGO_PKG_VERSION"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(output).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot create {}: {error}", output.to_string_lossy()),
+        )
+    })?;
+    std::io::Write::write_all(&mut file, &archive)
 }
 
 async fn shutdown_signal() -> io::Result<()> {

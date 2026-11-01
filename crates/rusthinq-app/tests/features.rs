@@ -91,6 +91,7 @@ async fn management_keeps_health_and_explicit_disabled_results_without_optional_
             gui: false,
             credentials: None,
             raw_inject_toggle: false,
+            backup: None,
             raw_inject: Default::default(),
         },
         stopped,
@@ -171,6 +172,7 @@ async fn embedding_rejects_disabled_capabilities_before_loading_ca_or_writing_ch
             gui: true,
             credentials: None,
             raw_inject_toggle: false,
+            backup: None,
             raw_inject: Default::default(),
         });
         let error = match Daemon::prepare(config).await {

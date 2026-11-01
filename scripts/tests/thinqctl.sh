@@ -302,6 +302,63 @@ assert_event 'systemctl start thinq.service'
 [ "$("$adopted/bin/rusthinq-mcp" --version)" = "rusthinq 0.2.0" ]
 assert_file_has "$root/etc/thinqctl.conf" 'VERSION=0.2.0'
 
+# Restore puts a dashboard backup back where this installation's config names it.
+make_backup() {
+    python3 - "$@" <<'PY'
+import io, json, sys, tarfile
+out, extra = sys.argv[1], sys.argv[2:]
+files = {"config.toml": b'hostname = "restored.lan"\n', "ca.key": b"KEY2", "ca.cert": b"-----BEGIN CERTIFICATE-----\nNEW\n",
+         "state/devices.json": b"{}"}
+manifest = {"format": 1, "rusthinq": "0.2.0", "created": 1700000000, "config": "/old/config.toml", "directory": "/old",
+            "files": [{"name": n, "path": "/old/" + n} for n in files if n != "config.toml"]}
+with tarfile.open(out, "w", format=tarfile.USTAR_FORMAT) as tar:
+    def add(name, data):
+        info = tarfile.TarInfo(name); info.size = len(data); tar.addfile(info, io.BytesIO(data))
+    add("config.toml", files.pop("config.toml")); add("backup.json", json.dumps(manifest).encode())
+    for name, data in files.items(): add(name, data)
+    for name in extra: add(name, b"x")
+PY
+}
+printf 'hostname = "before.lan"\n' > "$adopted/config.toml"
+printf -- '-----BEGIN CERTIFICATE-----\nOLD\n' > "$adopted/ca.cert"
+make_backup "$test_dir/backup.tar"
+run restore "$test_dir/backup.tar" --yes
+assert_output 'appliances that trust the current CA must be provisioned again'
+assert_event 'systemctl stop thinq.service'
+assert_event 'systemctl start thinq.service'
+assert_file_has "$adopted/config.toml" 'restored.lan'
+assert_file_has "$adopted/ca.key" 'KEY2'
+assert_file_has "$adopted/state/devices.json" '{}'
+undo="$(ls "$root"/var/lib/thinqctl/before-restore-*.tar)"
+tar -xOf "$undo" config.toml | grep -q 'before.lan'
+tar -xOf "$undo" ca.cert | grep -q 'OLD'
+# Undoing restores the replaced files.
+run restore "$undo" --yes
+assert_file_has "$adopted/config.toml" 'before.lan'
+assert_file_has "$adopted/ca.cert" 'OLD'
+# An archive with an unsafe member changes nothing and leaves the service running.
+make_backup "$test_dir/evil.tar" ../escape
+fails restore "$test_dir/evil.tar" --yes
+assert_output 'unsafe path'
+assert_no_event 'systemctl stop'
+assert_file_has "$adopted/config.toml" 'before.lan'
+fails restore "$test_dir/missing.tar" --yes
+assert_output 'No such file'
+rm -f "$root"/var/lib/thinqctl/before-restore-*.tar
+# Backup runs the installed daemon binary on the configuration it uses.
+cp "$adopted/bin/rusthinq" "$test_dir/rusthinq.saved"
+printf '#!/bin/sh\n[ "$1" = --backup ] && [ -n "$3" ] && echo "$2" > "$3"\n' > "$adopted/bin/rusthinq"
+run backup "$test_dir/out.tar"
+assert_output "Backup written to $test_dir/out.tar"
+assert_file_has "$test_dir/out.tar" "$adopted/config.toml"
+fails backup "$test_dir/out.tar"
+assert_output 'exists'
+printf '#!/bin/sh\nexit 1\n' > "$adopted/bin/rusthinq"
+fails backup "$test_dir/old.tar"
+assert_output 'cannot write backups: upgrade rusthinq'
+cp "$test_dir/rusthinq.saved" "$adopted/bin/rusthinq"
+
+
 # A failed download leaves the service alone.
 FAIL_DOWNLOAD=1 fails upgrade --yes
 assert_no_event 'systemctl stop'

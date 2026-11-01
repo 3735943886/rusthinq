@@ -53,6 +53,7 @@ async fn generated_commands_are_authenticated_fenced_and_work_without_scripts_or
             password: "secret".into(),
         }),
         raw_inject_toggle: false,
+        backup: None,
         raw_inject: Default::default(),
     };
     let app = management::router(handle.clone(), options, stopped.clone()).unwrap();

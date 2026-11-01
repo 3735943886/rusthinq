@@ -7,6 +7,8 @@
 #                                         # 0.1, or install afresh (asks questions)
 #   sudo thinqctl upgrade [--yes] [--version 0.2.0]
 #   sudo thinqctl rollback [--yes]        # restore the binaries the last upgrade replaced
+#   sudo thinqctl backup [FILE]           # archive configuration, CA, devices, LG account
+#   sudo thinqctl restore FILE [--yes]    # restore such an archive
 #   sudo thinqctl scripts update          # update the driver checkout
 #   sudo thinqctl remove  [--yes]
 #   sudo thinqctl purge   [--yes]
@@ -1334,6 +1336,210 @@ cmd_rollback() {
     fi
 }
 
+# Backup archives (`GET /api/backup`, the dashboard's System → Download backup):
+#   backup_tool unpack ARCHIVE DEST CONFIG   checks and unpacks ARCHIVE into DEST, then
+#       prints `version V`, `created EPOCH` and one `file NAME TARGET` per file, where
+#       TARGET is where it goes for the installation whose configuration is CONFIG.
+#   backup_tool pack ARCHIVE CONFIG NAME=TARGET...   archives the TARGETs that exist,
+#       in the same format, so restoring it undoes a restore.
+backup_tool() {
+    command -v python3 >/dev/null || die "python3 is required to restore a backup."
+    python3 - "$@" <<'PYBACKUP'
+import io, json, os, posixpath, sys, tarfile, time
+
+def fail(message):
+    print(f"backup: {message}", file=sys.stderr)
+    sys.exit(1)
+
+def unpack(archive, dest, config):
+    limit, total, names = 64 << 20, 0, set()
+    try:
+        tar = tarfile.open(archive, "r:*")
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot read {archive}: {error}")
+    with tar:
+        for member in tar:
+            name = member.name
+            if not member.isfile():
+                fail(f"{name}: only regular files are allowed")
+            parts = name.split("/")
+            if name.startswith("/") or any(p in ("", ".", "..") for p in parts) or "\\" in name:
+                fail(f"{name}: unsafe path")
+            if name in names:
+                fail(f"{name}: appears twice")
+            names.add(name)
+            total += member.size
+            if total > limit:
+                fail("archive exceeds 64 MiB")
+            path = os.path.join(dest, *parts)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with tar.extractfile(member) as source, open(path, "xb") as target:
+                target.write(source.read())
+    try:
+        with open(os.path.join(dest, "backup.json"), encoding="utf-8") as file:
+            manifest = json.load(file)
+    except (OSError, ValueError):
+        fail("backup.json is missing or invalid: not a rusthinq backup")
+    if manifest.get("format") != 1:
+        fail(f"unsupported backup format {manifest.get('format')!r}")
+    if "config.toml" not in names:
+        fail("config.toml is missing")
+    old = manifest.get("directory")
+    if not isinstance(old, str) or not old.startswith("/"):
+        fail("backup.json has no source directory")
+    new = os.path.dirname(config)
+    print("version", manifest.get("rusthinq", "unknown"))
+    print("created", int(manifest.get("created", 0)))
+    print("file", "config.toml", config)
+    for entry in manifest.get("files", []):
+        name, path = entry.get("name"), entry.get("path")
+        if name not in names or name in ("config.toml", "backup.json"):
+            fail(f"backup.json names {name!r}, which the archive does not hold")
+        if not isinstance(path, str) or not path.startswith("/") or "\n" in path or " " in name:
+            fail(f"{name}: invalid source path")
+        path = posixpath.normpath(path)
+        relative = posixpath.relpath(path, old)
+        target = path if relative.startswith("..") else posixpath.join(new, relative)
+        print("file", name, target)
+
+def pack(archive, config, pairs):
+    now, listed, files = int(time.time()), [], []
+    for pair in pairs:
+        name, _, target = pair.partition("=")
+        if os.path.isfile(target):
+            files.append((name, target))
+            if name != "config.toml":
+                listed.append({"name": name, "path": target})
+    manifest = {"format": 1, "rusthinq": "unknown", "created": now, "config": config,
+                "directory": os.path.dirname(config), "files": listed, "note": "taken by thinqctl restore"}
+    fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out, tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        def add(name, data):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = len(data), 0o600, now
+            tar.addfile(info, io.BytesIO(data))
+        for name, target in files[:1]:
+            with open(target, "rb") as file: add(name, file.read())
+        add("backup.json", json.dumps(manifest, indent=2).encode())
+        for name, target in files[1:]:
+            with open(target, "rb") as file: add(name, file.read())
+
+if sys.argv[1] == "unpack":
+    unpack(*sys.argv[2:5])
+else:
+    pack(sys.argv[2], sys.argv[3], sys.argv[4:])
+PYBACKUP
+}
+
+# Writes the backup archive the dashboard offers, read by the installed daemon binary
+# from the files its configuration names, so the service may run or be stopped.
+cmd_backup() {
+    require_root backup
+    detect_installation
+    case "$I_KIND" in
+        none|legacy) die "No rusthinq 0.2 installation to back up." ;;
+        container) die "rusthinq runs in a container: back up its volume instead." ;;
+    esac
+    [ -n "$I_CONFIG" ] || die "The configuration file of ${I_BIN:-rusthinq} is unknown."
+    if [ "$(id -u)" -eq 0 ] && ! root_trusted_path "$I_BIN"; then
+        die "Not running ${I_BIN} as root: other users can write to its path."
+    fi
+    local output="${1:-rusthinq-backup-$(date +%Y%m%d-%H%M%S).tar}"
+    [ ! -e "$output" ] || die "${output} exists; name another file."
+    if ! "$I_BIN" --backup "$I_CONFIG" "$output"; then
+        "$I_BIN" --backup 2>&1 | grep -q 'usage: rusthinq --backup' \
+            || die "${I_BIN} cannot write backups: upgrade rusthinq (0.2.0 or later), or use the dashboard (System → Download backup)."
+        die "Backup failed."
+    fi
+    ok "Backup written to ${output}."
+    log "  It holds the CA key and the LG account: keep it private. Restore it with sudo thinqctl restore ${output}"
+}
+
+# Replaces the configuration and state files with those of a backup archive, with the
+# service stopped. The files it replaces are kept as a backup archive beside BACKUP_DIR.
+cmd_restore() {
+    local archive="$1"
+    require_root restore
+    [ -n "$archive" ] || die "Usage: sudo thinqctl restore FILE (a backup from the dashboard: System → Download backup)."
+    [ -f "$archive" ] || die "No such file: $archive"
+    archive="$(realpath -e -- "$archive")"
+    detect_installation
+    case "$I_KIND" in
+        none|legacy) die "No rusthinq 0.2 installation to restore into." ;;
+        container) die "rusthinq runs in a container: restore into its volume instead." ;;
+    esac
+    [ -n "$I_CONFIG" ] || die "The configuration file of ${I_BIN:-rusthinq} is unknown."
+    local config owner work plan version created current
+    config="$(realpath -m -- "$I_CONFIG")"
+    owner="${I_USER:-${S_RUN_USER:-root}}"
+    work="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expand now: $work is local
+    trap "rm -rf -- '$work'" EXIT
+    install -d -m 700 "$work/files"
+    plan="$(backup_tool unpack "$archive" "$work/files" "$config")" || die "Not restored: the archive was refused."
+
+    version="$(printf '%s\n' "$plan" | awk '$1 == "version" { print $2 }')"
+    created="$(printf '%s\n' "$plan" | awk '$1 == "created" { print $2 }')"
+    log "Backup of rusthinq ${version}, taken $(date -d "@${created:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "at ${created}")."
+    log "It replaces:"
+    local name target pairs=()
+    while read -r _ name target; do
+        log "  ${target}"
+        pairs+=("${name}=${target}")
+    done < <(printf '%s\n' "$plan" | awk '$1 == "file"')
+
+    current="$(binary_version "$I_BIN")"
+    if [ -n "$current" ] && [ "$version" != unknown ] && [ "$(version_direction "$version" "$current")" = newer ]; then
+        warn "The backup comes from rusthinq ${version}, newer than the installed ${current}; its files may not load."
+    fi
+    local ca_name ca_target
+    for pair in "${pairs[@]}"; do
+        name="${pair%%=*}" target="${pair#*=}"
+        case "$name" in *.cert|*.crt|*.pem) ;; *) continue ;; esac
+        if [ -f "$target" ] && grep -q "BEGIN CERTIFICATE" "$work/files/$name" 2>/dev/null \
+            && ! cmp -s "$target" "$work/files/$name"; then
+            ca_name="$name" ca_target="$target"
+        fi
+    done
+    [ -z "${ca_name:-}" ] || warn "${ca_target} differs from the backup's: appliances that trust the current CA must be provisioned again."
+    warn "Stop any other rusthinq that answers the same appliances or LG account."
+    confirm "Restore this backup into $(dirname "$config")?" || { log "Aborted."; return 0; }
+
+    local was_active=0
+    if [ -n "$I_UNIT" ] && systemctl is-active --quiet "$I_UNIT" 2>/dev/null; then
+        was_active=1
+        systemctl stop "$I_UNIT"
+    elif [ -n "$I_PID" ] && kill -0 "$I_PID" 2>/dev/null; then
+        die "rusthinq (PID ${I_PID}) runs outside systemd: stop it, then restore again."
+    fi
+
+    local undo
+    undo="$(dirname "$BACKUP_DIR")/before-restore-$(date +%Y%m%d-%H%M%S).tar"
+    install -d -m 755 "$(dirname "$BACKUP_DIR")"
+    backup_tool pack "$undo" "$config" "${pairs[@]}" \
+        || die "Could not keep the current files; nothing was changed."
+    log "  Kept the replaced files in ${undo} (sudo thinqctl restore ${undo} undoes this)."
+
+    for pair in "${pairs[@]}"; do
+        name="${pair%%=*}" target="${pair#*=}"
+        install -d "$(dirname "$target")"
+        install -m 600 -o "$owner" -g "$(id -gn "$owner")" "$work/files/$name" "${target}.thinqctl-new"
+        if [ -e "$target" ]; then
+            chown --reference="$target" "${target}.thinqctl-new"
+            chmod --reference="$target" "${target}.thinqctl-new"
+        fi
+        mv -f "${target}.thinqctl-new" "$target"
+    done
+    ok "Restored ${#pairs[@]} files."
+    if [ "$was_active" -eq 1 ]; then
+        systemctl start "$I_UNIT"
+        wait_running "$I_UNIT" || exit 1
+        ok "Service restarted."
+    else
+        log "  Start rusthinq to use them."
+    fi
+}
+
 # Never read service-owned repository configuration as root. Git still checks
 # ownership of the repository and its metadata under the selected identity.
 scripts_git() {
@@ -1490,6 +1696,9 @@ ${C_BOLD}USAGE${C_RESET}
                                   0.1, or install afresh with a few questions
   sudo thinqctl upgrade [opts]    Replace the binaries with the selected release
   sudo thinqctl rollback          Restore the binaries the last upgrade replaced
+  sudo thinqctl backup [FILE]     Archive the configuration, CA, devices and LG account
+                                  (the dashboard's System → Download backup)
+  sudo thinqctl restore FILE      Put such a backup back, with the service stopped
   thinqctl scripts [status|check] Show drivers or compare HEAD with the remote upstream
   sudo thinqctl scripts update    Fast-forward the driver checkout (preserves local changes)
   thinqctl self check             Compare thinqctl with master
@@ -1551,7 +1760,7 @@ main() {
             *)
                 if [ -z "$subcmd" ]; then
                     subcmd="$1"
-                elif [[ "$subcmd" = scripts || "$subcmd" = self ]] && [ -z "$subarg" ]; then
+                elif [[ "$subcmd" = scripts || "$subcmd" = self || "$subcmd" = restore || "$subcmd" = backup ]] && [ -z "$subarg" ]; then
                     subarg="$1"
                 else
                     die "Unexpected argument: $1"
@@ -1577,6 +1786,8 @@ main() {
         install)  cmd_install ;;
         upgrade)  cmd_upgrade ;;
         rollback) cmd_rollback ;;
+        backup)   cmd_backup "$subarg" ;;
+        restore)  cmd_restore "$subarg" ;;
         scripts)  cmd_scripts "$subarg" ;;
         self)     cmd_self "$subarg" ;;
         remove)   cmd_remove ;;

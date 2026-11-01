@@ -192,6 +192,7 @@ impl Config {
                     gui,
                     credentials,
                     raw_inject: Default::default(),
+                    backup: None,
                     raw_inject_toggle: match management.get("raw_inject_toggle") {
                         None => false,
                         Some(value) => value.as_bool().ok_or_else(|| {
@@ -337,7 +338,7 @@ impl Config {
         if !bridge_dns.is_empty() && !cfg!(feature = "bridge") {
             return Err(invalid("bridge feature is disabled"));
         }
-        Ok(Self {
+        let mut config = Self {
             bridge_dns,
             thinq1_bind: address("thinq1_bind")?,
             mqtt_bind: address("mqtt_bind")?,
@@ -376,7 +377,38 @@ impl Config {
                     )
                 }
             },
-        })
+        };
+        let files = config.state_files();
+        if let Some(management) = &mut config.management {
+            management.backup = Some(crate::backup::Source::new(path, files)?);
+        }
+        Ok(config)
+    }
+
+    /// What a backup of the installation configured at `path` holds, as `GET /api/backup`
+    /// archives it; for taking one without a running daemon (`rusthinq --backup`).
+    pub fn backup_source(path: &Path) -> io::Result<crate::backup::Source> {
+        crate::backup::Source::new(path, Self::load(path)?.state_files())
+    }
+
+    /// Files the configuration names that hold this installation's identity and state.
+    fn state_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![
+            self.ca_key.clone(),
+            self.ca_certificate.clone(),
+            self.device_ledger.clone(),
+        ];
+        files.extend(self.custom_root_certificate.clone());
+        if let Some(account) = &self.cloud_account {
+            let mut pairings = account.as_os_str().to_owned();
+            pairings.push(".pairings");
+            files.extend([account.clone(), pairings.into()]);
+        }
+        if let Some(mqtt) = &self.external_mqtt {
+            files.extend(mqtt.ca.clone());
+            files.push(mqtt.inventory.clone());
+        }
+        files
     }
 }
 
@@ -471,15 +503,15 @@ impl Daemon {
             .transpose()?;
         #[cfg(feature = "scripting")]
         let drivers = config.drivers.clone();
-        let thin = listen(config.thinq1_bind).await?;
-        let mqtt = listen(config.mqtt_bind).await?;
-        let http = listen(config.https_bind).await?;
-        let plain_http = listen(config.http_bind).await?;
-        let thinq1_https = listen(config.thinq1_https_bind).await?;
-        let thinq1_http = listen(config.thinq1_http_bind).await?;
+        let thin = listen("thinq1_bind", config.thinq1_bind).await?;
+        let mqtt = listen("mqtt_bind", config.mqtt_bind).await?;
+        let http = listen("https_bind", config.https_bind).await?;
+        let plain_http = listen("http_bind", config.http_bind).await?;
+        let thinq1_https = listen("thinq1_https_bind", config.thinq1_https_bind).await?;
+        let thinq1_http = listen("thinq1_http_bind", config.thinq1_http_bind).await?;
         let management = if let Some(management) = config.management.clone() {
             management.validate()?;
-            let listener = TcpListener::bind(management.bind).await?;
+            let listener = bind("[management] bind", management.bind).await?;
             Some((management, listener))
         } else {
             None
@@ -868,11 +900,28 @@ pub struct Endpoints {
     pub thinq1_https: Option<SocketAddr>,
     pub thinq1_http: Option<SocketAddr>,
 }
-async fn listen(address: Option<SocketAddr>) -> io::Result<Option<TcpListener>> {
+async fn listen(key: &str, address: Option<SocketAddr>) -> io::Result<Option<TcpListener>> {
     match address {
-        Some(address) => TcpListener::bind(address).await.map(Some),
+        Some(address) => bind(key, address).await.map(Some),
         None => Ok(None),
     }
+}
+/// Binds a listener; a failure names the configuration key and address it came from.
+async fn bind(key: &str, address: SocketAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(address).await.map_err(|error| {
+        let hint = match error.kind() {
+            io::ErrorKind::AddrInUse => "; another process listens there",
+            io::ErrorKind::PermissionDenied if address.port() < 1024 => {
+                "; ports below 1024 need root or CAP_NET_BIND_SERVICE"
+            }
+            io::ErrorKind::AddrNotAvailable => "; no interface of this host has that address",
+            _ => "",
+        };
+        io::Error::new(
+            error.kind(),
+            format!("cannot listen on {key} = \"{address}\": {error}{hint}"),
+        )
+    })
 }
 fn local(listener: &Option<TcpListener>) -> io::Result<Option<SocketAddr>> {
     listener.as_ref().map(TcpListener::local_addr).transpose()

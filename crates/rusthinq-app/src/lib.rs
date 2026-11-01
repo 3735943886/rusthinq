@@ -1,4 +1,5 @@
 //! L6 application foundations: owns persistence, not device protocol decisions.
+pub mod backup;
 pub mod cleanup_mqtt;
 pub mod daemon;
 #[cfg(feature = "scripting")]

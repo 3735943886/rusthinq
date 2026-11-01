@@ -40,6 +40,8 @@ pub struct Config {
     /// Runtime injection state, shared with the MQTT `$raw` routes. Always starts off
     /// and is never persisted, so a restart returns to the safe state.
     pub raw_inject: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What `GET /api/backup` archives; set from the configuration file that was loaded.
+    pub backup: Option<crate::backup::Source>,
 }
 impl Config {
     fn injection(&self) -> bool {
@@ -183,6 +185,7 @@ fn build(app: App) -> Router {
     let routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/diagnostics", get(diagnostics))
+        .route("/api/backup", get(backup))
         .route("/api/devices/{id}/presentation", get(presentation))
         .route(
             "/api/cloud/notifications",
@@ -535,6 +538,41 @@ async fn delete_retained(State(app): State<App>, Json(request): Json<RetainedDel
             StatusCode::GATEWAY_TIMEOUT,
             "cleanup outcome unknown; inspect adapter status and durable inventory",
         ),
+    }
+}
+/// The configuration and state files as a tar archive (`backup` module). It holds the CA
+/// key and LG tokens, so it is only served behind credentials or on a loopback bind.
+async fn backup(State(app): State<App>) -> Response {
+    let Some(source) = app.config.backup.clone() else {
+        return error(StatusCode::NOT_FOUND, "backup unavailable");
+    };
+    if app.config.credentials.is_none() && !app.config.bind.ip().is_loopback() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "the backup holds the CA key and LG tokens: set [management] user and password, or bind management to a loopback address",
+        );
+    }
+    match tokio::task::spawn_blocking(move || source.archive(env!("CARGO_PKG_VERSION"))).await {
+        Ok(Ok(bytes)) => {
+            let created = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_secs())
+                .unwrap_or(0);
+            (
+                [
+                    (header::CONTENT_TYPE, "application/x-tar".to_owned()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"rusthinq-backup-{created}.tar\""),
+                    ),
+                    (header::CACHE_CONTROL, "no-store".to_owned()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Ok(Err(reason)) => error(StatusCode::INTERNAL_SERVER_ERROR, &reason.to_string()),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "backup task failed"),
     }
 }
 #[derive(Deserialize)]
@@ -1682,6 +1720,7 @@ mod tests {
                 gui: true,
                 credentials: None,
                 raw_inject_toggle: false,
+                backup: None,
                 raw_inject: Default::default(),
             },
             stop: stopped.clone(),
@@ -1761,6 +1800,7 @@ mod tests {
                 gui: cfg!(feature = "gui"),
                 credentials: None,
                 raw_inject_toggle: false,
+                backup: None,
                 raw_inject: Default::default(),
             },
             stopped,

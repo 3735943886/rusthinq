@@ -43,6 +43,7 @@ async fn composed_runtime_serves_shared_https_and_joins_shutdown() {
             gui: cfg!(feature = "gui"),
             credentials: None,
             raw_inject_toggle: false,
+            backup: None,
             raw_inject: Default::default(),
         }),
         drivers: None,
@@ -231,8 +232,16 @@ async fn bind_failure_does_not_create_lifecycle_checkpoint() {
         external_mqtt: None,
         cloud_account: None,
     };
+    let address = occupied.local_addr().unwrap();
+    let Err(error) = Daemon::prepare(config).await else {
+        panic!("an occupied port must fail")
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     assert!(
-        matches!(Daemon::prepare(config).await, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse)
+        error
+            .to_string()
+            .starts_with(&format!("cannot listen on mqtt_bind = \"{address}\": ")),
+        "{error}"
     );
     assert!(!ledger.exists());
 }

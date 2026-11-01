@@ -113,6 +113,21 @@
         "application/json",
       );
     });
+  $("download-backup").onclick = () =>
+    busy($("download-backup"), async () => {
+      const response = await fetch(UI.url("api/backup"), {
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || `Backup failed (${response.status})`);
+      }
+      const name =
+        /filename="([^"]+)"/.exec(
+          response.headers.get("content-disposition") || "",
+        )?.[1] || `rusthinq-backup-${Date.now()}.tar`;
+      UI.download(name, await response.blob(), "application/x-tar");
+    });
   const attention = (device) =>
     !!(
       device.scriptFaulted ||
