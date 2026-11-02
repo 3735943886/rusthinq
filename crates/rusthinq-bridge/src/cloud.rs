@@ -787,9 +787,8 @@ impl Client {
         device: NewDevice<'_>,
     ) -> Result<crate::pairing::Material, Error> {
         let devices = self.list_devices().await?;
-        let alias = devices
-            .iter()
-            .find(|entry| entry["deviceId"] == device.id)
+        let registered = devices.iter().find(|entry| entry["deviceId"] == device.id);
+        let alias = registered
             .and_then(|entry| entry["alias"].as_str())
             .unwrap_or(device.alias);
         let device = NewDevice { alias, ..device };
@@ -804,10 +803,13 @@ impl Client {
                 &key,
             )
             .await?;
-            self.add_device(NewDevice {
-                ciphertext: Some(&paired.registration_ciphertext),
-                ..device
-            })
+            self.register_paired(
+                NewDevice {
+                    ciphertext: Some(&paired.registration_ciphertext),
+                    ..device
+                },
+                registered.is_some(),
+            )
             .await?;
             return Ok(paired.material);
         }
@@ -831,6 +833,22 @@ impl Client {
         })
         .await?;
         Ok(material)
+    }
+    /// WashTower units are reported to refuse with `0005` where other appliances get `0125`.
+    /// The new certificate has already replaced the appliance's own, so a device the home lists
+    /// keeps it. For an unlisted device nothing shows it is registered, so the refusal stands.
+    async fn register_paired(&self, device: NewDevice<'_>, listed: bool) -> Result<(), Error> {
+        let id = device.id;
+        match self.add_device(device).await {
+            Err(Error::Api(code)) if listed && code == "0005" => {
+                tracing::info!(
+                    device = id,
+                    "LG refused a listed device with 0005; keeping pairing"
+                );
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
     }
     pub async fn add_device(&self, device: NewDevice<'_>) -> Result<Value, Error> {
         for value in [
@@ -1188,6 +1206,37 @@ mod tests {
         let body: Value =
             serde_json::from_str(requests[6].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body, json!({"homeId":"h/a","item":[{"deviceId":"d/a"}]}));
+    }
+    #[tokio::test]
+    async fn refusal_0005_keeps_pairing_only_for_a_device_the_home_lists() {
+        let refused = || (200, json!({"resultCode":"0005","result":""}).to_string());
+        let mut replies = auth_replies();
+        replies.extend([
+            refused(),
+            refused(),
+            (200, json!({"resultCode":"9999"}).to_string()),
+        ]);
+        let (mut client, task) = mock(replies).await;
+        client.authenticate("refresh").await.unwrap();
+        let device = || NewDevice {
+            id: "d",
+            alias: "Washer",
+            model: "FAKPK21021",
+            device_type: "221",
+            platform: "thinq2",
+            ciphertext: Some("cipher"),
+        };
+        client.register_paired(device(), true).await.unwrap();
+        assert_eq!(
+            client.register_paired(device(), false).await.unwrap_err(),
+            Error::Api("0005".into())
+        );
+        assert_eq!(
+            client.register_paired(device(), true).await.unwrap_err(),
+            Error::Api("9999".into())
+        );
+        let requests = task.await.unwrap();
+        assert!(requests[4].contains("\"initDevice\":false"));
     }
     #[tokio::test]
     async fn thinq1_pairing_keeps_existing_alias_and_registration() {
