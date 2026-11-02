@@ -457,7 +457,7 @@
             async () => {
               pairing = { id: selected.id, incarnation: selected.incarnation };
               $("pair-description").textContent =
-                `Register ${deviceName(selected.id, device)} with the LG account. Use the device type reported during setup.`;
+                `Bridge ${deviceName(selected.id, device)} to the LG account. Pairing issues a new LG certificate and the one the appliance holds stops working, so it then reaches LG only through this bridge. Removing the redirect or the bridge does not restore it; that needs setup again in the ThinQ app. Use the device type reported during setup.`;
               $("pair-type").value = device.deviceType || "";
               $("pair-alias").value = deviceName(selected.id, device);
               $("pair-dialog").showModal();
@@ -886,10 +886,6 @@
         incarnation: target.incarnation,
         deviceType: type,
         alias,
-      });
-      // The captured incarnation is preserved even if pairing spans a local replacement.
-      await operate(target.id, "bridge/enable", {
-        incarnation: target.incarnation,
       });
       $("pair-dialog").close();
     });

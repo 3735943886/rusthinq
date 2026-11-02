@@ -189,7 +189,7 @@ impl Store {
             .enabled = enabled;
         self.commit(next)
     }
-    /// Call only after a successful cloud removal; failure preserves cleanup ownership.
+    /// Call only once the cloud no longer has the device; failure preserves cleanup ownership.
     pub fn remove_confirmed(&mut self, attempt: &Attempt, confirmed: bool) -> io::Result<()> {
         self.current(attempt)?;
         if !confirmed {

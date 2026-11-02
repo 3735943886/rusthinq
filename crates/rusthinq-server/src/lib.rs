@@ -108,7 +108,16 @@ pub enum MqttDiagnostic {
         session: Option<SessionId>,
         ready: bool,
         reason: Disconnect,
+        rejected: Option<RejectedPublish>,
     },
+}
+/// The publish behind a ThinQ2 protocol rejection. Device strings are bounded; the payload
+/// itself stays out of diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedPublish {
+    pub topic: String,
+    pub cmd: Option<String>,
+    pub payload_len: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disconnect {
@@ -118,9 +127,26 @@ pub enum Disconnect {
     WriteTimeout,
     Protocol(thinq1::Error),
     ThinQ2(rusthinq_protocol::thinq2::Error),
-    Mqtt,
+    Mqtt(MqttFailure),
     IdleTimeout,
     Panic,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MqttFailure {
+    Malformed(rusthinq_protocol::mqtt::Error),
+    Truncated,
+    BeforeConnect,
+    DuplicateConnect,
+    TooManyFilters,
+    PayloadExceeded,
+    Qos2Conflict,
+    Qos2Full,
+    DeviceIdTooLong,
+    DeviceIdChanged,
+    UnsubscribedTopic,
+    EncodeFailed,
+    NotIdentified,
+    UnexpectedAction,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reject {

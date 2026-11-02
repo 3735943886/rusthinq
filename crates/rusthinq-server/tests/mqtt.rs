@@ -1,7 +1,7 @@
 use base64::Engine;
 use rusthinq_protocol::mqtt;
 use rusthinq_server::{
-    Config, Delivery, Disconnect, Event, Reject,
+    Config, Delivery, Disconnect, Event, MqttDiagnostic, MqttFailure, Reject, RejectedPublish,
     mqtt::{Broker, Clock, Sample},
 };
 use serde_json::{Value, json};
@@ -258,7 +258,7 @@ async fn qos2_pending_storage_is_bounded() {
     }
     assert_eq!(
         event(&mut events).await,
-        Event::Down(session, Disconnect::Mqtt)
+        Event::Down(session, Disconnect::Mqtt(MqttFailure::Qos2Full))
     );
     task.await.unwrap();
     broker.stop();
@@ -934,6 +934,55 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
     assert_eq!(wire(&mut peer).await, vec![0xd0, 0]);
     broker.stop();
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn protocol_rejection_diagnostic_names_the_publish_without_its_payload() {
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let mut events = broker.handle().subscribe();
+    let mut diagnostics = broker.handle().mqtt_diagnostics();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await });
+    ready(&mut peer, "d", &mut events).await;
+    let topic = "clip/message/devices/other";
+    let payload = br#"{"did":"d","cmd":"private-command","data":"private-data"}"#;
+    let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+    body.extend_from_slice(topic.as_bytes());
+    body.extend_from_slice(payload);
+    peer.write_all(&mqtt::frame(0x30, &body, 8192).unwrap())
+        .await
+        .unwrap();
+    let closed = loop {
+        let diagnostic = timeout(Duration::from_secs(2), diagnostics.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(diagnostic, MqttDiagnostic::Closed { .. }) {
+            break diagnostic;
+        }
+    };
+    let MqttDiagnostic::Closed {
+        reason, rejected, ..
+    } = &closed
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        *reason,
+        Disconnect::ThinQ2(rusthinq_protocol::thinq2::Error::InvalidTopic)
+    );
+    assert_eq!(
+        *rejected,
+        Some(RejectedPublish {
+            topic: topic.into(),
+            cmd: Some("private-command".into()),
+            payload_len: payload.len(),
+        })
+    );
+    assert!(!format!("{closed:?}").contains("private-data"));
+    let _ = task.await;
+    broker.stop();
 }
 
 /// 0.1 logged every client's CONNECT and close reason. Connections that never identify a

@@ -159,6 +159,7 @@ fn configuration_resolves_paths_and_rejects_typographical_fields() {
         Config::load(&path).unwrap().ca_certificate,
         dir.path().join("ca.pem")
     );
+    assert!(Config::load(&path).unwrap().advertise_requested_host);
     value["drivers"] = serde_json::json!({"directory":".","watch":true});
     std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
     if cfg!(feature = "scripting") {

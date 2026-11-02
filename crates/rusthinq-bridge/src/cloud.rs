@@ -122,6 +122,23 @@ fn header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<()
 pub(crate) fn result_code(code: &str) -> bool {
     code != "0000" && code.len() <= 32 && code.bytes().all(|b| b.is_ascii_alphanumeric())
 }
+/// Names the request by a fixed step, never its URL, which carries home and device IDs.
+/// Only the validated result code leaves the response; refusals such as `0101` can be
+/// expected, so the caller decides whether one is a failure.
+fn log_response(step: &'static str, status: u16, bytes: &[u8], started: tokio::time::Instant) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let raw = serde_json::from_slice::<Value>(bytes).ok();
+    let code = raw
+        .as_ref()
+        .and_then(|raw| raw["resultCode"].as_str())
+        .filter(|code| result_code(code));
+    if (200..300).contains(&status) && code.is_none() {
+        tracing::debug!(step, http = status, elapsed_ms, "LG API response");
+    } else {
+        let code = code.unwrap_or("none");
+        tracing::info!(step, http = status, code, elapsed_ms, "LG API refused");
+    }
+}
 fn nonce() -> Result<String, Error> {
     let mut bytes = [0; 16];
     openssl::rand::rand_bytes(&mut bytes).map_err(|_| Error::Crypto)?;
@@ -229,12 +246,13 @@ impl Client {
     }
     pub(crate) async fn request(
         &self,
+        step: &'static str,
         url: Url,
         method: Method,
         headers: HeaderMap,
         body: Option<String>,
     ) -> Result<Value, Error> {
-        let (status, bytes) = self.send(url, method, headers, body).await?;
+        let (status, bytes) = self.send(step, url, method, headers, body).await?;
         if !(200..300).contains(&status) {
             return Err(Error::Http(status));
         }
@@ -243,6 +261,7 @@ impl Client {
     /// A failed status wins over a failure reading its body.
     async fn send(
         &self,
+        step: &'static str,
         url: Url,
         method: Method,
         headers: HeaderMap,
@@ -260,7 +279,11 @@ impl Client {
         if let Some(body) = body {
             request = request.body(body);
         }
-        let mut response = request.send().await.map_err(|_| Error::Network)?;
+        let started = tokio::time::Instant::now();
+        let mut response = request.send().await.map_err(|error| {
+            tracing::info!(step, error = %error.without_url(), "LG API request failed");
+            Error::Network
+        })?;
         let status = response.status();
         let mut bytes = Vec::new();
         let read = async {
@@ -276,6 +299,7 @@ impl Client {
             Ok(())
         }
         .await;
+        log_response(step, status.as_u16(), &bytes, started);
         if status.is_success() {
             read?;
         }
@@ -284,12 +308,13 @@ impl Client {
     /// LG reports some typed refusals, such as `0101`, with HTTP 400.
     async fn api_request(
         &self,
+        step: &'static str,
         url: Url,
         method: Method,
         headers: HeaderMap,
         body: Option<String>,
     ) -> Result<Value, Error> {
-        let (status, bytes) = self.send(url, method, headers, body).await?;
+        let (status, bytes) = self.send(step, url, method, headers, body).await?;
         let raw = serde_json::from_slice::<Value>(&bytes);
         match (status, raw) {
             (200..=299, raw) => raw.map_err(|_| Error::InvalidResponse),
@@ -299,6 +324,7 @@ impl Client {
     }
     async fn api(
         &self,
+        step: &'static str,
         url: Url,
         method: Method,
         mut headers: HeaderMap,
@@ -312,7 +338,13 @@ impl Client {
         let raw = loop {
             attempt += 1;
             match self
-                .api_request(url.clone(), method.clone(), headers.clone(), body.clone())
+                .api_request(
+                    step,
+                    url.clone(),
+                    method.clone(),
+                    headers.clone(),
+                    body.clone(),
+                )
                 .await
             {
                 Ok(raw) => break raw,
@@ -343,6 +375,7 @@ impl Client {
         }
         let raw = self
             .api(
+                "gateway",
                 self.gateway_url.clone(),
                 Method::GET,
                 self.headers.clone(),
@@ -423,6 +456,7 @@ impl Client {
             header(&mut headers, key, value)?;
         }
         self.request(
+            "oauth",
             url,
             if body.is_some() {
                 Method::POST
@@ -504,6 +538,7 @@ impl Client {
         let mut registration = headers.clone();
         header(&mut registration, "x-device-type", "601")?;
         self.api(
+            "register_client",
             append(&gateway.api, "service/users/client")?,
             Method::POST,
             registration,
@@ -512,6 +547,7 @@ impl Client {
         .await?;
         let homes = self
             .api(
+                "list_homes",
                 append(&gateway.api, "service/homes")?,
                 Method::GET,
                 headers.clone(),
@@ -576,6 +612,7 @@ impl Client {
     pub async fn list_devices(&self) -> Result<Vec<Value>, Error> {
         let raw = self
             .api(
+                "list_devices",
                 self.home_url()?,
                 Method::GET,
                 self.account
@@ -602,6 +639,7 @@ impl Client {
             .push("delete");
         match self
             .api(
+                "remove_device",
                 url,
                 Method::POST,
                 self.account
@@ -614,8 +652,15 @@ impl Client {
             .await
         {
             // The device is not registered, which is the outcome removal asks for.
-            Err(Error::Api(code)) if code == "0101" => Ok(()),
-            result => result.map(|_| ()),
+            Err(Error::Api(code)) if code == "0101" => {
+                tracing::info!(device, "LG registration already absent");
+                Ok(())
+            }
+            Ok(_) => {
+                tracing::info!(device, "LG registration removed");
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
     /// Fresh account observer identity; no certificate/client ID is persisted or shared with devices.
@@ -639,6 +684,7 @@ impl Client {
         header(&mut headers, "x-client-id", &client_id)?;
         let api = &self.gateway.as_ref().ok_or(Error::NotAuthenticated)?.api;
         self.api(
+            "register_observer",
             append(api, "service/users/client")?,
             Method::POST,
             {
@@ -651,6 +697,7 @@ impl Client {
         .await?;
         let certificate = self
             .api(
+                "observer_certificate",
                 append(api, "service/users/client/certificate")?,
                 Method::POST,
                 headers,
@@ -672,7 +719,8 @@ impl Client {
         let mut headers = HeaderMap::new();
         header(&mut headers, "x-country-code", &self.country)?;
         header(&mut headers, "x-service-phase", "OP")?;
-        let response = crate::pairing::iot(self, append(&route, "route")?, headers, None).await?;
+        let response =
+            crate::pairing::iot(self, "route", append(&route, "route")?, headers, None).await?;
         let api = endpoint(
             response["apiServer"]
                 .as_str()
@@ -680,7 +728,8 @@ impl Client {
         )?;
         let mut ca_url = append(&api, "route/certificate")?;
         ca_url.query_pairs_mut().append_pair("name", "aws-iot");
-        let ca = crate::pairing::iot(self, ca_url, HeaderMap::new(), None).await?;
+        let ca =
+            crate::pairing::iot(self, "route_certificate", ca_url, HeaderMap::new(), None).await?;
         let material = crate::pairing::Material::ThinQ2 {
             country: self.country.clone(),
             api_server: api.to_string(),
@@ -716,6 +765,7 @@ impl Client {
         let api = &self.gateway.as_ref().ok_or(Error::NotAuthenticated)?.api;
         let raw = self
             .api(
+                "otp_certificate",
                 append(api, "service/devices/otp/certificate")?,
                 Method::POST,
                 account.headers.clone(),
@@ -737,9 +787,8 @@ impl Client {
         device: NewDevice<'_>,
     ) -> Result<crate::pairing::Material, Error> {
         let devices = self.list_devices().await?;
-        let alias = devices
-            .iter()
-            .find(|entry| entry["deviceId"] == device.id)
+        let registered = devices.iter().find(|entry| entry["deviceId"] == device.id);
+        let alias = registered
             .and_then(|entry| entry["alias"].as_str())
             .unwrap_or(device.alias);
         let device = NewDevice { alias, ..device };
@@ -754,10 +803,13 @@ impl Client {
                 &key,
             )
             .await?;
-            self.add_device(NewDevice {
-                ciphertext: Some(&paired.registration_ciphertext),
-                ..device
-            })
+            self.register_paired(
+                NewDevice {
+                    ciphertext: Some(&paired.registration_ciphertext),
+                    ..device
+                },
+                registered.is_some(),
+            )
             .await?;
             return Ok(paired.material);
         }
@@ -782,6 +834,22 @@ impl Client {
         .await?;
         Ok(material)
     }
+    /// WashTower units are reported to refuse with `0005` where other appliances get `0125`.
+    /// The new certificate has already replaced the appliance's own, so a device the home lists
+    /// keeps it. For an unlisted device nothing shows it is registered, so the refusal stands.
+    async fn register_paired(&self, device: NewDevice<'_>, listed: bool) -> Result<(), Error> {
+        let id = device.id;
+        match self.add_device(device).await {
+            Err(Error::Api(code)) if listed && code == "0005" => {
+                tracing::info!(
+                    device = id,
+                    "LG refused a listed device with 0005; keeping pairing"
+                );
+                Ok(())
+            }
+            result => result.map(|_| ()),
+        }
+    }
     pub async fn add_device(&self, device: NewDevice<'_>) -> Result<Value, Error> {
         for value in [
             device.id,
@@ -803,7 +871,13 @@ impl Client {
             body["ciphertext"] = json!(ciphertext);
         }
         match self
-            .api(url, Method::POST, account.headers.clone(), Some(body))
+            .api(
+                "add_device",
+                url,
+                Method::POST,
+                account.headers.clone(),
+                Some(body),
+            )
             .await
         {
             Err(Error::Api(code)) if code == "0125" => Ok(Value::Null),
@@ -903,6 +977,7 @@ mod tests {
         assert_eq!(
             client
                 .request(
+                    "test",
                     url,
                     Method::POST,
                     headers,
@@ -1131,6 +1206,37 @@ mod tests {
         let body: Value =
             serde_json::from_str(requests[6].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body, json!({"homeId":"h/a","item":[{"deviceId":"d/a"}]}));
+    }
+    #[tokio::test]
+    async fn refusal_0005_keeps_pairing_only_for_a_device_the_home_lists() {
+        let refused = || (200, json!({"resultCode":"0005","result":""}).to_string());
+        let mut replies = auth_replies();
+        replies.extend([
+            refused(),
+            refused(),
+            (200, json!({"resultCode":"9999"}).to_string()),
+        ]);
+        let (mut client, task) = mock(replies).await;
+        client.authenticate("refresh").await.unwrap();
+        let device = || NewDevice {
+            id: "d",
+            alias: "Washer",
+            model: "FAKPK21021",
+            device_type: "221",
+            platform: "thinq2",
+            ciphertext: Some("cipher"),
+        };
+        client.register_paired(device(), true).await.unwrap();
+        assert_eq!(
+            client.register_paired(device(), false).await.unwrap_err(),
+            Error::Api("0005".into())
+        );
+        assert_eq!(
+            client.register_paired(device(), true).await.unwrap_err(),
+            Error::Api("9999".into())
+        );
+        let requests = task.await.unwrap();
+        assert!(requests[4].contains("\"initDevice\":false"));
     }
     #[tokio::test]
     async fn thinq1_pairing_keeps_existing_alias_and_registration() {
@@ -1373,21 +1479,21 @@ mod tests {
         let url = client.gateway.as_ref().unwrap().api.clone();
         assert_eq!(
             client
-                .request(url.clone(), Method::GET, HeaderMap::new(), None)
+                .request("test", url.clone(), Method::GET, HeaderMap::new(), None)
                 .await
                 .unwrap_err(),
             Error::ResponseExceeded
         );
         assert_eq!(
             client
-                .request(url.clone(), Method::GET, HeaderMap::new(), None)
+                .request("test", url.clone(), Method::GET, HeaderMap::new(), None)
                 .await
                 .unwrap_err(),
             Error::Http(302)
         );
         assert_eq!(
             client
-                .request(url, Method::GET, HeaderMap::new(), None)
+                .request("test", url, Method::GET, HeaderMap::new(), None)
                 .await
                 .unwrap_err(),
             Error::InvalidResponse
