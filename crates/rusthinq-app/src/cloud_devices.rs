@@ -14,7 +14,7 @@ use rusthinq_server::{ServerHandle, SessionId, mqtt};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io,
     path::PathBuf,
     sync::{
@@ -389,13 +389,16 @@ impl Runtime {
                 if !self.current(&pair.device, pair.incarnation) {
                     return Err(stale());
                 }
+                let saved = attempt.clone();
+                self.storage(move |store| store.set_enabled(&saved, true))
+                    .await?;
+                let record = self.record(&pair.device, pair.incarnation)?;
                 let registration = self
                     .bridge
                     .registered(pair.device, pair.incarnation)
                     .map_err(|e| io::Error::other(format!("{e:?}")))?;
-                self.bridge
-                    .disable(&registration)
-                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                self.start(record, registration)?;
+                self.project();
                 Ok(())
             }
             Operation::Enable {
@@ -536,17 +539,18 @@ impl Runtime {
         self.tasks.insert(device, Task { stop, task });
         Ok(())
     }
-    /// Read-only account reconciliation never deletes registration material.
-    /// A suspicious empty response is confirmed on a separate poll before pausing.
+    /// A device deleted from the LG account is unpaired here, so pairing can register it again.
+    /// Absence is confirmed on a separate poll first: an empty response can be spurious, and the
+    /// account may not list a device it has only just registered.
     async fn reconcile_account(
         &mut self,
-        empty: &mut Option<String>,
+        absent: &mut HashSet<String>,
         stop: &mut watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let client = match self.account.authenticated_client() {
             Ok(client) => client,
             Err(_) => {
-                *empty = None;
+                absent.clear();
                 return Ok(false);
             }
         };
@@ -560,7 +564,7 @@ impl Runtime {
                     record.attempt.owner.incarnation,
                 )
         }) {
-            *empty = None;
+            absent.clear();
             return Ok(false);
         }
         let epoch = *self.account.cancellation().borrow();
@@ -575,11 +579,7 @@ impl Runtime {
         .await?;
         self.account
             .publish_inventory(&identity, epoch, serde_json::json!(inventory));
-        if inventory.is_empty() && empty.as_ref() != Some(&identity) {
-            *empty = Some(identity);
-            return Ok(true);
-        }
-        *empty = None;
+        let mut unconfirmed = HashSet::new();
         for record in self.records() {
             let owner = &record.attempt.owner;
             if owner.account != identity
@@ -592,32 +592,28 @@ impl Runtime {
             {
                 continue;
             }
-            let attempt = record.attempt.clone();
-            self.storage(move |store| store.set_enabled(&attempt, false))
-                .await?;
+            if !absent.contains(&owner.device) {
+                unconfirmed.insert(owner.device.clone());
+                continue;
+            }
             self.stop_device(&owner.device).await?;
+            let attempt = record.attempt.clone();
+            self.storage(move |store| store.remove_confirmed(&attempt, true))
+                .await?;
             if let Some(status) = self.bridge.snapshot().iter().find(|status| {
                 status.registration.device == owner.device
                     && status.registration.incarnation == owner.incarnation
             }) {
                 self.bridge
-                    .disable(&status.registration)
+                    .deregistered(&status.registration)
                     .map_err(|_| stale())?;
             }
+            tracing::info!(device = %owner.device, "device left the LG account; bridge unpaired");
             self.project();
-            if let Some(status) = self
-                .handle
-                .status
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get_mut(&owner.device)
-            {
-                status.connected = false;
-                status.error = Some("Registration absent from the LG account; bridge paused, saved material preserved".into());
-            }
             self.app.cloud_changed(owner.device.clone());
         }
-        Ok(false)
+        *absent = unconfirmed;
+        Ok(!absent.is_empty())
     }
     fn reconciliation_needed(&self) -> bool {
         self.account
@@ -659,7 +655,7 @@ impl Runtime {
         let mut account_status = self.account.status_updates();
         let mut account_status_open = true;
         let mut account_error = None;
-        let mut empty_inventory = None;
+        let mut absent = HashSet::new();
         let mut reconcile_at = tokio::time::Instant::now();
         while !*stop.borrow() {
             let reconcile_needed = self.reconciliation_needed();
@@ -670,7 +666,7 @@ impl Runtime {
                 changed=accounts.changed()=>{
                     if changed.is_err() { break; }
                     accounts.borrow_and_update();
-                    empty_inventory = None;
+                    absent.clear();
                     reconcile_at = tokio::time::Instant::now();
                     continue;
                 },
@@ -691,7 +687,7 @@ impl Runtime {
                 },
                 changed=device_states.changed()=>{if changed.is_err(){break;} continue;},
                 _=tokio::time::sleep_until(reconcile_at),if reconcile_needed=>{
-                    let recheck = self.reconcile_account(&mut empty_inventory, &mut stop).await.unwrap_or(false);
+                    let recheck = self.reconcile_account(&mut absent, &mut stop).await.unwrap_or(false);
                     reconcile_at = tokio::time::Instant::now() + Duration::from_secs(if recheck {60} else {900});
                     continue;
                 }

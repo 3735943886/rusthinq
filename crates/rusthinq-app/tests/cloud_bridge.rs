@@ -99,6 +99,12 @@ fn client_identity() -> (String, String) {
 
 /// The account API calls `Client::authenticate` makes, answered like LG does.
 async fn lg_http(listener: TcpListener, inventory_id: &str) {
+    let inventory = Arc::new(std::sync::Mutex::new(vec![inventory_id.to_owned()]));
+    lg_http_with(listener, inventory).await
+}
+
+/// `inventory` is the account's device list; registering a device adds to it.
+async fn lg_http_with(listener: TcpListener, inventory: Arc<std::sync::Mutex<Vec<String>>>) {
     let acceptor = acceptor("lg.test");
     loop {
         let mut stream = accept_tls(&listener, &acceptor).await;
@@ -121,14 +127,23 @@ async fn lg_http(listener: TcpListener, inventory_id: &str) {
         let response = match path {
             "/gateway" => json!({"resultCode":"0000","result":{
                 "uris":{"empFrontBaseUri2":"https://lg.test/web","empOauthBaseUri":"https://lg.test/auth"},
-                "thinq2Uri":"https://lg.test/api"}}),
+                "thinq2Uri":"https://lg.test/api",
+                "thinq1Uri":"https://lg.test/thinq1/api","rtiUri":"lg.test:5222"}}),
             "/auth/oauth/1.0/oauth2/token" => json!({"access_token":"access","expires_in":3600}),
             "/auth/users/profile" => json!({"status":1,"account":{"userNo":"user-1"}}),
             "/api/service/users/client" => json!({"resultCode":"0000","result":{}}),
             "/api/service/homes" => {
                 json!({"resultCode":"0000","result":{"item":[{"homeId":"h","currentHomeYn":"Y"}]}})
             }
-            "/api/service/homes/h" => json!({"resultCode":"0000","result":{"devices":[{"deviceId":inventory_id,"alias":"LG room"}]}}),
+            "/api/service/homes/h" => {
+                let devices = inventory.lock().unwrap().iter().map(|id| json!({"deviceId":id,"alias":"LG room"})).collect::<Vec<_>>();
+                json!({"resultCode":"0000","result":{"devices":devices}})
+            }
+            "/api/service/homes/h/devices" => {
+                let added: Value = serde_json::from_slice(&body).unwrap();
+                inventory.lock().unwrap().push(added["deviceId"].as_str().unwrap().to_owned());
+                json!({"resultCode":"0000","result":{}})
+            }
             other => panic!("unexpected LG request {other}"),
         }
         .to_string();
@@ -641,7 +656,7 @@ async fn bridge_round_trips(late_local: bool) {
 }
 
 #[tokio::test]
-async fn missing_account_registration_pauses_bridge_and_preserves_material() {
+async fn device_deleted_from_the_account_is_unpaired_and_pairing_registers_it_again() {
     let dir = tempfile::tempdir().unwrap();
     let mut storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
     storage
@@ -685,7 +700,8 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let lg = tokio::spawn(lg_http(listener, "some-other-device"));
+    let lg_inventory = Arc::new(std::sync::Mutex::new(vec!["some-other-device".to_owned()]));
+    let lg = tokio::spawn(lg_http_with(listener, lg_inventory.clone()));
     let (account, account_runtime) =
         rusthinq_app::cloud_account::open(dir.path().join("account.json"))
             .await
@@ -715,17 +731,37 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
     let (stop, stopped) = watch::channel(false);
     let account_task = tokio::spawn(account_runtime.run(stopped.clone()));
     let cloud_task = tokio::spawn(cloud.run(stopped));
+    // Any bridge operation brings the next account check forward. Each one returns only after
+    // the check before it, so this waits for the first absence to be seen, then confirms it.
+    let mut checks = account.inventory_updates();
+    timeout(Duration::from_secs(5), checks.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let resume = || rusthinq_app::cloud_devices::Operation::Enable {
+        device: "d".into(),
+        incarnation: 1,
+        enabled: true,
+    };
+    // Listed again before the second check: the first absence is forgotten.
+    lg_inventory.lock().unwrap().push("d".into());
+    checks.borrow_and_update();
+    handle.operate(resume()).await.unwrap();
+    timeout(Duration::from_secs(5), checks.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    lg_inventory.lock().unwrap().retain(|id| id != "d");
+    checks.borrow_and_update();
+    handle.operate(resume()).await.unwrap();
+    timeout(Duration::from_secs(5), checks.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(handle.snapshot().len(), 1);
+    handle.operate(resume()).await.unwrap();
     timeout(Duration::from_secs(5), async {
-        loop {
-            let status = &handle.snapshot()[0];
-            if !status.enabled
-                && status
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.contains("Registration absent"))
-            {
-                break;
-            }
+        while !handle.snapshot().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -740,6 +776,20 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
     assert!(!updates.has_changed().unwrap());
     assert_eq!(account.inventory_snapshot().unwrap(), inventory);
     updates.borrow_and_update();
+    handle
+        .operate(rusthinq_app::cloud_devices::Operation::Pair(
+            rusthinq_app::cloud_devices::Pair {
+                device: "d".into(),
+                incarnation: 1,
+                alias: "Model".into(),
+                device_type: "401".into(),
+                model: "Model".into(),
+                thinq2: false,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(lg_inventory.lock().unwrap().iter().any(|id| id == "d"));
     stop.send_replace(true);
     for task in [account_task, cloud_task] {
         timeout(Duration::from_secs(5), task)
@@ -749,7 +799,8 @@ async fn missing_account_registration_pauses_bridge_and_preserves_material() {
             .unwrap();
     }
     let restored = Store::open(&path, 8).unwrap().snapshot();
-    assert!(!restored[0].enabled);
+    assert_eq!(restored.len(), 1);
+    assert!(restored[0].enabled);
     assert!(restored[0].material.is_some());
     assert_eq!(restored[0].attempt.owner.account, "user-1");
     server.shutdown().await;
