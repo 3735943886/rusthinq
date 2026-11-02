@@ -203,13 +203,14 @@ async fn tls10_cbc_is_enabled_only_by_explicit_compatibility_policy() {
     let (address, shutdown, task, _, mut rejects) =
         start(Config::default(), TlsPolicy::Baseline, None).await;
     assert!(connect(address, "first.example", true, true).await.is_err());
-    assert_eq!(
-        timeout(Duration::from_secs(2), rejects.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .reason,
-        Failure::Tls
+    let reason = timeout(Duration::from_secs(2), rejects.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .reason;
+    assert!(
+        matches!(&reason, Failure::Tls(detail) if !detail.is_empty()),
+        "{reason:?}"
     );
     stop(shutdown, task).await;
     let (address, shutdown, task, _, _) =
