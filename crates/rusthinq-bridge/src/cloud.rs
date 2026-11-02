@@ -119,6 +119,9 @@ fn header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<()
     headers.insert(name, value);
     Ok(())
 }
+pub(crate) fn result_code(code: &str) -> bool {
+    code != "0000" && code.len() <= 32 && code.bytes().all(|b| b.is_ascii_alphanumeric())
+}
 fn nonce() -> Result<String, Error> {
     let mut bytes = [0; 16];
     openssl::rand::rand_bytes(&mut bytes).map_err(|_| Error::Crypto)?;
@@ -231,6 +234,20 @@ impl Client {
         headers: HeaderMap,
         body: Option<String>,
     ) -> Result<Value, Error> {
+        let (status, bytes) = self.send(url, method, headers, body).await?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Http(status));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)
+    }
+    /// A failed status wins over a failure reading its body.
+    async fn send(
+        &self,
+        url: Url,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<String>,
+    ) -> Result<(u16, Vec<u8>), Error> {
         // Check the actual destination at the send boundary as well as enforcing
         // HTTPS on the client, including for authenticated and OAuth requests.
         if url.scheme() != "https" {
@@ -244,20 +261,41 @@ impl Client {
             request = request.body(body);
         }
         let mut response = request.send().await.map_err(|_| Error::Network)?;
-        if !response.status().is_success() {
-            return Err(Error::Http(response.status().as_u16()));
-        }
-        if response.content_length().is_some_and(|n| n > LIMIT as u64) {
-            return Err(Error::ResponseExceeded);
-        }
+        let status = response.status();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
-            if chunk.len() > LIMIT - bytes.len() {
+        let read = async {
+            if response.content_length().is_some_and(|n| n > LIMIT as u64) {
                 return Err(Error::ResponseExceeded);
             }
-            bytes.extend_from_slice(&chunk);
+            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
+                if chunk.len() > LIMIT - bytes.len() {
+                    return Err(Error::ResponseExceeded);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(())
         }
-        serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)
+        .await;
+        if status.is_success() {
+            read?;
+        }
+        Ok((status.as_u16(), bytes))
+    }
+    /// LG reports some typed refusals, such as `0101`, with HTTP 400.
+    async fn api_request(
+        &self,
+        url: Url,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<String>,
+    ) -> Result<Value, Error> {
+        let (status, bytes) = self.send(url, method, headers, body).await?;
+        let raw = serde_json::from_slice::<Value>(&bytes);
+        match (status, raw) {
+            (200..=299, raw) => raw.map_err(|_| Error::InvalidResponse),
+            (400, Ok(raw)) if raw["resultCode"].as_str().is_some_and(result_code) => Ok(raw),
+            _ => Err(Error::Http(status)),
+        }
     }
     async fn api(
         &self,
@@ -274,7 +312,7 @@ impl Client {
         let raw = loop {
             attempt += 1;
             match self
-                .request(url.clone(), method.clone(), headers.clone(), body.clone())
+                .api_request(url.clone(), method.clone(), headers.clone(), body.clone())
                 .await
             {
                 Ok(raw) => break raw,
@@ -292,7 +330,7 @@ impl Client {
         };
         let code = raw["resultCode"].as_str().ok_or(Error::InvalidResponse)?;
         if code != "0000" {
-            if code.len() > 32 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            if !result_code(code) {
                 return Err(Error::InvalidResponse);
             }
             return Err(Error::Api(code.into()));
@@ -518,7 +556,7 @@ impl Client {
         self.account = None;
         self.household_id = None;
     }
-    fn home_url(&self, device: Option<&str>) -> Result<Url, Error> {
+    fn home_url(&self) -> Result<Url, Error> {
         if !self.authenticated() {
             return Err(Error::NotAuthenticated);
         }
@@ -530,23 +568,15 @@ impl Client {
             &self.gateway.as_ref().ok_or(Error::NotAuthenticated)?.api,
             "service/homes",
         )?;
-        {
-            let mut path = url.path_segments_mut().map_err(|_| Error::InvalidInput)?;
-            path.push(household_id);
-            if let Some(device) = device {
-                text(device, 256)?;
-                if matches!(device, "." | "..") {
-                    return Err(Error::InvalidInput);
-                }
-                path.push("devices").push(device);
-            }
-        }
+        url.path_segments_mut()
+            .map_err(|_| Error::InvalidInput)?
+            .push(household_id);
         Ok(url)
     }
     pub async fn list_devices(&self) -> Result<Vec<Value>, Error> {
         let raw = self
             .api(
-                self.home_url(None)?,
+                self.home_url()?,
                 Method::GET,
                 self.account
                     .as_ref()
@@ -564,18 +594,29 @@ impl Client {
     }
     /// Success requires a confirmed remote acknowledgement; never best-effort.
     pub async fn remove_device(&self, device: &str) -> Result<(), Error> {
-        self.api(
-            self.home_url(Some(device))?,
-            Method::DELETE,
-            self.account
-                .as_ref()
-                .ok_or(Error::NotAuthenticated)?
-                .headers
-                .clone(),
-            None,
-        )
-        .await
-        .map(|_| ())
+        let mut url = self.home_url()?;
+        text(device, 256)?;
+        url.path_segments_mut()
+            .map_err(|_| Error::InvalidInput)?
+            .push("devices")
+            .push("delete");
+        match self
+            .api(
+                url,
+                Method::POST,
+                self.account
+                    .as_ref()
+                    .ok_or(Error::NotAuthenticated)?
+                    .headers
+                    .clone(),
+                Some(json!({"homeId":self.household_id,"item":[{"deviceId":device}]})),
+            )
+            .await
+        {
+            // The device is not registered, which is the outcome removal asks for.
+            Err(Error::Api(code)) if code == "0101" => Ok(()),
+            result => result.map(|_| ()),
+        }
     }
     /// Fresh account observer identity; no certificate/client ID is persisted or shared with devices.
     pub async fn notification_subscription(
@@ -684,7 +725,10 @@ impl Client {
         let otp = raw["otp"].as_str().ok_or(Error::InvalidResponse)?;
         let key = raw["publicKey"].as_str().ok_or(Error::InvalidResponse)?;
         text(otp, 8192).map_err(|_| Error::InvalidResponse)?;
-        text(key, 65536).map_err(|_| Error::InvalidResponse)?;
+        // LG sends a multi-line PEM; encryption parses it before any use.
+        if key.is_empty() || key.len() > 65536 {
+            return Err(Error::InvalidResponse);
+        }
         Ok((otp.into(), key.into()))
     }
     /// Pair and register without deleting an existing appliance or changing its alias.
@@ -749,7 +793,7 @@ impl Client {
             text(value, 256)?;
         }
         let account = self.account.as_ref().ok_or(Error::NotAuthenticated)?;
-        let mut url = self.home_url(None)?;
+        let mut url = self.home_url()?;
         url.path_segments_mut()
             .map_err(|_| Error::InvalidInput)?
             .push("devices");
@@ -1026,6 +1070,9 @@ mod tests {
             json!({"resultCode":"9999","result":"private-secret"}).to_string(),
         ));
         replies.push(ok(Value::Null));
+        replies.push((400, json!({"resultCode":"0101"}).to_string()));
+        replies.push((405, String::new()));
+        replies.push((400, "not json".into()));
         let (mut client, task) = mock(replies).await;
         assert_eq!(
             client.list_devices().await.unwrap_err(),
@@ -1052,6 +1099,15 @@ mod tests {
             Error::Api("9999".into())
         );
         client.remove_device("d/a").await.unwrap();
+        client.remove_device("absent").await.unwrap();
+        assert_eq!(
+            client.remove_device("d/a").await.unwrap_err(),
+            Error::Http(405)
+        );
+        assert_eq!(
+            client.remove_device("d/a").await.unwrap_err(),
+            Error::Http(400)
+        );
         client.logout();
         assert!(client.household_id.is_none());
         assert_eq!(
@@ -1059,7 +1115,7 @@ mod tests {
             Error::NotAuthenticated
         );
         let requests = task.await.unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 11);
         for request in &requests {
             let destination = request.lines().next().unwrap();
             assert!(!destination.contains("private-access"));
@@ -1071,7 +1127,10 @@ mod tests {
         assert!(requests[2].contains("x-device-type: 601"));
         assert!(requests[4].starts_with("GET /service/homes/h%2Fa "));
         assert!(requests[5].contains("\"initDevice\":false"));
-        assert!(requests[6].starts_with("DELETE /service/homes/h%2Fa/devices/d%2Fa "));
+        assert!(requests[6].starts_with("POST /service/homes/h%2Fa/devices/delete "));
+        let body: Value =
+            serde_json::from_str(requests[6].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, json!({"homeId":"h/a","item":[{"deviceId":"d/a"}]}));
     }
     #[tokio::test]
     async fn thinq1_pairing_keeps_existing_alias_and_registration() {
@@ -1227,6 +1286,24 @@ mod tests {
             *private_key = "invalid".into();
         }
         assert!(altered.validate().is_err());
+    }
+    #[tokio::test]
+    async fn certificate_otp_accepts_the_multi_line_pem_lg_sends() {
+        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let pem = String::from_utf8(rsa.public_key_to_pem().unwrap()).unwrap();
+        assert!(pem.lines().count() > 2);
+        let mut replies = auth_replies();
+        replies.push(ok(json!({"otp":"otp","publicKey":pem})));
+        replies.push(ok(json!({"otp":"otp\nsplit","publicKey":pem})));
+        let (mut client, _task) = mock(replies).await;
+        client.authenticate("refresh").await.unwrap();
+        let (otp, key) = client.certificate_otp().await.unwrap();
+        assert_eq!(otp, "otp");
+        assert_eq!(key, pem);
+        assert_eq!(
+            client.certificate_otp().await.unwrap_err(),
+            Error::InvalidResponse
+        );
     }
     #[tokio::test]
     async fn refresh_lifetime_stops_expired_requests_before_wire_delivery() {
