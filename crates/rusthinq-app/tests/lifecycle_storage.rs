@@ -273,6 +273,10 @@ fn old_lifecycle_schema_upgrades_without_inventing_models_and_invalid_metadata_i
     value["metadata"] = serde_json::json!({"d":{"incarnation":2,"model_name":"D140110","device_type":"204","thinq2":false}});
     let corrupted = value.to_string();
     std::fs::write(&path, &corrupted).unwrap();
-    assert!(Storage::open(&path, 4).is_err());
+    let error = Storage::open(&path, 4).err().unwrap().to_string();
+    assert!(
+        error.contains("\"d\"") && error.contains("incarnation 2"),
+        "{error}"
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted);
 }

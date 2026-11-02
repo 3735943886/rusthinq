@@ -699,16 +699,17 @@ impl Runtime {
             if command.result.is_closed() {
                 continue;
             }
-            let target = match &command.operation {
-                Operation::Pair(p) => p.device.clone(),
-                Operation::Adopt { device, .. }
-                | Operation::Enable { device, .. }
-                | Operation::Unpair { device, .. } => device.clone(),
+            let (operation, target) = match &command.operation {
+                Operation::Pair(p) => ("pair", p.device.clone()),
+                Operation::Adopt { device, .. } => ("adopt", device.clone()),
+                Operation::Enable { device, .. } => ("enable", device.clone()),
+                Operation::Unpair { device, .. } => ("unpair", device.clone()),
             };
             let result = self
                 .command(command.operation, command.registration, &mut stop)
                 .await;
             if let Err(error) = &result {
+                tracing::warn!(device = %target, operation, %error, "bridge operation failed");
                 self.project();
                 let mut statuses = self.handle.status.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(status) = statuses.get_mut(&target) {

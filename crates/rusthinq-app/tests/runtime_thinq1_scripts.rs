@@ -15,6 +15,93 @@ async fn thinq1_mqtt_outputs_keep_restart_safe_exact_and_owner_deletion() {
     automatic_driver(true).await;
 }
 
+#[tokio::test]
+async fn missing_driver_is_named_once_and_later_input_is_dropped_quietly() {
+    use rusthinq_app::{
+        lifecycle_storage::Storage,
+        runtime::{Event, Runtime},
+    };
+    use rusthinq_server::{Server, thinq1_http::Metadata};
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::{mpsc, watch},
+        time::timeout,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Default::default()).unwrap();
+    let (metadata, receiver) = mpsc::channel(4);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 64)
+        .unwrap()
+        .with_metadata(receiver)
+        .with_drivers(Config {
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/host-drivers"),
+            topic_prefix: "rusthinq".into(),
+            limits: Default::default(),
+            bindings: BTreeMap::new(),
+            watch: false,
+        })
+        .unwrap();
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    metadata
+        .send(Metadata {
+            device_id: "styler".into(),
+            model_name: "NoDriverModel".into(),
+            device_type: "styler".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(events.recv().await.unwrap(), Event::Metadata(_)) {}
+    })
+    .await
+    .unwrap();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    server.admit(stream).unwrap();
+    let frame = rusthinq_protocol::thinq1::encode(
+        json!({
+            "Header":{"x-lgedm-deviceId":"styler"},
+            "Body":{"Cmd":"Mon","Format":"B64","Data":STANDARD.encode(b"running")}
+        })
+        .to_string()
+        .as_bytes(),
+        8192,
+    )
+    .unwrap();
+    let mut rejections = Vec::new();
+    for _ in 0..32 {
+        peer.write_all(&frame).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            let size = peer.read_u32().await.unwrap();
+            let mut bytes = vec![0; size as usize];
+            peer.read_exact(&mut bytes).await.unwrap();
+        })
+        .await
+        .unwrap();
+        // Let the failed preparation finish before later frames arrive.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        while let Ok(event) = events.try_recv() {
+            if let Event::Rejected { reason, .. } = event {
+                rejections.push(reason);
+            }
+        }
+    }
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert!(
+        rejections[0].contains("NoDriverModel.rhai not found in drivers"),
+        "{rejections:?}"
+    );
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}
+
 async fn automatic_driver(external: bool) {
     use rusthinq_app::{
         lifecycle_storage::Storage,

@@ -271,7 +271,10 @@ pub(crate) async fn iot(
     if let Some(code) = raw.get("resultCode")
         && code != "0000"
     {
-        return Err(Error::InvalidResponse);
+        return Err(match code.as_str() {
+            Some(code) if crate::cloud::result_code(code) => Error::Api(code.into()),
+            _ => Error::InvalidResponse,
+        });
     }
     Ok(raw.get("result").cloned().unwrap_or(raw))
 }

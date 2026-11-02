@@ -65,7 +65,8 @@ pub enum Failure {
     Eof,
     Timeout,
     Unserved,
-    Tls,
+    /// The OpenSSL error text, which identifies no peer secret.
+    Tls(String),
     Io,
     SessionRejected,
     Panic,
@@ -380,12 +381,12 @@ impl Router {
         if let Some(acceptor) =
             local_name.and_then(|name| self.local.get(&name.to_ascii_lowercase()))
         {
-            let ssl = Ssl::new(acceptor.context()).map_err(|_| Failure::Tls)?;
-            let mut transport = SslStream::new(ssl, stream).map_err(|_| Failure::Tls)?;
+            let ssl = Ssl::new(acceptor.context()).map_err(tls_failure)?;
+            let mut transport = SslStream::new(ssl, stream).map_err(tls_failure)?;
             timeout_at(deadline, Pin::new(&mut transport).accept())
                 .await
                 .map_err(|_| Failure::Timeout)?
-                .map_err(|_| Failure::Tls)?;
+                .map_err(tls_failure)?;
             return Ok(Some(transport));
         }
         if let (Some(name), Some(hook)) = (&name, &self.passthrough)
@@ -401,12 +402,12 @@ impl Router {
         };
         let context = minter.context(name.as_deref()).await;
         let accepted = async {
-            let ssl = Ssl::new(&context).map_err(|_| Failure::Tls)?;
-            let mut transport = SslStream::new(ssl, stream).map_err(|_| Failure::Tls)?;
+            let ssl = Ssl::new(&context).map_err(tls_failure)?;
+            let mut transport = SslStream::new(ssl, stream).map_err(tls_failure)?;
             timeout_at(deadline, Pin::new(&mut transport).accept())
                 .await
                 .map_err(|_| Failure::Timeout)?
-                .map_err(|_| Failure::Tls)?;
+                .map_err(tls_failure)?;
             Ok(transport)
         }
         .await;
@@ -418,6 +419,9 @@ impl Router {
         }
         accepted.map(Some)
     }
+}
+fn tls_failure(error: impl std::fmt::Display) -> Failure {
+    Failure::Tls(error.to_string())
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)

@@ -4,6 +4,7 @@ pub struct Preparation<K> {
     capacity: usize,
     attempts: BTreeMap<String, (K, String)>,
     buffers: BTreeMap<String, (K, VecDeque<Vec<u8>>)>,
+    failed: BTreeMap<String, K>,
 }
 impl<K: Clone + PartialEq> Preparation<K> {
     pub fn new(capacity: usize) -> Self {
@@ -11,6 +12,7 @@ impl<K: Clone + PartialEq> Preparation<K> {
             capacity,
             attempts: BTreeMap::new(),
             buffers: BTreeMap::new(),
+            failed: BTreeMap::new(),
         }
     }
     pub fn can_start(in_flight: usize, worker_exists: bool) -> bool {
@@ -26,6 +28,7 @@ impl<K: Clone + PartialEq> Preparation<K> {
         {
             return false;
         }
+        self.failed.remove(id);
         self.attempts.insert(id.into(), (scope, model.into()));
         true
     }
@@ -34,7 +37,15 @@ impl<K: Clone + PartialEq> Preparation<K> {
             .get(id)
             .is_some_and(|(current, name)| current == scope && name == model)
     }
+    /// A failed attempt is not retried for its scope, so nothing will consume its input.
+    pub fn fail(&mut self, id: &str, scope: &K) {
+        self.buffers.remove(id);
+        self.failed.insert(id.into(), scope.clone());
+    }
     pub fn buffer(&mut self, id: &str, scope: K, data: &[u8]) -> Result<(), String> {
+        if self.failed.get(id) == Some(&scope) {
+            return Ok(());
+        }
         let total: usize = self
             .buffers
             .values()
@@ -80,6 +91,7 @@ impl<K: Clone + PartialEq> Preparation<K> {
     pub fn retain(&mut self, mut current: impl FnMut(&str, &K) -> bool) {
         self.attempts.retain(|id, (scope, _)| current(id, scope));
         self.buffers.retain(|id, (scope, _)| current(id, scope));
+        self.failed.retain(|id, scope| current(id, scope));
     }
 }
 #[cfg(test)]
@@ -103,6 +115,24 @@ mod tests {
         assert!(Preparation::<u64>::can_start(1, false));
         assert!(!Preparation::<u64>::can_start(2, false));
         assert!(!Preparation::<u64>::can_start(0, true));
+    }
+    #[test]
+    fn failed_attempt_drops_input_until_its_scope_is_replaced() {
+        let mut policy = Preparation::new(2);
+        assert!(policy.begin("a", 1, "model"));
+        policy.buffer("a", 1, b"early").unwrap();
+        policy.fail("a", &1);
+        for _ in 0..32 {
+            policy.buffer("a", 1, b"late").unwrap();
+        }
+        assert!(policy.take_buffer("a", &1).is_empty());
+        assert!(!policy.begin("a", 1, "model"));
+        assert!(policy.begin("a", 2, "model"));
+        policy.buffer("a", 2, b"new").unwrap();
+        assert_eq!(
+            policy.take_buffer("a", &2),
+            VecDeque::from([b"new".to_vec()])
+        );
     }
     #[test]
     fn global_and_per_device_budget_and_replacement_release_are_bounded() {

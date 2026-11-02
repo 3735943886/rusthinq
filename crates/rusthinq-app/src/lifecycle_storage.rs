@@ -257,25 +257,39 @@ fn decode(bytes: &[u8], capacity: usize) -> io::Result<State> {
     Ok(state)
 }
 fn validate_metadata(state: &State) -> io::Result<()> {
-    if state.metadata.len() > state.ledger.entries.len()
-        || state.metadata.iter().any(|(id, meta)| {
-            meta.model_name.is_empty()
-                || meta.model_name.len() > 256
-                || meta.model_name.chars().any(char::is_control)
-                || meta.model_id.len() > 256
-                || meta.model_id.chars().any(char::is_control)
-                || meta.sw_version.len() > 256
-                || meta.sw_version.chars().any(char::is_control)
-                || meta.device_type.len() > 128
-                || meta.device_type.chars().any(char::is_control)
-                || !state
-                    .ledger
-                    .entries
-                    .iter()
-                    .any(|entry| entry.id == *id && entry.incarnation == meta.incarnation)
-        })
-    {
-        return Err(invalid("invalid model metadata identity or bounds"));
+    if state.metadata.len() > state.ledger.entries.len() {
+        return Err(invalid("more model metadata than devices"));
+    }
+    for (id, meta) in &state.metadata {
+        if meta.model_name.is_empty()
+            || meta.model_name.len() > 256
+            || meta.model_name.chars().any(char::is_control)
+            || meta.model_id.len() > 256
+            || meta.model_id.chars().any(char::is_control)
+            || meta.sw_version.len() > 256
+            || meta.sw_version.chars().any(char::is_control)
+            || meta.device_type.len() > 128
+            || meta.device_type.chars().any(char::is_control)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid model metadata for device {id:?}"),
+            ));
+        }
+        if !state
+            .ledger
+            .entries
+            .iter()
+            .any(|entry| entry.id == *id && entry.incarnation == meta.incarnation)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "model metadata for device {id:?} incarnation {} matches no device entry",
+                    meta.incarnation
+                ),
+            ));
+        }
     }
     Ok(())
 }
