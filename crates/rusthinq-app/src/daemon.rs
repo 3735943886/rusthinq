@@ -148,7 +148,9 @@ impl Config {
             Some(value) => value
                 .as_bool()
                 .ok_or_else(|| invalid("advertise_requested_host must be boolean"))?,
-            None => false,
+            // Harmless for appliances set up against `hostname`: they ask for that name, and
+            // an address falls back to it. A redirected appliance needs its own name back.
+            None => true,
         };
         let management = match value.get("management") {
             None | Some(serde_json::Value::Null) => None,
