@@ -279,6 +279,8 @@ impl Runtime {
                     rusthinq_scripting::Output::Send(_) => {
                         Err("shutdown callback cannot send to device".into())
                     }
+                    // Retirement already dropped this session's timers.
+                    rusthinq_scripting::Output::Timer { after_ms: None, .. } => Ok(()),
                     rusthinq_scripting::Output::Timer { .. } => {
                         Err("shutdown callback cannot schedule timers".into())
                     }
@@ -662,7 +664,7 @@ macro_rules! runtime_select { ($runtime:ident,$stop:ident,$stopping:ident; $($br
                                 if current && !*$stop.borrow() {$runtime.scripts.as_mut().expect("driver owner").attach(&$runtime.model.devices(),id.clone(),session,compiled,$runtime.drivers.as_ref().expect("driver config").engine_config().worker_config())} else {Err(rusthinq_scripting::Error::Stale)}
                             }
                         };
-                        if let Err(error)=result {$runtime.script_rejected(id.clone(),error);}
+                        if let Err(error)=result {$runtime.preparation_policy.fail(&id,&session);$runtime.script_rejected(id.clone(),error);}
                         else {
                             $runtime.script_callbacks.insert(id.clone(),crate::scripts::Callbacks {cloud:Some("__cloud".into()),response:Some("__response".into()),data:Some("__data".into()),ready:None,timer:Some("__timer".into()),shutdown:Some("__drop".into()),data_encoding:crate::scripts::DataEncoding::Hex});
                             let _=$runtime.scripts.as_ref().expect("driver owner").set_shutdown_callback(&id,Some("__drop".into()));

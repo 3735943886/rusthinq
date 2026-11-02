@@ -611,6 +611,58 @@ async fn driver_thinq1_command_matches_legacy_wire_frame() {
 }
 
 #[tokio::test]
+async fn shutdown_callback_may_cancel_a_timer_but_not_schedule_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+    let mut server = Server::new(Config::default()).unwrap();
+    let (sink, mut publications) = mpsc::channel(4);
+    let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 32)
+        .unwrap()
+        .with_scripts(Owner::new(1).unwrap())
+        .with_script_sink(Arc::new(Sink(sink)));
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(runtime.run(stopped));
+    let peer = identify(&mut server).await;
+    until(&mut events,|event|matches!(event,Event::Lifecycle(rusthinq_lifecycle::Action::Changed(device)) if device.online)).await;
+    let session = handle.snapshot()[0].session.unwrap();
+    handle
+        .attach_script(
+            "d".into(),
+            session,
+            Compiled::with_context(
+                r#"fn bye(ctx,v){ctx.cancel_timer("t");ctx.publish("offline");ctx.set_timer("t",1);ctx.publish("late");}"#,
+                Limits::default(),
+                true,
+                rusthinq_scripting::context::Config::new("d".into(), "model".into()),
+            )
+            .unwrap(),
+            worker::Config::default(),
+            Callbacks {
+                shutdown: Some("bye".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(peer);
+    assert_eq!(
+        timeout(Duration::from_secs(3), publications.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        "offline"
+    );
+    until(&mut events,|event|matches!(event,Event::Rejected{reason,..} if reason.contains("shutdown callback cannot schedule timers"))).await;
+    server.shutdown().await;
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    assert!(publications.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn shutdown_callback_publishes_once_offline_and_cannot_send_to_device() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();

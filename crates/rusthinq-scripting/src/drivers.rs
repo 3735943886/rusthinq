@@ -66,7 +66,15 @@ fn read_located(
             "invalid driver/module name",
         ));
     }
-    let path = locate(root, subdirectory, name).canonicalize()?;
+    let path = locate(root, subdirectory, name)
+        .canonicalize()
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{name}.rhai not found in {subdirectory}"),
+            ),
+            _ => error,
+        })?;
     if !path.starts_with(root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
