@@ -102,13 +102,36 @@ pub fn runtime_event(event: &Event) {
 pub fn mqtt_diagnostic(diagnostic: &MqttDiagnostic) {
     match diagnostic {
         MqttDiagnostic::Connected { .. } => tracing::info!(?diagnostic, "MQTT client connected"),
+        // The reason leads: long lines get cut, and it is what the line exists to report.
         MqttDiagnostic::Closed {
-            reason: Disconnect::Eof | Disconnect::Closed,
-            ..
+            generation,
+            client,
+            session,
+            ready,
+            reason,
+            rejected,
         } => {
-            tracing::info!(?diagnostic, "MQTT client closed");
+            if matches!(reason, Disconnect::Eof | Disconnect::Closed) {
+                tracing::info!(
+                    ?reason,
+                    ?client,
+                    generation,
+                    ready,
+                    ?session,
+                    "MQTT client closed"
+                );
+            } else {
+                tracing::warn!(
+                    ?reason,
+                    ?rejected,
+                    ?client,
+                    generation,
+                    ready,
+                    ?session,
+                    "MQTT client failed"
+                );
+            }
         }
-        MqttDiagnostic::Closed { .. } => tracing::warn!(?diagnostic, "MQTT client failed"),
     }
 }
 
@@ -127,6 +150,35 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn mqtt_failure_leads_with_its_reason_and_lg_steps_pass_the_default_filter() {
+        let output = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(DEFAULT_FILTER))
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            mqtt_diagnostic(&MqttDiagnostic::Closed {
+                generation: 1,
+                client: Some("test-device".into()),
+                session: None,
+                ready: true,
+                reason: Disconnect::Mqtt(rusthinq_server::MqttFailure::UnsubscribedTopic),
+                rejected: None,
+            });
+            tracing::info!(target: "rusthinq_bridge::cloud", step = "add_device", "LG API refused");
+            tracing::debug!(target: "rusthinq_bridge::cloud", step = "route", "LG API response");
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let reason = text.find("UnsubscribedTopic").unwrap();
+        assert!(reason < text.find("test-device").unwrap(), "{text}");
+        assert!(text.contains("step=\"add_device\""), "{text}");
+        assert!(!text.contains("step=\"route\""), "{text}");
     }
 
     #[test]

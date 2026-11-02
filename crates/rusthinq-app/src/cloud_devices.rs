@@ -708,6 +708,9 @@ impl Runtime {
             let result = self
                 .command(command.operation, command.registration, &mut stop)
                 .await;
+            if result.is_ok() {
+                tracing::info!(device = %target, operation, "bridge operation completed");
+            }
             if let Err(error) = &result {
                 tracing::warn!(device = %target, operation, %error, "bridge operation failed");
                 self.project();

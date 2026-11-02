@@ -1,7 +1,7 @@
 //! Local ThinQ2 device MQTT service. No external broker, cloud dial, or device semantics.
 use crate::{
-    Command, Config, Delivery, Disconnect, Entry, Event, Guard, MqttDiagnostic, Protocol, Receipt,
-    Reject, ServerHandle, SessionId, Shared, State,
+    Command, Config, Delivery, Disconnect, Entry, Event, Guard, MqttDiagnostic, MqttFailure,
+    Protocol, Receipt, Reject, RejectedPublish, ServerHandle, SessionId, Shared, State,
     tls::{LocalFuture, LocalService, Transport},
     write_frame,
 };
@@ -290,6 +290,20 @@ fn encode_publish(topic: &str, payload: &[u8], config: &Config) -> Result<Vec<u8
     }
     mqtt::publish(topic, payload, maximum(config))
 }
+fn rejected_publish(topic: &str, payload: &[u8]) -> RejectedPublish {
+    const LIMIT: usize = 128;
+    let bounded = |text: &str| text.chars().take(LIMIT).collect::<String>();
+    let value: Option<Value> =
+        serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(payload)).ok();
+    RejectedPublish {
+        topic: bounded(topic),
+        cmd: value
+            .as_ref()
+            .and_then(|value| value["cmd"].as_str())
+            .map(bounded),
+        payload_len: payload.len(),
+    }
+}
 fn maximum(config: &Config) -> usize {
     config.max_payload.saturating_add(4096)
 }
@@ -299,17 +313,25 @@ async fn read_packet<S: AsyncRead + Unpin>(
 ) -> Result<Packet, Disconnect> {
     let mut bytes = vec![stream.read_u8().await.map_err(|_| Disconnect::Eof)?];
     loop {
-        match mqtt::length(&bytes, maximum).map_err(|_| Disconnect::Mqtt)? {
+        match mqtt::length(&bytes, maximum)
+            .map_err(|error| Disconnect::Mqtt(MqttFailure::Malformed(error)))?
+        {
             Some(length) => {
                 let header = bytes.len();
                 bytes.resize(length, 0);
                 stream
                     .read_exact(&mut bytes[header..])
                     .await
-                    .map_err(|_| Disconnect::Mqtt)?;
-                return mqtt::decode(&bytes, maximum).map_err(|_| Disconnect::Mqtt);
+                    .map_err(|_| Disconnect::Mqtt(MqttFailure::Truncated))?;
+                return mqtt::decode(&bytes, maximum)
+                    .map_err(|error| Disconnect::Mqtt(MqttFailure::Malformed(error)));
             }
-            None => bytes.push(stream.read_u8().await.map_err(|_| Disconnect::Mqtt)?),
+            None => bytes.push(
+                stream
+                    .read_u8()
+                    .await
+                    .map_err(|_| Disconnect::Mqtt(MqttFailure::Truncated))?,
+            ),
         }
     }
 }
@@ -331,6 +353,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut ready = false;
     let mut will = None;
     let mut clean_disconnect = false;
+    let mut rejected = None;
     let mut idle = config.idle_timeout;
     let mut deadline = Instant::now() + idle;
     let mut filters: Vec<String> = Vec::new();
@@ -422,8 +445,8 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 deadline = Instant::now() + idle;
                 replies.push(vec![0x20, 2, 0, 0]);
             }
-            _ if !connected => break Disconnect::Mqtt,
-            Packet::Connect { .. } => break Disconnect::Mqtt,
+            _ if !connected => break Disconnect::Mqtt(MqttFailure::BeforeConnect),
+            Packet::Connect { .. } => break Disconnect::Mqtt(MqttFailure::DuplicateConnect),
             Packet::Subscribe {
                 id,
                 filters: requested,
@@ -435,7 +458,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
                 if next.len() > 16 {
-                    break Disconnect::Mqtt;
+                    break Disconnect::Mqtt(MqttFailure::TooManyFilters);
                 }
                 filters = next;
                 let mut body = id.to_be_bytes().to_vec();
@@ -462,15 +485,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 ..
             } => {
                 if payload.len() > config.max_payload {
-                    break Disconnect::Mqtt;
+                    break Disconnect::Mqtt(MqttFailure::PayloadExceeded);
                 }
                 if let Some((_, previous_topic, previous_payload)) = qos2.get(&id) {
                     if previous_topic != &topic || previous_payload != &payload {
-                        break Disconnect::Mqtt;
+                        break Disconnect::Mqtt(MqttFailure::Qos2Conflict);
                     }
                 } else {
                     if qos2.len() >= config.outbound_capacity {
-                        break Disconnect::Mqtt;
+                        break Disconnect::Mqtt(MqttFailure::Qos2Full);
                     }
                     qos2.insert(id, (guard.generation, topic, payload));
                 }
@@ -489,6 +512,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         start.elapsed(),
                     );
                     if let Some(error) = outcome.error {
+                        rejected = Some(rejected_publish(&topic, &payload));
                         break Disconnect::ThinQ2(error);
                     }
                     actions = outcome.actions;
@@ -513,6 +537,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     start.elapsed(),
                 );
                 if let Some(error) = outcome.error {
+                    rejected = Some(rejected_publish(&topic, &payload));
                     break Disconnect::ThinQ2(error);
                 }
                 actions = outcome.actions;
@@ -560,7 +585,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     let device = request["did"].as_str().expect("L1 deploy ID").to_owned();
                     if device.len() > 256 {
-                        break 'connection Disconnect::Mqtt;
+                        break 'connection Disconnect::Mqtt(MqttFailure::DeviceIdTooLong);
                     }
                     {
                         let mut state = broker.shared.lock();
@@ -723,7 +748,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 Action::Ready { device_id, deploy } => {
                     let id = guard.id.clone().expect("provisioned identity");
                     if id.device != device_id {
-                        break 'connection Disconnect::Mqtt;
+                        break 'connection Disconnect::Mqtt(MqttFailure::DeviceIdChanged);
                     }
                     {
                         let mut state = broker.shared.lock();
@@ -749,11 +774,11 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     bridge_generation: None,
                 } => {
                     if !filters.iter().any(|filter| mqtt::matches(filter, &topic)) {
-                        break 'connection Disconnect::Mqtt;
+                        break 'connection Disconnect::Mqtt(MqttFailure::UnsubscribedTopic);
                     }
                     let frame = match encode_publish(&topic, &payload, config) {
                         Ok(frame) => frame,
-                        Err(_) => break 'connection Disconnect::Mqtt,
+                        Err(_) => break 'connection Disconnect::Mqtt(MqttFailure::EncodeFailed),
                     };
                     if let Err((reason, _)) = write_frame(
                         &mut writer,
@@ -772,7 +797,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 Action::TimeSyncRequested => {
                     let Some(did) = model.device_id() else {
-                        break 'connection Disconnect::Mqtt;
+                        break 'connection Disconnect::Mqtt(MqttFailure::NotIdentified);
                     };
                     let sample = match broker.clock.sample() {
                         Ok(sample) => sample,
@@ -812,7 +837,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         ));
                     }
                 }
-                _ => break 'connection Disconnect::Mqtt,
+                _ => break 'connection Disconnect::Mqtt(MqttFailure::UnexpectedAction),
             }
         }
     };
@@ -842,6 +867,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         session: guard.id.clone(),
         ready,
         reason: reason.clone(),
+        rejected,
     });
     guard.reason = reason;
     drop(reader);

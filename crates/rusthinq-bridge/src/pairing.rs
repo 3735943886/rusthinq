@@ -252,12 +252,14 @@ pub(crate) struct ResultMaterial {
 }
 pub(crate) async fn iot(
     client: &Client,
+    step: &'static str,
     url: Url,
     headers: HeaderMap,
     body: Option<Value>,
 ) -> Result<Value, Error> {
     let raw = client
         .request(
+            step,
             url,
             if body.is_some() {
                 Method::POST
@@ -295,7 +297,7 @@ pub(crate) async fn pair_at(
     headers.insert("x-service-phase", "OP".parse().expect("constant"));
     let route = tokio::time::timeout(
         Duration::from_secs(5),
-        iot(client, append(&route, "route")?, headers, None),
+        iot(client, "route", append(&route, "route")?, headers, None),
     )
     .await
     .map_err(|_| Error::Network)??;
@@ -307,7 +309,7 @@ pub(crate) async fn pair_at(
     service(&mqtt)?;
     let mut ca_url = append(&api, "route/certificate")?;
     ca_url.query_pairs_mut().append_pair("name", "aws-iot");
-    let ca = iot(client, ca_url, HeaderMap::new(), None).await?;
+    let ca = iot(client, "route_certificate", ca_url, HeaderMap::new(), None).await?;
     let ca = ca["certificatePem"]
         .as_str()
         .ok_or(Error::InvalidResponse)?
@@ -327,7 +329,7 @@ pub(crate) async fn pair_at(
         "content-type",
         "application/json".parse().expect("constant"),
     );
-    let result=iot(client,certificate_url,headers,Some(json!({"otp":otp,"csr":crypto.csr,"publickey":crypto.public,"ciphertext":crypto.certificate_ciphertext}))).await?;
+    let result=iot(client,"device_certificate",certificate_url,headers,Some(json!({"otp":otp,"csr":crypto.csr,"publickey":crypto.public,"ciphertext":crypto.certificate_ciphertext}))).await?;
     let material = Material::ThinQ2 {
         country: country.into(),
         api_server: api.into(),
