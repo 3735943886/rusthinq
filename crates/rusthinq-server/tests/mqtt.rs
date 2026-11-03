@@ -912,6 +912,7 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let handle = broker.handle();
     let mut events = handle.subscribe();
+    let mut diagnostics = handle.mqtt_diagnostics();
     let (a, mut peer) = tokio::io::duplex(8192);
     let runtime = broker.clone();
     let task = tokio::spawn(async move {
@@ -926,33 +927,69 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
         .await
         .unwrap();
     assert_eq!(wire(&mut peer).await, vec![0xb0, 2, 0, 9]);
-    assert_eq!(
-        handle.send(&id, b"{}").unwrap().wait().await,
-        Delivery::Failed
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            handle
+                .send(&id, br#"{"cmd":"packet"}"#)
+                .unwrap()
+                .wait()
+                .await,
+            Delivery::Failed
+        );
+    }
     peer.write_all(&[0xc0, 0]).await.unwrap();
     assert_eq!(wire(&mut peer).await, vec![0xd0, 0]);
     broker.stop();
     task.await.unwrap();
+    let mut subscribed = false;
+    let mut refused = vec![];
+    while let Ok(diagnostic) = diagnostics.try_recv() {
+        match diagnostic {
+            MqttDiagnostic::Subscribed { filters, .. } => {
+                subscribed |= filters.iter().any(|filter| filter == topic)
+            }
+            MqttDiagnostic::DownlinkRefused { reason, cmd, .. } => refused.push((reason, cmd)),
+            _ => {}
+        }
+    }
+    assert!(subscribed);
+    assert_eq!(
+        refused,
+        vec![(
+            rusthinq_server::DownlinkRefusal::NotSubscribed,
+            Some("packet".to_owned())
+        )]
+    );
 }
 
-#[tokio::test]
-async fn protocol_rejection_diagnostic_names_the_publish_without_its_payload() {
-    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
-    let mut events = broker.handle().subscribe();
-    let mut diagnostics = broker.handle().mqtt_diagnostics();
-    let (stream, mut peer) = tokio::io::duplex(8192);
-    let runtime = broker.clone();
-    let task = tokio::spawn(async move { runtime.run(stream).await });
-    ready(&mut peer, "d", &mut events).await;
-    let topic = "clip/message/devices/other";
-    let payload = br#"{"did":"d","cmd":"private-command","data":"private-data"}"#;
+async fn publish_raw(peer: &mut tokio::io::DuplexStream, topic: &str, payload: &[u8]) {
     let mut body = (topic.len() as u16).to_be_bytes().to_vec();
     body.extend_from_slice(topic.as_bytes());
     body.extend_from_slice(payload);
     peer.write_all(&mqtt::frame(0x30, &body, 8192).unwrap())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_rejection_diagnostic_names_the_publish_without_its_payload() {
+    let config = Config {
+        max_payload: 1024,
+        ..Config::default()
+    };
+    let broker = Broker::new(config, Arc::new(FixedClock)).unwrap();
+    let mut events = broker.handle().subscribe();
+    let mut diagnostics = broker.handle().mqtt_diagnostics();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await });
+    ready(&mut peer, "d", &mut events).await;
+    let topic = "clip/message/devices/d";
+    let payload = format!(
+        r#"{{"cmd":"private-command","did":"d","data":"private-data{}"}}"#,
+        "x".repeat(1024)
+    );
+    publish_raw(&mut peer, topic, payload.as_bytes()).await;
     let closed = loop {
         let diagnostic = timeout(Duration::from_secs(2), diagnostics.recv())
             .await
@@ -970,17 +1007,120 @@ async fn protocol_rejection_diagnostic_names_the_publish_without_its_payload() {
     };
     assert_eq!(
         *reason,
-        Disconnect::ThinQ2(rusthinq_protocol::thinq2::Error::InvalidTopic)
+        Disconnect::ThinQ2(rusthinq_protocol::thinq2::Error::PayloadExceeded)
     );
     assert_eq!(
         *rejected,
         Some(RejectedPublish {
             topic: topic.into(),
+            did: Some("d".into()),
             cmd: Some("private-command".into()),
+            keys: Some(vec!["cmd".into(), "data".into(), "did".into()]),
             payload_len: payload.len(),
         })
     );
     assert!(!format!("{closed:?}").contains("private-data"));
+    let _ = task.await;
+    broker.stop();
+}
+
+#[tokio::test]
+async fn dropped_publishes_keep_the_session_and_log_once_per_kind() {
+    use rusthinq_protocol::thinq2::Error;
+    let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
+    let mut events = broker.handle().subscribe();
+    let mut diagnostics = broker.handle().mqtt_diagnostics();
+    let (stream, mut peer) = tokio::io::duplex(8192);
+    let runtime = broker.clone();
+    let task = tokio::spawn(async move { runtime.run(stream).await });
+    let id = ready(&mut peer, "d", &mut events).await;
+
+    let express = "$aws/rules/monitoring_express_rule/express/monitoring/501/devices/d";
+    let state = br#"{"state":"private-state"}"#;
+    let clip = "clip/message/devices/d";
+    publish_raw(&mut peer, express, state).await;
+    publish_raw(&mut peer, express, state).await;
+    publish_raw(&mut peer, clip, b"not json").await;
+    publish_raw(&mut peer, clip, br#"{"did":"d"}"#).await;
+
+    // A QoS1 publish outside CLIP is still acknowledged.
+    let mut body = (express.len() as u16).to_be_bytes().to_vec();
+    body.extend_from_slice(express.as_bytes());
+    body.extend_from_slice(&[0, 7]);
+    body.extend_from_slice(state);
+    peer.write_all(&mqtt::frame(0x32, &body, 8192).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(wire(&mut peer).await, vec![0x40, 2, 0, 7]);
+
+    // The session still works, and the original payload reaches the trace-only event.
+    publish_raw(
+        &mut peer,
+        clip,
+        br#"{"did":"d","cmd":"device_packet","data":"AA"}"#,
+    )
+    .await;
+    let mut traced = 0;
+    loop {
+        match timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::PublishIgnored(session, _, payload) => {
+                assert_eq!(session, id);
+                if payload == state {
+                    traced += 1;
+                }
+            }
+            Event::Data(_, data) => {
+                assert_eq!(data, vec![0xaa]);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(traced, 3);
+
+    peer.write_all(&[0xe0, 0]).await.unwrap();
+    let mut logged = vec![];
+    let closed = loop {
+        let diagnostic = timeout(Duration::from_secs(2), diagnostics.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!format!("{diagnostic:?}").contains("private-state"));
+        match diagnostic {
+            MqttDiagnostic::PublishIgnored {
+                reason, publish, ..
+            } => logged.push((reason, publish.topic, publish.keys)),
+            MqttDiagnostic::Closed { .. } => break diagnostic,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        logged,
+        vec![
+            (
+                Error::OutsideClip,
+                express.to_owned(),
+                Some(vec!["state".to_owned()])
+            ),
+            (Error::InvalidJson, clip.to_owned(), None),
+            (
+                Error::InvalidEnvelope,
+                clip.to_owned(),
+                Some(vec!["did".to_owned()])
+            ),
+        ]
+    );
+    assert!(matches!(
+        closed,
+        MqttDiagnostic::Closed {
+            ignored_publishes: 5,
+            ..
+        }
+    ));
     let _ = task.await;
     broker.stop();
 }

@@ -346,28 +346,57 @@ impl Runtime {
                     incarnation: pair.incarnation,
                     account: identity.clone(),
                 };
+                if self
+                    .records()
+                    .iter()
+                    .any(|record| record.attempt.owner.device == pair.device)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "pairing intent already owned",
+                    ));
+                }
+                let new_device = || NewDevice {
+                    id: &pair.device,
+                    alias: &pair.alias,
+                    model: &pair.model,
+                    device_type: &pair.device_type,
+                    platform: if pair.thinq2 { "thinq2" } else { "thinq1" },
+                    ciphertext: None,
+                };
+                // Reads only, so a failure records nothing and pairing can simply be tried again.
+                let prepared = owned_remote(&self.account, &identity, epoch, stop, async {
+                    timeout(
+                        Duration::from_secs(30),
+                        client.prepare_pairing(new_device()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "pairing preparation timed out")
+                    })?
+                    .map_err(|e| io::Error::other(format!("{e:?}")))
+                })
+                .await?;
+                let unchanged = |runtime: &Self| {
+                    runtime.current(&pair.device, pair.incarnation)
+                        && *cancelled.borrow() == epoch
+                        && runtime
+                            .account
+                            .authenticated_client()
+                            .is_ok_and(|c| c.account_identity() == Some(identity.as_str()))
+                };
+                if !unchanged(self) {
+                    return Err(stale());
+                }
                 let attempt = self.storage(move |store| store.begin(owner)).await?;
                 self.project();
-                if !self.current(&pair.device, pair.incarnation)
-                    || *cancelled.borrow() != epoch
-                    || !self
-                        .account
-                        .authenticated_client()
-                        .is_ok_and(|c| c.account_identity() == Some(identity.as_str()))
-                {
+                if !unchanged(self) {
                     return Err(stale());
                 }
                 // Intent is already durable. Unknown remote outcomes stay owned and are never retried.
                 let remote = async {
                     client
-                        .pair_device(NewDevice {
-                            id: &pair.device,
-                            alias: &pair.alias,
-                            model: &pair.model,
-                            device_type: &pair.device_type,
-                            platform: if pair.thinq2 { "thinq2" } else { "thinq1" },
-                            ciphertext: None,
-                        })
+                        .finish_pairing(new_device(), prepared)
                         .await
                         .map_err(|e| io::Error::other(format!("{e:?}")))
                 };
@@ -772,6 +801,7 @@ async fn supervise(
     .await
     .map_err(|e| io::Error::other(format!("{e:?}")))??;
     let mut backoff = 1;
+    let mut logged_error = None;
     let mut states = context.app.state_changes();
     loop {
         if *stop.borrow() {
@@ -878,9 +908,17 @@ async fn supervise(
             // A session that reached Ready was healthy: reconnect promptly, as 0.1 did.
             if status.connected {
                 backoff = 1;
+                logged_error = None;
             }
             status.connected = false;
             status.error = result.as_ref().err().map(ToString::to_string);
+            // Reconnecting repeats the same failure; a change or a lost healthy session is news.
+            if status.error != logged_error {
+                if let Some(error) = &status.error {
+                    tracing::warn!(%device, %error, "bridge connection failed");
+                }
+                logged_error = status.error.clone();
+            }
         }
         context.app.cloud_changed(device.clone());
         if *stop.borrow() {
@@ -1023,12 +1061,18 @@ async fn connected(session: CloudSession<'_>, signals: SessionSignals<'_>) -> io
                     // A device with a driver gets its acks from the driver (aabb_common's ack), as upstream rethink does.
                     if ready && matches!(material,Material::ThinQ2{..}) && context.app.script_states().get(&local.device).is_some_and(|(key,_,_)|key.generation==local.generation)
                         && serde_json::from_slice::<serde_json::Value>(payload.strip_suffix(&[0]).unwrap_or(&payload)).is_ok_and(|value|value["cmd"]=="ack") {
+                        tracing::debug!(device=%local.device,"LG ack withheld; the driver acks this device");
                         let _=result.send(true);continue;
                     }
                     let receipt=if ready && matches!(material,Material::ThinQ1{..}){context.bridge.downlink(registration,local,&payload,&context.server,Some(&context.firmware)).map_err(|e|io::Error::other(format!("{e:?}")))}else if ready{
                         let value:serde_json::Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|e|io::Error::other(format!("{e:?}")))?;context.firmware.learn_command(&value)?;context.broker.cloud(local,generation,&payload).map_err(|e|io::Error::other(format!("{e:?}")))
                     }else{Err(stale())};
-                    let delivered=match receipt{Ok(receipt)=>timeout(Duration::from_secs(15),receipt.wait()).await==Ok(rusthinq_server::Delivery::Sent),Err(_)=>false};let _=result.send(delivered);
+                    let delivered=match receipt{Ok(receipt)=>timeout(Duration::from_secs(15),receipt.wait()).await==Ok(rusthinq_server::Delivery::Sent),Err(_)=>false};
+                    if ready && !delivered {
+                        let cmd=serde_json::from_slice::<serde_json::Value>(payload.strip_suffix(&[0]).unwrap_or(&payload)).ok().and_then(|value|value["cmd"].as_str().map(|cmd|cmd.chars().take(64).collect::<String>()));
+                        tracing::warn!(device=%local.device,?cmd,payload_len=payload.len(),"LG message not delivered to device");
+                    }
+                    let _=result.send(delivered);
                 },None=>return Err(stale())
             },
             event=events.recv()=>{

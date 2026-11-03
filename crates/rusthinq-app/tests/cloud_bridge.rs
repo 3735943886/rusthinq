@@ -103,7 +103,8 @@ async fn lg_http(listener: TcpListener, inventory_id: &str) {
     lg_http_with(listener, inventory).await
 }
 
-/// `inventory` is the account's device list; registering a device adds to it.
+/// `inventory` is the account's device list; registering a device adds to it. The entries
+/// `refuse-list` and `refuse-add` make LG refuse that request.
 async fn lg_http_with(listener: TcpListener, inventory: Arc<std::sync::Mutex<Vec<String>>>) {
     let acceptor = acceptor("lg.test");
     loop {
@@ -134,6 +135,12 @@ async fn lg_http_with(listener: TcpListener, inventory: Arc<std::sync::Mutex<Vec
             "/api/service/users/client" => json!({"resultCode":"0000","result":{}}),
             "/api/service/homes" => {
                 json!({"resultCode":"0000","result":{"item":[{"homeId":"h","currentHomeYn":"Y"}]}})
+            }
+            "/api/service/homes/h" if inventory.lock().unwrap().iter().any(|id| id == "refuse-list") => {
+                json!({"resultCode":"9999"})
+            }
+            "/api/service/homes/h/devices" if inventory.lock().unwrap().iter().any(|id| id == "refuse-add") => {
+                json!({"resultCode":"9999"})
             }
             "/api/service/homes/h" => {
                 let devices = inventory.lock().unwrap().iter().map(|id| json!({"deviceId":id,"alias":"LG room"})).collect::<Vec<_>>();
@@ -652,6 +659,103 @@ async fn bridge_round_trips(late_local: bool) {
         .unwrap()
         .unwrap()
         .unwrap();
+    lg.abort();
+}
+
+/// A refusal while pairing only reads can be retried right away. Once the registering request has
+/// gone out, the attempt stays owned until it is reconciled.
+#[tokio::test]
+async fn pairing_failure_before_any_change_leaves_nothing_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Storage::open(&dir.path().join("devices.json"), 8).unwrap();
+    storage
+        .save(&Ledger {
+            revision: 1,
+            next_incarnation: 2,
+            entries: vec![Entry {
+                id: "d".into(),
+                incarnation: 1,
+                last_generation: 0,
+            }],
+        })
+        .unwrap();
+    let server = rusthinq_server::Server::new(Default::default()).unwrap();
+    let runtime =
+        rusthinq_app::runtime::Runtime::new(storage, server.handle(), Duration::ZERO, 32).unwrap();
+    std::fs::write(
+        dir.path().join("account.json"),
+        json!({"schema":1,"credentials":{"country":"KR","refresh":"refresh"}}).to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let lg_inventory = Arc::new(std::sync::Mutex::new(vec!["refuse-list".to_owned()]));
+    let lg = tokio::spawn(lg_http_with(listener, lg_inventory.clone()));
+    let (account, account_runtime) =
+        rusthinq_app::cloud_account::open(dir.path().join("account.json"))
+            .await
+            .unwrap();
+    let account_runtime = account_runtime.with_client_factory(move |country| {
+        Client::with_test_service(
+            country,
+            "https://lg.test/gateway",
+            authority().certificate_pem(),
+            &["lg.test"],
+            address,
+        )
+    });
+    let broker = rusthinq_server::mqtt::Broker::sharing(server.handle(), Arc::new(SystemClock));
+    let relay =
+        passthrough::Relay::new(Default::default(), Arc::new(passthrough::HttpsConnector)).unwrap();
+    let (handle, cloud, _) = rusthinq_app::cloud_devices::Runtime::open(
+        dir.path().join("pairings.json"),
+        account.clone(),
+        runtime.handle(),
+        server.handle(),
+        broker.handle(),
+        relay,
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = watch::channel(false);
+    let account_task = tokio::spawn(account_runtime.run(stopped.clone()));
+    let cloud_task = tokio::spawn(cloud.run(stopped));
+    timeout(Duration::from_secs(5), async {
+        while !account.status().logged_in {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pair = || {
+        rusthinq_app::cloud_devices::Operation::Pair(rusthinq_app::cloud_devices::Pair {
+            device: "d".into(),
+            incarnation: 1,
+            alias: "Model".into(),
+            device_type: "401".into(),
+            model: "Model".into(),
+            thinq2: false,
+        })
+    };
+
+    handle.operate(pair()).await.unwrap_err();
+    assert!(handle.snapshot().is_empty());
+
+    *lg_inventory.lock().unwrap() = vec!["refuse-add".to_owned()];
+    handle.operate(pair()).await.unwrap_err();
+    assert_eq!(handle.snapshot().len(), 1);
+    lg_inventory.lock().unwrap().clear();
+    let owned = handle.operate(pair()).await.unwrap_err();
+    assert_eq!(owned.kind(), std::io::ErrorKind::AlreadyExists);
+
+    stop.send_replace(true);
+    for task in [account_task, cloud_task] {
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
     lg.abort();
 }
 

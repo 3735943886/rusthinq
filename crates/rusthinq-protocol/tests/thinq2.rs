@@ -189,6 +189,50 @@ fn aws_republish_topic_and_single_trailing_nul_are_accepted() {
 }
 
 #[test]
+fn publish_outside_clip_is_ignored_and_keeps_the_session() {
+    let topic = "$aws/rules/monitoring_express_rule/express/monitoring/501/devices/dev-1";
+    let mut model = Session::new(4096, false, Duration::ZERO);
+    deploy(&mut model, "unknown");
+    ready(&mut model);
+    for payload in [&br#"{"state":{"reported":{}}}"#[..], b"not json"] {
+        let outcome = model.input(Input::Device { topic, payload }, Duration::ZERO);
+        assert_eq!(outcome.error, Some(Error::OutsideClip));
+        assert!(!outcome.closed);
+        assert!(outcome.actions.is_empty());
+    }
+    let outcome = input(
+        &mut model,
+        "clip/message/devices/dev-1",
+        json!({"did":"dev-1","cmd":"req_timesync"}),
+    );
+    assert_eq!(outcome.actions, vec![Action::TimeSyncRequested]);
+
+    // Before provisioning too: it is not part of the provisioning sequence.
+    let mut model = Session::new(4096, false, Duration::ZERO);
+    let outcome = model.input(
+        Input::Device {
+            topic,
+            payload: b"{}",
+        },
+        Duration::ZERO,
+    );
+    assert_eq!(outcome.error, Some(Error::OutsideClip));
+    assert!(!outcome.closed);
+
+    // Ignoring it does not lift the bound.
+    let mut model = Session::new(4, false, Duration::ZERO);
+    let outcome = model.input(
+        Input::Device {
+            topic: "a/b",
+            payload: &[0; 5],
+        },
+        Duration::ZERO,
+    );
+    assert_eq!(outcome.error, Some(Error::PayloadExceeded));
+    assert!(outcome.closed);
+}
+
+#[test]
 fn unknown_clip_is_preserved_and_not_confused_with_command_completion() {
     let mut model = Session::new(4096, false, Duration::ZERO);
     deploy(&mut model, "unknown");
@@ -211,7 +255,7 @@ fn unknown_clip_is_preserved_and_not_confused_with_command_completion() {
 }
 
 #[test]
-fn device_errors_are_explicit_and_terminal() {
+fn unusable_publishes_are_explicit_and_keep_the_session() {
     for (topic, value, expected) in [
         (
             "clip/message/devices/other",
@@ -249,12 +293,14 @@ fn device_errors_are_explicit_and_terminal() {
         ready(&mut model);
         let outcome = input(&mut model, topic, value);
         assert_eq!(outcome.error, Some(expected));
-        assert!(outcome.closed);
+        assert!(!outcome.closed);
         assert!(outcome.actions.is_empty());
-        assert_eq!(
-            model.input(Input::End, Duration::ZERO).error,
-            Some(Error::Closed)
+        let outcome = input(
+            &mut model,
+            "clip/message/devices/dev-1",
+            json!({"did":"dev-1","cmd":"req_timesync"}),
         );
+        assert_eq!(outcome.actions, vec![Action::TimeSyncRequested]);
     }
 }
 

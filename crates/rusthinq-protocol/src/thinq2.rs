@@ -9,6 +9,8 @@ pub enum Error {
     InvalidJson,
     InvalidEnvelope,
     InvalidTopic,
+    /// Published outside `clip/`; not a CLIP message at all.
+    OutsideClip,
     DeviceIdChanged,
     NotProvisioned,
     BridgeDisabled,
@@ -61,7 +63,8 @@ pub enum Action {
 pub struct Outcome {
     pub actions: Vec<Action>,
     pub error: Option<Error>,
-    /// Device protocol errors are terminal; rejected cloud input is not.
+    /// Exceeded bounds and backwards time are terminal; dropped publishes and rejected cloud
+    /// input are not.
     pub closed: bool,
     /// MQTT keepalive is owned by the broker, not a second protocol timer.
     pub next_deadline: Option<Duration>,
@@ -176,7 +179,20 @@ impl Session {
                 next_deadline: None,
             },
             Err(error) => {
-                if (!cloud_input && !matches!(error, Error::Busy | Error::StaleBridge))
+                // LG-005: a publish the session cannot use is dropped, as in 0.1 and upstream.
+                let dropped = matches!(
+                    error,
+                    Error::Busy
+                        | Error::StaleBridge
+                        | Error::InvalidJson
+                        | Error::InvalidEnvelope
+                        | Error::InvalidTopic
+                        | Error::OutsideClip
+                        | Error::DeviceIdChanged
+                        | Error::NotProvisioned
+                        | Error::InvalidHex
+                );
+                if (!cloud_input && !dropped)
                     || matches!(error, Error::Closed | Error::TimeWentBackwards)
                 {
                     self.closed = true;
@@ -225,10 +241,18 @@ impl Session {
         if topic.len() > self.max_payload {
             return Err(Error::PayloadExceeded);
         }
+        let topic = normalize_clip_topic(topic);
+        // LG-005: firmware also publishes outside CLIP, in formats that are not CLIP envelopes.
+        if !topic.starts_with("clip/") {
+            return Err(if payload.len() > self.max_payload {
+                Error::PayloadExceeded
+            } else {
+                Error::OutsideClip
+            });
+        }
         let value = self.parse(payload)?;
         let id = value["did"].as_str().ok_or(Error::InvalidEnvelope)?;
         let cmd = value["cmd"].as_str().ok_or(Error::InvalidEnvelope)?;
-        let topic = normalize_clip_topic(topic);
         if topic == format!("clip/provisioning/devices/{id}")
             && matches!(cmd, "deploy" | "preDeploy")
         {
