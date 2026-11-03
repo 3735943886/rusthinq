@@ -280,14 +280,24 @@ pub(crate) async fn iot(
     }
     Ok(raw.get("result").cloned().unwrap_or(raw))
 }
-pub(crate) async fn pair_at(
+/// Everything read before the request that issues a certificate. LG invalidates the appliance's
+/// own certificate when it issues a new one, so up to here nothing has changed.
+pub(crate) struct CertificateRequest {
+    crypto: Crypto,
+    country: String,
+    otp: String,
+    api: Url,
+    mqtt: String,
+    ca: String,
+}
+pub(crate) async fn prepare_at(
     client: &Client,
     route: Url,
     country: &str,
     id: &str,
     otp: &str,
     key: &str,
-) -> Result<ResultMaterial, Error> {
+) -> Result<CertificateRequest, Error> {
     let crypto = prepare(id, otp, key)?;
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -315,6 +325,28 @@ pub(crate) async fn pair_at(
         .ok_or(Error::InvalidResponse)?
         .to_owned();
     certificates(&ca)?;
+    Ok(CertificateRequest {
+        crypto,
+        country: country.into(),
+        otp: otp.into(),
+        api,
+        mqtt,
+        ca,
+    })
+}
+pub(crate) async fn request_certificate(
+    client: &Client,
+    id: &str,
+    request: CertificateRequest,
+) -> Result<ResultMaterial, Error> {
+    let CertificateRequest {
+        crypto,
+        country,
+        otp,
+        api,
+        mqtt,
+        ca,
+    } = request;
     let mut certificate_url = api.clone();
     certificate_url
         .path_segments_mut()
@@ -331,7 +363,7 @@ pub(crate) async fn pair_at(
     );
     let result=iot(client,"device_certificate",certificate_url,headers,Some(json!({"otp":otp,"csr":crypto.csr,"publickey":crypto.public,"ciphertext":crypto.certificate_ciphertext}))).await?;
     let material = Material::ThinQ2 {
-        country: country.into(),
+        country,
         api_server: api.into(),
         mqtt_server: mqtt,
         ca_certificate: ca,

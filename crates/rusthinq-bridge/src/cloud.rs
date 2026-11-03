@@ -180,6 +180,16 @@ fn parse_token(raw: &Value, now_ms: u64) -> Result<Token, Error> {
         valid_until_ms,
     })
 }
+/// The result of `Client::prepare_pairing`, for `Client::finish_pairing`.
+pub struct PreparedPairing {
+    alias: String,
+    listed: bool,
+    step: PreparedStep,
+}
+enum PreparedStep {
+    ThinQ2(crate::pairing::CertificateRequest),
+    ThinQ1(crate::pairing::Material),
+}
 impl Client {
     pub fn new(country: &str) -> Result<Self, Error> {
         if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) {
@@ -781,58 +791,86 @@ impl Client {
         }
         Ok((otp.into(), key.into()))
     }
-    /// Pair and register without deleting an existing appliance or changing its alias.
-    pub async fn pair_device(
-        &self,
-        device: NewDevice<'_>,
-    ) -> Result<crate::pairing::Material, Error> {
+    /// Read what pairing needs. This changes nothing on the appliance or the account, so a failure
+    /// here leaves nothing to reconcile.
+    pub async fn prepare_pairing(&self, device: NewDevice<'_>) -> Result<PreparedPairing, Error> {
         let devices = self.list_devices().await?;
         let registered = devices.iter().find(|entry| entry["deviceId"] == device.id);
         let alias = registered
             .and_then(|entry| entry["alias"].as_str())
-            .unwrap_or(device.alias);
-        let device = NewDevice { alias, ..device };
-        if device.platform == "thinq2" {
-            let (otp, key) = self.certificate_otp().await?;
-            let paired = crate::pairing::pair_at(
-                self,
-                endpoint(IOT_BASE_URL)?,
-                &self.country,
-                device.id,
-                &otp,
-                &key,
-            )
-            .await?;
-            self.register_paired(
-                NewDevice {
-                    ciphertext: Some(&paired.registration_ciphertext),
-                    ..device
-                },
-                registered.is_some(),
-            )
-            .await?;
-            return Ok(paired.material);
-        }
-        if device.platform != "thinq1" {
-            return Err(Error::InvalidInput);
-        }
-        let gateway = self.gateway.as_ref().ok_or(Error::NotAuthenticated)?;
-        let mut http = gateway.thinq1.clone().ok_or(Error::InvalidResponse)?;
-        if let Some(path) = http.path().strip_suffix("/api") {
-            let path = path.to_owned();
-            http.set_path(&path);
-        }
-        let material = crate::pairing::Material::ThinQ1 {
-            http_server: http.into(),
-            rti_server: gateway.rti.clone().ok_or(Error::InvalidResponse)?,
+            .unwrap_or(device.alias)
+            .to_owned();
+        let listed = registered.is_some();
+        let step = match device.platform {
+            "thinq2" => {
+                let (otp, key) = self.certificate_otp().await?;
+                PreparedStep::ThinQ2(
+                    crate::pairing::prepare_at(
+                        self,
+                        endpoint(IOT_BASE_URL)?,
+                        &self.country,
+                        device.id,
+                        &otp,
+                        &key,
+                    )
+                    .await?,
+                )
+            }
+            "thinq1" => {
+                let gateway = self.gateway.as_ref().ok_or(Error::NotAuthenticated)?;
+                let mut http = gateway.thinq1.clone().ok_or(Error::InvalidResponse)?;
+                if let Some(path) = http.path().strip_suffix("/api") {
+                    let path = path.to_owned();
+                    http.set_path(&path);
+                }
+                let material = crate::pairing::Material::ThinQ1 {
+                    http_server: http.into(),
+                    rti_server: gateway.rti.clone().ok_or(Error::InvalidResponse)?,
+                };
+                material.validate()?;
+                PreparedStep::ThinQ1(material)
+            }
+            _ => return Err(Error::InvalidInput),
         };
-        material.validate()?;
-        self.add_device(NewDevice {
-            ciphertext: None,
-            ..device
+        Ok(PreparedPairing {
+            alias,
+            listed,
+            step,
         })
-        .await?;
-        Ok(material)
+    }
+    /// Pair and register without deleting an existing appliance or changing its alias. From the
+    /// first request on, the outcome can be unknown: the caller records its intent before this.
+    pub async fn finish_pairing(
+        &self,
+        device: NewDevice<'_>,
+        prepared: PreparedPairing,
+    ) -> Result<crate::pairing::Material, Error> {
+        let device = NewDevice {
+            alias: &prepared.alias,
+            ..device
+        };
+        match prepared.step {
+            PreparedStep::ThinQ2(request) => {
+                let paired = crate::pairing::request_certificate(self, device.id, request).await?;
+                self.register_paired(
+                    NewDevice {
+                        ciphertext: Some(&paired.registration_ciphertext),
+                        ..device
+                    },
+                    prepared.listed,
+                )
+                .await?;
+                Ok(paired.material)
+            }
+            PreparedStep::ThinQ1(material) => {
+                self.add_device(NewDevice {
+                    ciphertext: None,
+                    ..device
+                })
+                .await?;
+                Ok(material)
+            }
+        }
     }
     /// WashTower units are reported to refuse with `0005` where other appliances get `0125`.
     /// The new certificate has already replaced the appliance's own, so a device the home lists
@@ -1209,7 +1247,7 @@ mod tests {
     }
     #[tokio::test]
     async fn refusal_0005_keeps_pairing_only_for_a_device_the_home_lists() {
-        let refused = || (200, json!({"resultCode":"0005","result":""}).to_string());
+        let refused = || (400, json!({"resultCode":"0005","result":""}).to_string());
         let mut replies = auth_replies();
         replies.extend([
             refused(),
@@ -1248,17 +1286,18 @@ mod tests {
         let gateway = client.gateway.as_mut().unwrap();
         gateway.thinq1 = Some(endpoint("https://thinq1.example/api").unwrap());
         gateway.rti = Some("rti.example:5222".into());
-        let material = client
-            .pair_device(NewDevice {
-                id: "d",
-                alias: "Replacement",
-                model: "model",
-                device_type: "type",
-                platform: "thinq1",
-                ciphertext: None,
-            })
-            .await
-            .unwrap();
+        let device = || NewDevice {
+            id: "d",
+            alias: "Replacement",
+            model: "model",
+            device_type: "type",
+            platform: "thinq1",
+            ciphertext: None,
+        };
+        let Ok(prepared) = client.prepare_pairing(device()).await else {
+            panic!("prepare failed");
+        };
+        let material = client.finish_pairing(device(), prepared).await.unwrap();
         match material {
             crate::pairing::Material::ThinQ1 {
                 http_server,
@@ -1365,9 +1404,14 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
-        let paired = crate::pairing::pair_at(&client, route, "KR", "d/a", "otp", &public)
-            .await
-            .unwrap();
+        let Ok(request) =
+            crate::pairing::prepare_at(&client, route, "KR", "d/a", "otp", &public).await
+        else {
+            panic!("prepare failed");
+        };
+        let Ok(paired) = crate::pairing::request_certificate(&client, "d/a", request).await else {
+            panic!("certificate request failed");
+        };
         paired.material.validate().unwrap();
         let restored: crate::pairing::Material =
             serde_json::from_slice(&serde_json::to_vec(&paired.material).unwrap()).unwrap();
