@@ -1,6 +1,7 @@
 //! Daemon log policy. Subscribers belong to executables, not library callers.
 use crate::runtime::Event;
 use rusthinq_lifecycle::Action;
+use rusthinq_protocol::thinq2::Error as ThinQ2Error;
 use rusthinq_server::{Delivery, Disconnect, Event as Transport, MqttDiagnostic};
 use std::io;
 use tracing_subscriber::EnvFilter;
@@ -87,6 +88,7 @@ pub fn runtime_event(event: &Event) {
             | Transport::Ready(..)
             | Transport::CloudBound(..)
             | Transport::BridgedCloudBound(..)
+            | Transport::PublishIgnored(..)
             | Transport::Will { .. },
         )
         | Event::Injected { .. }
@@ -110,6 +112,7 @@ pub fn mqtt_diagnostic(diagnostic: &MqttDiagnostic) {
             ready,
             reason,
             rejected,
+            ignored_publishes,
         } => {
             if matches!(reason, Disconnect::Eof | Disconnect::Closed) {
                 tracing::info!(
@@ -117,6 +120,7 @@ pub fn mqtt_diagnostic(diagnostic: &MqttDiagnostic) {
                     ?client,
                     generation,
                     ready,
+                    ignored_publishes,
                     ?session,
                     "MQTT client closed"
                 );
@@ -127,8 +131,40 @@ pub fn mqtt_diagnostic(diagnostic: &MqttDiagnostic) {
                     ?client,
                     generation,
                     ready,
+                    ignored_publishes,
                     ?session,
                     "MQTT client failed"
+                );
+            }
+        }
+        // Outside CLIP is ordinary firmware behavior; a broken CLIP message is worth a warning.
+        MqttDiagnostic::PublishIgnored {
+            generation,
+            client,
+            session,
+            ready,
+            reason,
+            publish,
+        } => {
+            if *reason == ThinQ2Error::OutsideClip {
+                tracing::info!(
+                    ?reason,
+                    ?publish,
+                    ?client,
+                    generation,
+                    ready,
+                    ?session,
+                    "MQTT publish ignored"
+                );
+            } else {
+                tracing::warn!(
+                    ?reason,
+                    ?publish,
+                    ?client,
+                    generation,
+                    ready,
+                    ?session,
+                    "MQTT publish ignored"
                 );
             }
         }
@@ -170,6 +206,21 @@ mod tests {
                 ready: true,
                 reason: Disconnect::Mqtt(rusthinq_server::MqttFailure::UnsubscribedTopic),
                 rejected: None,
+                ignored_publishes: 3,
+            });
+            mqtt_diagnostic(&MqttDiagnostic::PublishIgnored {
+                generation: 1,
+                client: Some("test-device".into()),
+                session: None,
+                ready: true,
+                reason: ThinQ2Error::OutsideClip,
+                publish: rusthinq_server::RejectedPublish {
+                    topic: "express/monitoring".into(),
+                    did: None,
+                    cmd: None,
+                    keys: Some(vec!["state".into()]),
+                    payload_len: 5,
+                },
             });
             tracing::info!(target: "rusthinq_bridge::cloud", step = "add_device", "LG API refused");
             tracing::debug!(target: "rusthinq_bridge::cloud", step = "route", "LG API response");
@@ -177,6 +228,10 @@ mod tests {
         let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
         let reason = text.find("UnsubscribedTopic").unwrap();
         assert!(reason < text.find("test-device").unwrap(), "{text}");
+        assert!(text.contains("ignored_publishes=3"), "{text}");
+        let ignored = text.find("MQTT publish ignored").unwrap();
+        assert!(text[ignored..].contains("OutsideClip"), "{text}");
+        assert!(text.contains("keys: Some([\"state\"])"), "{text}");
         assert!(text.contains("step=\"add_device\""), "{text}");
         assert!(!text.contains("step=\"route\""), "{text}");
     }

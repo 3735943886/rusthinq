@@ -85,6 +85,8 @@ pub enum Event {
     Ready(SessionId, serde_json::Value),
     CloudBound(SessionId, Vec<u8>),
     BridgedCloudBound(SessionId, u64, Vec<u8>),
+    /// A publish the session dropped: its topic and original payload, for trace logging.
+    PublishIgnored(SessionId, String, Vec<u8>),
     BridgeChanged(SessionId, u64, bool),
     /// Raw MQTT Last Will observation; L6 owns publication and retained storage.
     Will {
@@ -109,14 +111,26 @@ pub enum MqttDiagnostic {
         ready: bool,
         reason: Disconnect,
         rejected: Option<RejectedPublish>,
+        ignored_publishes: u64,
+    },
+    /// The first publish of its kind on a connection that the session dropped and kept going.
+    PublishIgnored {
+        generation: u64,
+        client: Option<String>,
+        session: Option<SessionId>,
+        ready: bool,
+        reason: rusthinq_protocol::thinq2::Error,
+        publish: RejectedPublish,
     },
 }
-/// The publish behind a ThinQ2 protocol rejection. Device strings are bounded; the payload
-/// itself stays out of diagnostics.
+/// The publish behind a ThinQ2 protocol rejection. Device strings are bounded; payload values
+/// stay out of diagnostics, and `keys` names only the top-level fields of a JSON object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedPublish {
     pub topic: String,
+    pub did: Option<String>,
     pub cmd: Option<String>,
+    pub keys: Option<Vec<String>>,
     pub payload_len: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
