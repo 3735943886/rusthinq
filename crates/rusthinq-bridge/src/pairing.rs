@@ -362,6 +362,13 @@ pub(crate) async fn request_certificate(
         "application/json".parse().expect("constant"),
     );
     let result=iot(client,"device_certificate",certificate_url,headers,Some(json!({"otp":otp,"csr":crypto.csr,"publickey":crypto.public,"ciphertext":crypto.certificate_ciphertext}))).await?;
+    // Only `message` and `provisioning` are used; the rest would show topics the bridge never reads.
+    tracing::info!(
+        device = id,
+        publication = %result["publication"],
+        subscription = %result["subscription"],
+        "LG issued a device certificate"
+    );
     let material = Material::ThinQ2 {
         country,
         api_server: api.into(),

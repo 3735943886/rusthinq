@@ -1,7 +1,8 @@
 //! Local ThinQ2 device MQTT service. No external broker, cloud dial, or device semantics.
 use crate::{
-    Command, Config, Delivery, Disconnect, Entry, Event, Guard, MqttDiagnostic, MqttFailure,
-    Protocol, Receipt, Reject, RejectedPublish, ServerHandle, SessionId, Shared, State,
+    Command, Config, Delivery, Disconnect, DownlinkRefusal, Entry, Event, Guard, MqttDiagnostic,
+    MqttFailure, Protocol, Receipt, Reject, RejectedPublish, ServerHandle, SessionId, Shared,
+    State,
     tls::{LocalFuture, LocalService, Transport},
     write_frame,
 };
@@ -314,6 +315,38 @@ fn rejected_publish(topic: &str, payload: &[u8]) -> RejectedPublish {
         payload_len: payload.len(),
     }
 }
+/// Refused device writes on one connection, reported once per reason and command.
+#[derive(Default)]
+struct DownlinkRefusals(Vec<(DownlinkRefusal, Option<String>)>);
+impl DownlinkRefusals {
+    const KINDS: usize = 16;
+    fn record(
+        &mut self,
+        shared: &Shared,
+        guard: &Guard,
+        client: &Option<String>,
+        ready: bool,
+        reason: DownlinkRefusal,
+        payload: &[u8],
+    ) {
+        let cmd = rejected_publish("", payload).cmd;
+        let kind = (reason, cmd);
+        if self.0.len() >= Self::KINDS || self.0.contains(&kind) {
+            return;
+        }
+        self.0.push(kind.clone());
+        let (reason, cmd) = kind;
+        let _ = shared.diagnostics.send(MqttDiagnostic::DownlinkRefused {
+            generation: guard.generation,
+            client: client.clone(),
+            session: guard.id.clone(),
+            ready,
+            reason,
+            cmd,
+            payload_len: payload.len(),
+        });
+    }
+}
 /// Dropped publishes on one connection. Only the first of each kind reaches the log, so a
 /// device repeating one does not flood it; the count arrives with the close.
 #[derive(Default)]
@@ -404,6 +437,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut clean_disconnect = false;
     let mut rejected = None;
     let mut ignored = IgnoredPublishes::default();
+    let mut refused = DownlinkRefusals::default();
     let mut idle = config.idle_timeout;
     let mut deadline = Instant::now() + idle;
     let mut filters: Vec<String> = Vec::new();
@@ -434,7 +468,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         None => Input::BridgeState {generation:command.generation, active:command.active},
                     };
                     let outcome = model.input(input, start.elapsed());
-                    if outcome.error.is_some() {
+                    if let Some(error) = outcome.error {
+                        if let Some(payload) = &command.payload {
+                            refused.record(&broker.shared, &guard, &client_id, ready, DownlinkRefusal::Protocol(error), payload);
+                        }
                         let _ = command.result.send(Delivery::Failed);
                         continue;
                     }
@@ -443,8 +480,18 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                         match action {
                             Action::BridgeChanged {generation,active} => {guard.publish(Event::BridgeChanged(command.target.clone(),generation,active));},
                             Action::Send {topic,payload,bridge_generation:Some(generation)} => {
-                                if !model.accepts_bridge_generation(generation) || !filters.iter().any(|filter| mqtt::matches(filter,&topic)) {delivery=Delivery::Failed;break;}
-                                let frame = match encode_publish(&topic,&payload,config) {Ok(frame)=>frame,Err(_)=>{delivery=Delivery::Failed;break;}};
+                                if !model.accepts_bridge_generation(generation) {
+                                    refused.record(&broker.shared, &guard, &client_id, ready, DownlinkRefusal::Protocol(thinq2::Error::StaleBridge), &payload);
+                                    delivery=Delivery::Failed;break;
+                                }
+                                if !filters.iter().any(|filter| mqtt::matches(filter,&topic)) {
+                                    refused.record(&broker.shared, &guard, &client_id, ready, DownlinkRefusal::NotSubscribed, &payload);
+                                    delivery=Delivery::Failed;break;
+                                }
+                                let frame = match encode_publish(&topic,&payload,config) {Ok(frame)=>frame,Err(_)=>{
+                                    refused.record(&broker.shared, &guard, &client_id, ready, DownlinkRefusal::EncodeFailed, &payload);
+                                    delivery=Delivery::Failed;break;
+                                }};
                                 if let Err((reason,written)) = write_frame(&mut writer,&frame,config.write_timeout,&mut stop,&mut closing).await {
                                     let _ = command.result.send(if written == 0 {Delivery::Failed} else {Delivery::Unknown});
                                     break 'connection reason;
@@ -460,7 +507,11 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     if let Some(command) = command {
                         if !guard.current() { let _ = command.result.send(Delivery::Failed); break 'connection Disconnect::Closed; }
                         let topic = format!("lime/devices/{}", guard.id.as_ref().expect("registered command").device);
-                        if !filters.iter().any(|filter| mqtt::matches(filter, &topic)) { let _ = command.result.send(Delivery::Failed); continue; }
+                        if !filters.iter().any(|filter| mqtt::matches(filter, &topic)) {
+                            refused.record(&broker.shared, &guard, &client_id, ready, DownlinkRefusal::NotSubscribed, &command.payload);
+                            let _ = command.result.send(Delivery::Failed);
+                            continue;
+                        }
                         let result = write_frame(&mut writer, &command.frame, config.write_timeout, &mut stop, &mut closing).await;
                         let delivery = match &result { Ok(()) => Delivery::Sent, Err((_, 0)) => Delivery::Failed, Err(_) => Delivery::Unknown };
                         if delivery==Delivery::Sent && let Some(id)=&guard.id {guard.publish(Event::Sent(id.clone(),command.payload));}
@@ -511,6 +562,14 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
                     break Disconnect::Mqtt(MqttFailure::TooManyFilters);
                 }
                 filters = next;
+                let _ = broker.shared.diagnostics.send(MqttDiagnostic::Subscribed {
+                    generation: guard.generation,
+                    client: client_id.clone(),
+                    filters: filters
+                        .iter()
+                        .map(|filter| filter.chars().take(128).collect())
+                        .collect(),
+                });
                 let mut body = id.to_be_bytes().to_vec();
                 body.resize(2 + requested.len(), 0); // grant QoS 0
                 replies.push(mqtt::frame(0x90, &body, maximum(config)).expect("bounded SUBACK"));

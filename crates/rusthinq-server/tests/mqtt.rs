@@ -912,6 +912,7 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
     let broker = Broker::new(Config::default(), Arc::new(FixedClock)).unwrap();
     let handle = broker.handle();
     let mut events = handle.subscribe();
+    let mut diagnostics = handle.mqtt_diagnostics();
     let (a, mut peer) = tokio::io::duplex(8192);
     let runtime = broker.clone();
     let task = tokio::spawn(async move {
@@ -926,14 +927,39 @@ async fn unsubscribe_ack_and_failed_command_leave_connection_usable() {
         .await
         .unwrap();
     assert_eq!(wire(&mut peer).await, vec![0xb0, 2, 0, 9]);
-    assert_eq!(
-        handle.send(&id, b"{}").unwrap().wait().await,
-        Delivery::Failed
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            handle
+                .send(&id, br#"{"cmd":"packet"}"#)
+                .unwrap()
+                .wait()
+                .await,
+            Delivery::Failed
+        );
+    }
     peer.write_all(&[0xc0, 0]).await.unwrap();
     assert_eq!(wire(&mut peer).await, vec![0xd0, 0]);
     broker.stop();
     task.await.unwrap();
+    let mut subscribed = false;
+    let mut refused = vec![];
+    while let Ok(diagnostic) = diagnostics.try_recv() {
+        match diagnostic {
+            MqttDiagnostic::Subscribed { filters, .. } => {
+                subscribed |= filters.iter().any(|filter| filter == topic)
+            }
+            MqttDiagnostic::DownlinkRefused { reason, cmd, .. } => refused.push((reason, cmd)),
+            _ => {}
+        }
+    }
+    assert!(subscribed);
+    assert_eq!(
+        refused,
+        vec![(
+            rusthinq_server::DownlinkRefusal::NotSubscribed,
+            Some("packet".to_owned())
+        )]
+    );
 }
 
 async fn publish_raw(peer: &mut tokio::io::DuplexStream, topic: &str, payload: &[u8]) {

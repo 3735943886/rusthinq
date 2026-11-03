@@ -195,6 +195,9 @@ fn publication(topic: &str, payload: &[u8], id: Option<u16>) -> io::Result<Vec<u
     body.extend_from_slice(payload);
     packet(if id.is_some() { 0x32 } else { 0x30 }, &body)
 }
+fn short(text: &str) -> String {
+    text.chars().take(128).collect()
+}
 fn relayable(cmd: &str) -> bool {
     !matches!(
         cmd,
@@ -281,7 +284,12 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                     let result=(||{
                         if uplink.payload.len()>MAX{return Err(invalid());}
                         let mut value:Value=serde_json::from_slice(uplink.payload.strip_suffix(&[0]).unwrap_or(&uplink.payload)).map_err(|_|invalid())?;
-                        if value["did"]!=config.identity.device || !relayable(value["cmd"].as_str().unwrap_or_default()){return Err(invalid());}
+                        let cmd=value["cmd"].as_str().unwrap_or_default();
+                        if value["did"]!=config.identity.device || !relayable(cmd){
+                            tracing::warn!(device=%config.identity.device,cmd=%short(cmd),payload_len=uplink.payload.len(),"device message not relayed to LG");
+                            return Err(invalid());
+                        }
+                        tracing::debug!(device=%config.identity.device,cmd=%short(cmd),payload_len=uplink.payload.len(),"device message relayed to LG");
                         counter=counter.checked_add(1).ok_or_else(invalid)?;
                         value["mid"]=json!(counter);value["kind"]=json!(config.identity.model);
                         publication(&config.publish,value.to_string().as_bytes(),None)
@@ -302,13 +310,23 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                             0xd0 if bytes==[0xd0,0]=>{if pong.take().is_none(){return Err(invalid());}},
                             header if header>>4==3=>{
                                 let mqtt::Packet::Publish{topic,payload,id,qos,duplicate}=mqtt::decode(&bytes,MAX+4096).map_err(|_|invalid())? else{return Err(invalid());};
-                                if header&1!=0 || qos>1 || payload.len()>MAX || !mqtt::matches(&config.subscribe,&topic){return Err(invalid());}
+                                // Values stay out: a refused message is named by its shape, and it ends this session.
+                                let refuse=|reason:&str|{
+                                    tracing::warn!(device=%config.identity.device,reason,topic=%short(&topic),qos,payload_len=payload.len(),"LG message refused; closing cloud session");
+                                    invalid()
+                                };
+                                if header&1!=0{return Err(refuse("retained"));}
+                                if qos>1{return Err(refuse("QoS above 1"));}
+                                if payload.len()>MAX{return Err(refuse("payload too large"));}
+                                if !mqtt::matches(&config.subscribe,&topic){return Err(refuse("topic outside the subscription"));}
                                 let fingerprint=openssl::sha::sha256(&payload);
-                                if duplicate && !seen.contains(&(id,fingerprint)){return Err(invalid());}
+                                if duplicate && !seen.contains(&(id,fingerprint)){return Err(refuse("duplicate of an unseen message"));}
                                 if !duplicate {
-                                    let value:Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|_|invalid())?;
-                                    if value["did"]!=config.identity.device{return Err(invalid());}
-                                    match value["cmd"].as_str().ok_or_else(invalid)? {
+                                    let value:Value=serde_json::from_slice(payload.strip_suffix(&[0]).unwrap_or(&payload)).map_err(|_|refuse("not JSON"))?;
+                                    if value["did"]!=config.identity.device{return Err(refuse("did mismatch"));}
+                                    let cmd=value["cmd"].as_str().ok_or_else(||refuse("no cmd"))?;
+                                    tracing::debug!(device=%config.identity.device,cmd=%short(cmd),payload_len=payload.len(),ready,"LG message received");
+                                    match cmd {
                                         "completeProvisioning"=>{
                                             counter=counter.checked_add(1).ok_or_else(invalid)?;
                                             // Empirical compatibility values used continuously by rethink's bridge;
@@ -322,7 +340,7 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
                                         },
                                         cmd if relayable(cmd) && ready=>downlink(&events,payload).await?,
                                         cmd if !relayable(cmd)=>{},
-                                        _=>return Err(invalid()),
+                                        _=>return Err(refuse("command before provisioning completed")),
                                     }
                                 }
                                 if !duplicate {seen.retain(|(prior,_)|*prior!=id);if seen.len()==64{seen.pop_front();}seen.push_back((id,fingerprint));}

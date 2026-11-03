@@ -113,6 +113,22 @@ pub enum MqttDiagnostic {
         rejected: Option<RejectedPublish>,
         ignored_publishes: u64,
     },
+    /// What the device asked to receive. A write to an unmatched topic cannot reach it.
+    Subscribed {
+        generation: u64,
+        client: Option<String>,
+        filters: Vec<String>,
+    },
+    /// The first write of its kind on a connection that was refused before reaching the device.
+    DownlinkRefused {
+        generation: u64,
+        client: Option<String>,
+        session: Option<SessionId>,
+        ready: bool,
+        reason: DownlinkRefusal,
+        cmd: Option<String>,
+        payload_len: usize,
+    },
     /// The first publish of its kind on a connection that the session dropped and kept going.
     PublishIgnored {
         generation: u64,
@@ -122,6 +138,12 @@ pub enum MqttDiagnostic {
         reason: rusthinq_protocol::thinq2::Error,
         publish: RejectedPublish,
     },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownlinkRefusal {
+    Protocol(rusthinq_protocol::thinq2::Error),
+    NotSubscribed,
+    EncodeFailed,
 }
 /// The publish behind a ThinQ2 protocol rejection. Device strings are bounded; payload values
 /// stay out of diagnostics, and `keys` names only the top-level fields of a JSON object.
