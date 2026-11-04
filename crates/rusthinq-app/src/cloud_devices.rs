@@ -637,7 +637,7 @@ impl Runtime {
                     .deregistered(&status.registration)
                     .map_err(|_| stale())?;
             }
-            tracing::info!(device = %owner.device, "device left the LG account; bridge unpaired");
+            tracing::warn!(device = %owner.device, "device left the LG account; bridge unpaired");
             self.project();
             self.app.cloud_changed(owner.device.clone());
         }

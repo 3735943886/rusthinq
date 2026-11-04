@@ -122,9 +122,79 @@ fn header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<()
 pub(crate) fn result_code(code: &str) -> bool {
     code != "0000" && code.len() <= 32 && code.bytes().all(|b| b.is_ascii_alphanumeric())
 }
+/// What the account listed when pairing started, for reading a refusal. Named fields only:
+/// entries also carry the alias, SSID, MAC addresses and appliance state.
+fn inventory_summary(devices: &[Value]) -> String {
+    const FIELDS: [&str; 11] = [
+        "deviceId",
+        "deviceType",
+        "modelName",
+        "platformType",
+        "online",
+        "deviceState",
+        "combinedProductYn",
+        "iotGroupDeviceYn",
+        "subDeviceCount",
+        "registrationFailCode",
+        "regDtUtc",
+    ];
+    let entries = devices.iter().take(32).map(|entry| {
+        FIELDS
+            .iter()
+            .filter_map(|field| Some((field.to_string(), entry.get(field)?.clone())))
+            .collect::<serde_json::Map<_, _>>()
+    });
+    Value::from_iter(entries.map(Value::Object)).to_string()
+}
+/// What a pair line reports, so one line is enough to read a failure.
+#[derive(Clone, Copy)]
+struct PairLog<'a> {
+    device: &'a str,
+    model: &'a str,
+    device_type: &'a str,
+    platform: &'a str,
+    listed: Option<bool>,
+    inventory: Option<&'a str>,
+}
+impl<'a> PairLog<'a> {
+    fn new(device: &NewDevice<'a>) -> Self {
+        Self {
+            device: device.id,
+            model: device.model,
+            device_type: device.device_type,
+            platform: device.platform,
+            listed: None,
+            inventory: None,
+        }
+    }
+    fn with_account(self, listed: bool, inventory: &'a str) -> Self {
+        Self {
+            listed: Some(listed),
+            inventory: Some(inventory),
+            ..self
+        }
+    }
+    /// `certificate_replaced`: the appliance's own certificate no longer works.
+    fn stopped(self, step: &'static str, certificate_replaced: bool) -> impl FnOnce(&Error) + 'a {
+        move |error| {
+            tracing::warn!(
+                device = self.device,
+                step,
+                ?error,
+                certificate_replaced,
+                listed = ?self.listed,
+                model = self.model,
+                device_type = self.device_type,
+                platform = self.platform,
+                inventory = ?self.inventory,
+                "LG pairing stopped"
+            )
+        }
+    }
+}
 /// Names the request by a fixed step, never its URL, which carries home and device IDs.
 /// Only the validated result code leaves the response; refusals such as `0101` can be
-/// expected, so the caller decides whether one is a failure.
+/// expected, so only the refusals that are normal stay below a warning.
 fn log_response(step: &'static str, status: u16, bytes: &[u8], started: tokio::time::Instant) {
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let raw = serde_json::from_slice::<Value>(bytes).ok();
@@ -136,7 +206,72 @@ fn log_response(step: &'static str, status: u16, bytes: &[u8], started: tokio::t
         tracing::debug!(step, http = status, elapsed_ms, "LG API response");
     } else {
         let code = code.unwrap_or("none");
-        tracing::info!(step, http = status, code, elapsed_ms, "LG API refused");
+        let body = refusal_body(step, bytes, raw.as_ref());
+        if matches!(
+            (step, code),
+            ("remove_device", "0101") | ("add_device", "0125")
+        ) {
+            tracing::info!(
+                step,
+                http = status,
+                code,
+                elapsed_ms,
+                ?body,
+                "LG API refused"
+            );
+        } else {
+            tracing::warn!(
+                step,
+                http = status,
+                code,
+                elapsed_ms,
+                ?body,
+                "LG API refused"
+            );
+        }
+    }
+}
+/// A refusal's body with anything secret-shaped hidden. OAuth is left out whole, and text that
+/// is not JSON is only kept when it holds no PEM block.
+fn refusal_body(step: &str, bytes: &[u8], raw: Option<&Value>) -> Option<String> {
+    const LIMIT: usize = 1024;
+    if step == "oauth" {
+        return None;
+    }
+    let text = match raw {
+        Some(raw) => {
+            let mut value = raw.clone();
+            redact(&mut value);
+            value.to_string()
+        }
+        None => {
+            let text = String::from_utf8_lossy(bytes);
+            if text.contains("BEGIN ") {
+                return None;
+            }
+            text.into_owned()
+        }
+    };
+    Some(text.chars().take(LIMIT).collect())
+}
+fn redact(value: &mut Value) {
+    const SECRET: [&str; 8] = [
+        "token", "secret", "password", "otp", "key", "cert", "csr", "cipher",
+    ];
+    match value {
+        Value::Object(map) => {
+            for (name, field) in map {
+                let name = name.to_ascii_lowercase();
+                if SECRET.iter().any(|secret| name.contains(secret)) {
+                    *field = json!("<redacted>");
+                } else {
+                    redact(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact),
+        Value::String(text) if text.contains("BEGIN ") => *text = "<redacted>".into(),
+        _ => {}
     }
 }
 fn nonce() -> Result<String, Error> {
@@ -184,6 +319,7 @@ fn parse_token(raw: &Value, now_ms: u64) -> Result<Token, Error> {
 pub struct PreparedPairing {
     alias: String,
     listed: bool,
+    inventory: String,
     step: PreparedStep,
 }
 enum PreparedStep {
@@ -291,7 +427,7 @@ impl Client {
         }
         let started = tokio::time::Instant::now();
         let mut response = request.send().await.map_err(|error| {
-            tracing::info!(step, error = %error.without_url(), "LG API request failed");
+            tracing::warn!(step, error = %error.without_url(), "LG API request failed");
             Error::Network
         })?;
         let status = response.status();
@@ -794,16 +930,24 @@ impl Client {
     /// Read what pairing needs. This changes nothing on the appliance or the account, so a failure
     /// here leaves nothing to reconcile.
     pub async fn prepare_pairing(&self, device: NewDevice<'_>) -> Result<PreparedPairing, Error> {
-        let devices = self.list_devices().await?;
+        let devices = self
+            .list_devices()
+            .await
+            .inspect_err(PairLog::new(&device).stopped("list_devices", false))?;
         let registered = devices.iter().find(|entry| entry["deviceId"] == device.id);
         let alias = registered
             .and_then(|entry| entry["alias"].as_str())
             .unwrap_or(device.alias)
             .to_owned();
         let listed = registered.is_some();
+        let inventory = inventory_summary(&devices);
+        let log = PairLog::new(&device).with_account(listed, &inventory);
         let step = match device.platform {
             "thinq2" => {
-                let (otp, key) = self.certificate_otp().await?;
+                let (otp, key) = self
+                    .certificate_otp()
+                    .await
+                    .inspect_err(log.stopped("otp_certificate", false))?;
                 PreparedStep::ThinQ2(
                     crate::pairing::prepare_at(
                         self,
@@ -813,7 +957,8 @@ impl Client {
                         &otp,
                         &key,
                     )
-                    .await?,
+                    .await
+                    .inspect_err(log.stopped("route", false))?,
                 )
             }
             "thinq1" => {
@@ -835,6 +980,7 @@ impl Client {
         Ok(PreparedPairing {
             alias,
             listed,
+            inventory,
             step,
         })
     }
@@ -849,17 +995,22 @@ impl Client {
             alias: &prepared.alias,
             ..device
         };
+        let log = PairLog::new(&device).with_account(prepared.listed, &prepared.inventory);
         match prepared.step {
             PreparedStep::ThinQ2(request) => {
-                let paired = crate::pairing::request_certificate(self, device.id, request).await?;
+                let paired = crate::pairing::request_certificate(self, device.id, request)
+                    .await
+                    .inspect_err(log.stopped("device_certificate", false))?;
                 self.register_paired(
                     NewDevice {
                         ciphertext: Some(&paired.registration_ciphertext),
                         ..device
                     },
                     prepared.listed,
+                    &prepared.inventory,
                 )
-                .await?;
+                .await
+                .inspect_err(log.stopped("add_device", true))?;
                 Ok(paired.material)
             }
             PreparedStep::ThinQ1(material) => {
@@ -867,7 +1018,8 @@ impl Client {
                     ciphertext: None,
                     ..device
                 })
-                .await?;
+                .await
+                .inspect_err(log.stopped("add_device", false))?;
                 Ok(material)
             }
         }
@@ -875,12 +1027,21 @@ impl Client {
     /// WashTower units are reported to refuse with `0005` where other appliances get `0125`.
     /// The new certificate has already replaced the appliance's own, so a device the home lists
     /// keeps it. For an unlisted device nothing shows it is registered, so the refusal stands.
-    async fn register_paired(&self, device: NewDevice<'_>, listed: bool) -> Result<(), Error> {
-        let id = device.id;
+    async fn register_paired(
+        &self,
+        device: NewDevice<'_>,
+        listed: bool,
+        inventory: &str,
+    ) -> Result<(), Error> {
+        let log = PairLog::new(&device).with_account(listed, inventory);
         match self.add_device(device).await {
             Err(Error::Api(code)) if listed && code == "0005" => {
-                tracing::info!(
-                    device = id,
+                tracing::warn!(
+                    device = log.device,
+                    model = log.model,
+                    device_type = log.device_type,
+                    platform = log.platform,
+                    inventory,
                     "LG refused a listed device with 0005; keeping pairing"
                 );
                 Ok(())
@@ -1245,6 +1406,33 @@ mod tests {
             serde_json::from_str(requests[6].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body, json!({"homeId":"h/a","item":[{"deviceId":"d/a"}]}));
     }
+    #[test]
+    fn refusal_body_hides_secrets_and_keeps_the_rest() {
+        let raw = json!({
+            "resultCode":"0005","message":"why","otp":"private","publicKey":"private",
+            "result":{"certificatePem":"private","other":"-----BEGIN private","kept":1}
+        });
+        let body = refusal_body("add_device", raw.to_string().as_bytes(), Some(&raw)).unwrap();
+        assert!(!body.contains("private"), "{body}");
+        assert!(body.contains("why") && body.contains("0005") && body.contains("kept"));
+        assert_eq!(refusal_body("oauth", b"{}", Some(&json!({}))), None);
+        assert_eq!(refusal_body("route", b"-----BEGIN x", None), None);
+        assert_eq!(
+            refusal_body("route", b"not json", None).unwrap(),
+            "not json"
+        );
+    }
+    #[test]
+    fn inventory_summary_keeps_named_fields_only() {
+        let summary = inventory_summary(&[json!({
+            "deviceId":"a","deviceType":221,"combinedProductYn":"Y",
+            "alias":"private","ssid":"private","snapshot":{"private":true}
+        })]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&summary).unwrap(),
+            json!([{"deviceId":"a","deviceType":221,"combinedProductYn":"Y"}])
+        );
+    }
     #[tokio::test]
     async fn refusal_0005_keeps_pairing_only_for_a_device_the_home_lists() {
         let refused = || (400, json!({"resultCode":"0005","result":""}).to_string());
@@ -1264,13 +1452,19 @@ mod tests {
             platform: "thinq2",
             ciphertext: Some("cipher"),
         };
-        client.register_paired(device(), true).await.unwrap();
+        client.register_paired(device(), true, "").await.unwrap();
         assert_eq!(
-            client.register_paired(device(), false).await.unwrap_err(),
+            client
+                .register_paired(device(), false, "")
+                .await
+                .unwrap_err(),
             Error::Api("0005".into())
         );
         assert_eq!(
-            client.register_paired(device(), true).await.unwrap_err(),
+            client
+                .register_paired(device(), true, "")
+                .await
+                .unwrap_err(),
             Error::Api("9999".into())
         );
         let requests = task.await.unwrap();
