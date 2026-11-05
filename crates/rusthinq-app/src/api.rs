@@ -3,6 +3,23 @@ use crate::runtime::{Event, Handle};
 use rusthinq_lifecycle::SessionKey;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+
+/// The runtime's observed metadata only covers ThinQ1, so a ThinQ2 device's type comes from the
+/// metadata saved when it connected.
+#[cfg(feature = "bridge")]
+fn pair_device_type(
+    body: &Value,
+    observed: Option<String>,
+    persisted: Option<&crate::lifecycle_storage::DeviceMetadata>,
+) -> Option<String> {
+    body["deviceType"]
+        .as_str()
+        .map(str::to_owned)
+        .into_iter()
+        .chain(observed)
+        .chain(persisted.map(|m| m.device_type.clone()))
+        .find(|device_type| !device_type.is_empty())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Sent,
@@ -445,30 +462,27 @@ impl AppHandle {
             let handle = self.0.cloud_devices().ok_or(CloudError::Unavailable)?;
             let operation = match action {
                 "pair" => {
+                    let rejected = |missing: &'static str| {
+                        tracing::warn!(device = %id, missing, "bridge pair rejected");
+                        CloudError::InvalidInput
+                    };
+                    let persisted = self.0.persisted_models();
+                    let persisted = persisted.get(&id).filter(|m| m.incarnation == incarnation);
                     let model = self
                         .0
                         .driver_models()
                         .get(&id)
                         .map(|m| (m.1.clone(), m.2))
-                        .or_else(|| {
-                            self.0
-                                .persisted_models()
-                                .get(&id)
-                                .filter(|m| m.incarnation == incarnation)
-                                .map(|m| (m.model_name.clone(), m.thinq2))
-                        })
-                        .ok_or(CloudError::InvalidInput)?;
-                    let device_type = body["deviceType"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            self.0
-                                .metadata_snapshot()
-                                .into_iter()
-                                .find(|m| m.device_id == id)
-                                .map(|m| m.device_type)
-                        })
-                        .ok_or(CloudError::InvalidInput)?;
+                        .or_else(|| persisted.map(|m| (m.model_name.clone(), m.thinq2)))
+                        .ok_or_else(|| rejected("model"))?;
+                    let observed = self
+                        .0
+                        .metadata_snapshot()
+                        .into_iter()
+                        .find(|m| m.device_id == id)
+                        .map(|m| m.device_type);
+                    let device_type = pair_device_type(&body, observed, persisted)
+                        .ok_or_else(|| rejected("device type"))?;
                     Operation::Pair(Pair {
                         device: id.clone(),
                         incarnation,
@@ -572,5 +586,43 @@ impl AppHandle {
             .logout()
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_device_type_falls_back_to_persisted_metadata() {
+        let persisted = crate::lifecycle_storage::DeviceMetadata {
+            incarnation: 1,
+            model_name: "IV12SNNWW".into(),
+            device_type: "501".into(),
+            thinq2: true,
+            model_id: String::new(),
+            sw_version: String::new(),
+            last_seen_unix: 0,
+        };
+        let pick = |body, observed: Option<&str>, saved| {
+            pair_device_type(&body, observed.map(str::to_owned), saved)
+        };
+        assert_eq!(
+            pick(json!({}), None, Some(&persisted)).as_deref(),
+            Some("501")
+        );
+        assert_eq!(
+            pick(json!({"deviceType":""}), Some(""), Some(&persisted)).as_deref(),
+            Some("501")
+        );
+        assert_eq!(
+            pick(json!({}), Some("401"), Some(&persisted)).as_deref(),
+            Some("401")
+        );
+        assert_eq!(
+            pick(json!({"deviceType":"222"}), Some("401"), Some(&persisted)).as_deref(),
+            Some("222")
+        );
+        assert_eq!(pick(json!({}), None, None), None);
     }
 }
