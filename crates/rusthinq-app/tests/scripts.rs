@@ -107,7 +107,8 @@ async fn reload_fences_completed_results_and_preserves_opaque_output_order() {
             .unwrap()
             .wait()
             .await
-            .unwrap(),
+            .unwrap()
+            .generation,
         2
     );
     assert!(matches!(owner.accept(&devices, old), Err(Error::Stale)));

@@ -403,7 +403,7 @@ impl Runtime {
                     && device.removal.is_none()
             });
             let revision = super::revision(&request.compiled);
-            let result = if !current {
+            let reloaded = if !current {
                 Err(rusthinq_scripting::Error::Stale)
             } else if request.initialize
                 && let Err(error) = self.script_schedule.next_sequence()
@@ -428,20 +428,28 @@ impl Runtime {
                     && device.session == Some(request.session)
                     && device.removal.is_none()
             });
+            let state_kept = reloaded.as_ref().is_ok_and(|reloaded| reloaded.state_kept);
             let result = if *stop.borrow() || stop.has_changed().is_err() {
                 Err(rusthinq_scripting::Error::Stopped)
             } else if !current {
                 Err(rusthinq_scripting::Error::Stale)
             } else {
-                result
+                reloaded.map(|reloaded| reloaded.generation)
             };
             if let Ok(generation) = result {
                 self.shared
                     .driver_revision(&request.device, request.session, generation, revision);
                 self.shared
                     .script_state(request.device.clone(), (request.session, generation, false));
-                self.script_schedule
-                    .retain_timers(|id, _| id != request.device);
+                if state_kept {
+                    self.script_schedule
+                        .rebind_timers(&request.device, |context| {
+                            context.generation = generation;
+                        });
+                } else {
+                    self.script_schedule
+                        .retain_timers(|id, _| id != request.device);
+                }
             }
             // Queue initialization before another actor turn can admit commands/data.
             let result = match result {

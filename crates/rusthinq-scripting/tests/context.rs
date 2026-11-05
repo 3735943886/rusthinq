@@ -36,9 +36,52 @@ fn context_callbacks_keep_device_state_and_opaque_outputs_without_semantic_helpe
     );
     first.reload(compiled(source, "first")).unwrap();
     assert_eq!(
-        first.invoke(2, "on_response", "fresh").outputs[0],
-        Output::Publish("first:model:1".into())
+        first.invoke(2, "on_response", "kept").outputs[0],
+        Output::Publish("first:model:3".into())
     );
+}
+#[test]
+fn reload_keeps_state_only_for_the_same_healthy_device_and_model_within_limits() {
+    let source = r#"fn on_response(ctx, body) {
+        ctx.publish((ctx.state_get("n") ?? 0).to_string());
+        if body == "throw" {throw "fault";}
+        ctx.state_set("n", 7);
+    }"#;
+    let kept = |replacement: Compiled, input: &str| {
+        let mut host = Host::new(compiled(source, "d"));
+        assert_eq!(host.invoke(1, "on_response", "x").error, None);
+        let _ = host.invoke(1, "on_response", input);
+        let reloaded = host.reload(replacement).unwrap();
+        let seen = host.invoke(2, "on_response", "x").outputs[0].clone();
+        assert_eq!(reloaded.generation, 2);
+        assert_eq!(
+            seen,
+            Output::Publish(if reloaded.state_kept { "7" } else { "0" }.into()),
+            "the reported outcome must match what the new script sees"
+        );
+        reloaded.state_kept
+    };
+    let with = |edit: fn(&mut Config)| {
+        let mut config = Config::new("d".into(), "model".into());
+        edit(&mut config);
+        Compiled::with_context(source, Limits::default(), true, config).unwrap()
+    };
+    assert!(kept(compiled(source, "d"), "x"));
+    assert!(!kept(compiled(source, "d"), "throw"), "fault recovery");
+    assert!(!kept(compiled(source, "other"), "x"), "other device");
+    assert!(
+        !kept(with(|c| c.model = "other".into()), "x"),
+        "other model"
+    );
+    assert!(!kept(with(|c| c.thinq2 = !c.thinq2), "x"), "other protocol");
+    assert!(
+        !kept(with(|c| c.state_bytes = 1), "x"),
+        "over the new limit"
+    );
+
+    let mut host = Host::new(compiled(source, "d"));
+    let plain = Compiled::new("fn on_response(body) {}", Limits::default(), true).unwrap();
+    assert!(!host.reload(plain).unwrap().state_kept);
 }
 #[test]
 fn context_state_is_bounded_and_cannot_store_context_or_shared_aliases() {
