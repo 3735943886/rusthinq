@@ -382,7 +382,12 @@ impl IgnoredPublishes {
             });
         }
         if let Some(session) = &guard.id {
-            guard.publish(Event::PublishIgnored(session.clone(), reason, topic, payload));
+            guard.publish(Event::PublishIgnored(
+                session.clone(),
+                reason,
+                topic,
+                payload,
+            ));
         }
     }
 }

@@ -261,10 +261,7 @@ async fn mqtt_relays_topic_uplink_verbatim() {
     let packet = mqtt(&mut peer).await;
     assert_eq!(packet[0], 0x30);
     let rusthinq_protocol::mqtt::Packet::Publish {
-        topic,
-        payload,
-        id,
-        ..
+        topic, payload, id, ..
     } = rusthinq_protocol::mqtt::decode(&packet, 1024).unwrap()
     else {
         panic!()
