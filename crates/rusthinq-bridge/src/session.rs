@@ -17,7 +17,9 @@ pub struct Uplink {
     /// When set, publish the payload verbatim to this topic instead of the
     /// configured CLIP message topic: no envelope parsing, validation or
     /// mid/kind rewriting. Used for device traffic that does not ride CLIP
-    /// (e.g. the monitoring_express rule topic).
+    /// (e.g. the monitoring_express rule topic). Verbatim includes any
+    /// trailing NUL (the CLIP path strips one), and the publish goes out
+    /// at QoS 0.
     pub topic: Option<String>,
     /// Complete socket write only. This does not report device/cloud acknowledgement.
     pub result: oneshot::Sender<io::Result<()>>,

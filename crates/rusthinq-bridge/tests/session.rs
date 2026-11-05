@@ -207,3 +207,72 @@ async fn partial_rti_frame_times_out_and_shutdown_cancels_downlink_wait() {
     drop(pending);
     assert!(peer.read_u8().await.is_err());
 }
+#[tokio::test]
+async fn mqtt_relays_topic_uplink_verbatim() {
+    let (client, mut peer) = duplex(8192);
+    let (uplink, rx) = mpsc::channel(4);
+    let (events, mut received) = mpsc::channel(4);
+    let (stop, stopped) = watch::channel(false);
+    let config = MqttConfig {
+        identity: identity(),
+        publish: "up".into(),
+        provisioning: "prov".into(),
+        subscribe: "down".into(),
+        deploy: json!({"did":"d","kind":"MODEL","mid":7,"data":{"appInfo":{"protocolVer":"7"},"platformInfo":{"version":"real"}}}),
+    };
+    let task = tokio::spawn(session::thinq2(client, config, rx, events, stopped));
+    assert_eq!(mqtt(&mut peer).await[0], 0x10);
+    peer.write_all(&[0x20, 2, 0, 0]).await.unwrap();
+    assert_eq!(mqtt(&mut peer).await[0], 0x82);
+    peer.write_all(&[0x90, 3, 0, 1, 1]).await.unwrap();
+    let pre = mqtt(&mut peer).await;
+    let rusthinq_protocol::mqtt::Packet::Publish { id, .. } =
+        rusthinq_protocol::mqtt::decode(&pre, 1_004_096).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(id, Some(2));
+    peer.write_all(&[0x40, 2, 0, 2]).await.unwrap();
+    peer.write_all(
+        &rusthinq_protocol::mqtt::publish(
+            "down",
+            br#"{"did":"d","mid":8,"cmd":"completeProvisioning"}"#,
+            1024,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let complete = mqtt(&mut peer).await;
+    assert_eq!(complete[0], 0x30);
+    assert!(matches!(received.recv().await, Some(Event::Ready)));
+    // A non-JSON payload with a trailing NUL: the verbatim path must not
+    // parse, strip or rewrite it, and must publish on the given topic.
+    let raw: &[u8] = b"\x00\x01not-json\x00";
+    let (result, reply) = oneshot::channel();
+    uplink
+        .send(Uplink {
+            payload: raw.to_vec(),
+            topic: Some("$aws/rules/monitoring_express_rule/d".into()),
+            result,
+        })
+        .await
+        .unwrap();
+    let packet = mqtt(&mut peer).await;
+    assert_eq!(packet[0], 0x30);
+    let rusthinq_protocol::mqtt::Packet::Publish {
+        topic,
+        payload,
+        id,
+        ..
+    } = rusthinq_protocol::mqtt::decode(&packet, 1024).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(topic, "$aws/rules/monitoring_express_rule/d");
+    assert_eq!(payload, raw);
+    assert_eq!(id, None);
+    reply.await.unwrap().unwrap();
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+}

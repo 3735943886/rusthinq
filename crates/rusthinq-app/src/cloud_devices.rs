@@ -1078,16 +1078,28 @@ async fn connected(session: CloudSession<'_>, signals: SessionSignals<'_>) -> io
             event=events.recv()=>{
                 let payload=match event {
                     Ok(AppEvent::Transport(rusthinq_server::Event::Data(id,data))) if id==*local && matches!(material,Material::ThinQ1{..})=>Some(data),
-                    Ok(AppEvent::Transport(rusthinq_server::Event::PublishIgnored(id,topic,bytes))) if id==*local && matches!(material,Material::ThinQ2{..})=>{
-                        // LG-005 traffic that never rides CLIP. The bridge speaks
-                        // to LG as the device, so any publish outside CLIP is
-                        // logged and relayed to LG verbatim on its own topic
-                        // while the bridge is up.
-                        if !topic.contains("/clip/") && !topic.starts_with("clip/") {
-                            tracing::info!(device=%local.device,topic=%topic,payload_len=bytes.len(),"publish outside CLIP relayed to LG");
+                    Ok(AppEvent::Transport(rusthinq_server::Event::PublishIgnored(id,reason,topic,bytes))) if id==*local && matches!(material,Material::ThinQ2{..})=>{
+                        // LG-005 traffic that never rides CLIP: the protocol
+                        // layer drops it with OutsideClip. The bridge speaks
+                        // to LG as the device, under the device's own cloud
+                        // identity, so such a publish is relayed to LG
+                        // verbatim on its own topic while the bridge is up.
+                        // The relay is deliberately generic - any topic a
+                        // paired device chooses is forwarded - on the trust
+                        // assumption that a paired device is the operator's
+                        // own appliance. It is logged at debug, after the
+                        // send, because some publishers are periodic
+                        // (position telemetry every few seconds).
+                        if matches!(reason,rusthinq_protocol::thinq2::Error::OutsideClip) {
+                            let payload_len=bytes.len();
                             if ready {
                                 let (result,_)=oneshot::channel();
-                                let _=uplink.try_send(session::Uplink{payload:bytes,topic:Some(topic),result});
+                                match uplink.try_send(session::Uplink{payload:bytes,topic:Some(topic.clone()),result}) {
+                                    Ok(())=>tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP relayed to LG"),
+                                    Err(_)=>tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP dropped: cloud uplink full"),
+                                }
+                            } else {
+                                tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP dropped: bridge not ready");
                             }
                         }
                         None
