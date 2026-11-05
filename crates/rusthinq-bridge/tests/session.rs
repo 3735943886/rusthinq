@@ -52,6 +52,7 @@ async fn rti_start_stop_latest_status_and_delivered_command_ack() {
     uplink
         .send(Uplink {
             payload: status,
+            topic: None,
             result,
         })
         .await
@@ -157,7 +158,7 @@ async fn mqtt_preserves_cloud_mid_and_correlations_and_orders_uplinks() {
     result.send(true).unwrap();
     for i in 0..3 {
         let (result, reply) = oneshot::channel();
-        uplink.send(Uplink{payload:json!({"did":"d","mid":1,"cmd":"respUniversalCtrl","data":{"messageId":"correlation","sequence":i}}).to_string().into_bytes(),result}).await.unwrap();
+        uplink.send(Uplink{payload:json!({"did":"d","mid":1,"cmd":"respUniversalCtrl","data":{"messageId":"correlation","sequence":i}}).to_string().into_bytes(),topic:None,result}).await.unwrap();
         let packet = mqtt(&mut peer).await;
         assert_eq!(packet[0], 0x30);
         let rusthinq_protocol::mqtt::Packet::Publish { payload, .. } =

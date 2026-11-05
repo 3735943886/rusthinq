@@ -1078,12 +1078,26 @@ async fn connected(session: CloudSession<'_>, signals: SessionSignals<'_>) -> io
             event=events.recv()=>{
                 let payload=match event {
                     Ok(AppEvent::Transport(rusthinq_server::Event::Data(id,data))) if id==*local && matches!(material,Material::ThinQ1{..})=>Some(data),
+                    Ok(AppEvent::Transport(rusthinq_server::Event::PublishIgnored(id,topic,bytes))) if id==*local && matches!(material,Material::ThinQ2{..})=>{
+                        // LG-005 traffic that never rides CLIP. The bridge speaks
+                        // to LG as the device, so any publish outside CLIP is
+                        // logged and relayed to LG verbatim on its own topic
+                        // while the bridge is up.
+                        if !topic.contains("/clip/") && !topic.starts_with("clip/") {
+                            tracing::info!(device=%local.device,topic=%topic,payload_len=bytes.len(),"publish outside CLIP relayed to LG");
+                            if ready {
+                                let (result,_)=oneshot::channel();
+                                let _=uplink.try_send(session::Uplink{payload:bytes,topic:Some(topic),result});
+                            }
+                        }
+                        None
+                    },
                     Ok(AppEvent::Transport(rusthinq_server::Event::BridgedCloudBound(id,g,bytes))) if id==*local && g==generation=>Some(bytes),
                     Ok(AppEvent::Transport(rusthinq_server::Event::Down(id,_))) if id==*local=>return Ok(()),
                     Err(_)|Ok(AppEvent::Lost{..})=>return Err(io::Error::other("cloud source events lost")),_=>None,
                 };
                 if !context.app.snapshot().iter().any(|d|d.entry.id==local.device && d.entry.incarnation==registration.incarnation && d.session.is_some_and(|s|s.generation==local.generation) && d.online && d.removal.is_none()){return Ok(());}
-                if ready && let Some(payload)=payload {let (result,_)=oneshot::channel();uplink.try_send(session::Uplink{payload,result}).map_err(|_|io::Error::new(io::ErrorKind::WouldBlock,"cloud uplink capacity exceeded"))?;}
+                if ready && let Some(payload)=payload {let (result,_)=oneshot::channel();uplink.try_send(session::Uplink{payload,topic:None,result}).map_err(|_|io::Error::new(io::ErrorKind::WouldBlock,"cloud uplink capacity exceeded"))?;}
             }
         }
     }
