@@ -28,7 +28,7 @@ async fn invocations_and_reload_are_serialized_and_late_generation_is_rejected()
         second.wait().await.unwrap().outputs,
         vec![Output::Send("2b".into())]
     );
-    assert_eq!(reload.wait().await.unwrap(), 2);
+    assert_eq!(reload.wait().await.unwrap().generation, 2);
     assert_eq!(stale.wait().await.unwrap().error, Some(Error::Stale));
     assert_eq!(*handle.status().borrow(), Status::Running { generation: 2 });
     assert_eq!(
@@ -133,7 +133,8 @@ async fn faulted_worker_preserves_prefix_and_other_worker_progress_until_explici
             .unwrap()
             .wait()
             .await
-            .unwrap(),
+            .unwrap()
+            .generation,
         2
     );
     assert_eq!(*handle.status().borrow(), Status::Running { generation: 2 });

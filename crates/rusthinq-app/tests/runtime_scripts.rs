@@ -466,7 +466,8 @@ async fn context_callbacks_bind_device_state_and_reload_without_interpretation()
         .unwrap()
         .unwrap();
     assert_eq!(context.generation, 2);
-    assert_eq!(value, "d:model:1");
+    // The count continues: reload keeps ctx state.
+    assert_eq!(value, "d:model:3");
     assert_eq!(frame(&mut peer).await, br#"{ "Body": {"Cmd":"Get"} }"#);
     server.shutdown().await;
     stop.send_replace(true);
@@ -474,13 +475,21 @@ async fn context_callbacks_bind_device_state_and_reload_without_interpretation()
 }
 
 #[tokio::test]
-async fn timer_from_replaced_generation_never_fires_and_successor_timer_does() {
+async fn timer_survives_reload_into_the_new_script_but_not_fault_recovery() {
     use rusthinq_scripting::context::Config as ContextConfig;
     let compiled = |tag: &str| {
         Compiled::with_context(
             &format!(
-                r#"fn on_response(ctx,body){{ctx.set_timer("t",150);ctx.publish("{tag}:armed");}}
-                fn on_timer(ctx,name){{ctx.publish("{tag}:"+name);}}"#
+                r#"fn on_response(ctx,body){{
+                    if ctx.state_get("fault")==true {{throw "fault";}}
+                    ctx.state_set("armed",true);ctx.set_timer("t",150);ctx.publish("{tag}:armed");
+                }}
+                fn on_timer(ctx,name){{
+                    let armed=ctx.state_get("armed")==true;
+                    ctx.publish("{tag}:"+name+":"+armed.to_string());
+                    ctx.state_set("fault",armed);
+                    ctx.set_timer("t2",100);
+                }}"#
             ),
             Limits::default(),
             true,
@@ -537,13 +546,31 @@ async fn timer_from_replaced_generation_never_fires_and_successor_timer_does() {
             .await,
         Ok(2)
     );
-    // The old timer is due during this window; nothing may be delivered.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Armed by the old script: the new one receives it and still sees the state beside it.
+    let (context, value) = next().await;
+    assert_eq!((context.generation, value.as_str()), (2, "new:t:true"));
+    // That call left `fault` set and armed t2, so this response faults the script.
     response(&mut peer).await;
-    let (context, value) = next().await;
-    assert_eq!((context.generation, value.as_str()), (2, "new:armed"));
-    let (context, value) = next().await;
-    assert_eq!((context.generation, value.as_str()), (2, "new:t"));
+    until(
+        &mut events,
+        |e| matches!(e,Event::Rejected{reason,..} if reason.contains("Execution")),
+    )
+    .await;
+    assert_eq!(
+        handle
+            .reload_script("d".into(), session, 2, compiled("clean"))
+            .await,
+        Ok(3)
+    );
+    // t2 is due during this window, but recovery dropped it along with the state.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(publications.try_recv().is_err());
+    response(&mut peer).await;
+    let (context, value) = timeout(Duration::from_secs(3), publications.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((context.generation, value.as_str()), (3, "clean:armed"));
     server.shutdown().await;
     stop.send_replace(true);
     task.await.unwrap().unwrap();

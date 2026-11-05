@@ -122,6 +122,14 @@ impl<C, T> Scheduler<C, T> {
             })
             .collect()
     }
+    /// Update the context of a device's pending timers. Their deadlines do not move.
+    pub fn rebind_timers(&mut self, device: &str, mut rebind: impl FnMut(&mut C)) {
+        for ((id, _), (context, _)) in &mut self.timers {
+            if id == device {
+                rebind(context);
+            }
+        }
+    }
     pub fn retain_timers(&mut self, mut keep: impl FnMut(&str, &C) -> bool) {
         self.timers
             .retain(|(device, _), (context, _)| keep(device, context));
@@ -153,6 +161,25 @@ mod tests {
         );
         assert!(policy.complete(1, "a", "late").is_err());
         assert_eq!(policy.next_sequence().unwrap(), 4);
+    }
+    #[test]
+    fn rebinding_changes_only_that_devices_context_and_keeps_its_deadline() {
+        let mut policy = Scheduler::<u64, ()>::new(1).unwrap();
+        let now = Instant::now();
+        for (device, after) in [("a", 10), ("b", 20)] {
+            policy
+                .set_timer(device.into(), "t".into(), 1, Some(after), true, now)
+                .unwrap();
+        }
+        policy.rebind_timers("a", |context| *context = 2);
+        assert_eq!(
+            policy.due_timers(now + std::time::Duration::from_millis(10)),
+            vec![("a".into(), "t".into(), 2)]
+        );
+        assert_eq!(
+            policy.due_timers(now + std::time::Duration::from_millis(20)),
+            vec![("b".into(), "t".into(), 1)]
+        );
     }
     #[test]
     fn timer_replacement_limits_cancellation_and_scope_pruning_are_explicit() {

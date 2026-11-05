@@ -72,6 +72,24 @@ impl Context {
             })),
         })
     }
+    /// Take over `previous`'s state if it is the same device and model and fits these limits.
+    /// Stored values are plain data, so they do not depend on the engine that wrote them.
+    pub(crate) fn adopt_state(&mut self, previous: &Self) -> bool {
+        let same = self.config.device == previous.config.device
+            && self.config.model == previous.config.model
+            && self.config.thinq2 == previous.config.thinq2;
+        let fits = {
+            let state = previous
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.values.len() <= self.config.state_keys && state.bytes <= self.config.state_bytes
+        };
+        if same && fits {
+            self.state = previous.state.clone();
+        }
+        same && fits
+    }
     pub(crate) fn device(&self) -> &str {
         &self.config.device
     }

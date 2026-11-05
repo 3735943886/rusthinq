@@ -423,6 +423,14 @@ impl Compiled {
         })
     }
 }
+/// The result of replacing a host's script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reloaded {
+    pub generation: u64,
+    /// The replacement continues from the old `ctx` state. Pending timers belong to that state,
+    /// so whoever owns them keeps them exactly when this is true.
+    pub state_kept: bool,
+}
 pub struct Host {
     compiled: Compiled,
     scope: Scope<'static>,
@@ -531,14 +539,24 @@ impl Host {
         }
     }
     /// Compile failure cannot touch this host; pass a successfully compiled replacement.
-    pub fn reload(&mut self, compiled: Compiled) -> Result<u64, Error> {
+    /// Script scope always restarts. `ctx` state carries over, except out of a faulted host: a
+    /// failed call may have left it half written, and reload is how a fault is recovered.
+    pub fn reload(&mut self, mut compiled: Compiled) -> Result<Reloaded, Error> {
         let generation = self
             .generation
             .checked_add(1)
             .ok_or(Error::GenerationExhausted)?;
+        let state_kept = !self.faulted
+            && match (&self.compiled.context, &mut compiled.context) {
+                (Some(previous), Some(next)) => next.adopt_state(previous),
+                _ => false,
+            };
         *self = Self::new(compiled);
         self.generation = generation;
-        Ok(generation)
+        Ok(Reloaded {
+            generation,
+            state_kept,
+        })
     }
 }
 

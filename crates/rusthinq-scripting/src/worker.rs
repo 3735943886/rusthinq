@@ -1,5 +1,5 @@
 //! One serialized blocking worker per script host; no detached retries or sinks.
-use crate::{Compiled, Error, Host, Outcome};
+use crate::{Compiled, Error, Host, Outcome, Reloaded};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -38,7 +38,7 @@ enum Request {
     Reload {
         generation: u64,
         compiled: Box<Compiled>,
-        result: oneshot::Sender<Result<u64, Error>>,
+        result: oneshot::Sender<Result<Reloaded, Error>>,
     },
     Wake,
 }
@@ -86,11 +86,11 @@ impl Invocation {
     }
 }
 pub struct Reload {
-    result: oneshot::Receiver<Result<u64, Error>>,
+    result: oneshot::Receiver<Result<Reloaded, Error>>,
     _slot: Arc<OwnedSemaphorePermit>,
 }
 impl Reload {
-    pub async fn wait(self) -> Result<u64, Error> {
+    pub async fn wait(self) -> Result<Reloaded, Error> {
         self.result
             .await
             .map_err(|_| Error::Worker("reload reply lost".into()))?
@@ -316,7 +316,7 @@ fn run(mut host: Host, mut receive: mpsc::Receiver<Message>, shared: Arc<Shared>
                 } else {
                     host.reload(*compiled)
                 };
-                if let Ok(generation) = outcome {
+                if let Ok(Reloaded { generation, .. }) = outcome {
                     shared.status.send_replace(Status::Running { generation });
                 }
                 let _ = result.send(outcome);
