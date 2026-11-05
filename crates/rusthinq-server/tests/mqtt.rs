@@ -1067,7 +1067,7 @@ async fn dropped_publishes_keep_the_session_and_log_once_per_kind() {
             .unwrap()
             .unwrap()
         {
-            Event::PublishIgnored(session, _, payload) => {
+            Event::PublishIgnored(session, _, _, payload) => {
                 assert_eq!(session, id);
                 if payload == state {
                     traced += 1;

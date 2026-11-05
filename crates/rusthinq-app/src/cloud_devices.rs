@@ -1078,12 +1078,38 @@ async fn connected(session: CloudSession<'_>, signals: SessionSignals<'_>) -> io
             event=events.recv()=>{
                 let payload=match event {
                     Ok(AppEvent::Transport(rusthinq_server::Event::Data(id,data))) if id==*local && matches!(material,Material::ThinQ1{..})=>Some(data),
+                    Ok(AppEvent::Transport(rusthinq_server::Event::PublishIgnored(id,reason,topic,bytes))) if id==*local && matches!(material,Material::ThinQ2{..})=>{
+                        // LG-005 traffic that never rides CLIP: the protocol
+                        // layer drops it with OutsideClip. The bridge speaks
+                        // to LG as the device, under the device's own cloud
+                        // identity, so such a publish is relayed to LG
+                        // verbatim on its own topic while the bridge is up.
+                        // The relay is deliberately generic - any topic a
+                        // paired device chooses is forwarded - on the trust
+                        // assumption that a paired device is the operator's
+                        // own appliance. It is logged at debug, after the
+                        // send, because some publishers are periodic
+                        // (position telemetry every few seconds).
+                        if matches!(reason,rusthinq_protocol::thinq2::Error::OutsideClip) {
+                            let payload_len=bytes.len();
+                            if ready {
+                                let (result,_)=oneshot::channel();
+                                match uplink.try_send(session::Uplink{payload:bytes,topic:Some(topic.clone()),result}) {
+                                    Ok(())=>tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP relayed to LG"),
+                                    Err(_)=>tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP dropped: cloud uplink full"),
+                                }
+                            } else {
+                                tracing::debug!(device=%local.device,topic=%topic,payload_len,"publish outside CLIP dropped: bridge not ready");
+                            }
+                        }
+                        None
+                    },
                     Ok(AppEvent::Transport(rusthinq_server::Event::BridgedCloudBound(id,g,bytes))) if id==*local && g==generation=>Some(bytes),
                     Ok(AppEvent::Transport(rusthinq_server::Event::Down(id,_))) if id==*local=>return Ok(()),
                     Err(_)|Ok(AppEvent::Lost{..})=>return Err(io::Error::other("cloud source events lost")),_=>None,
                 };
                 if !context.app.snapshot().iter().any(|d|d.entry.id==local.device && d.entry.incarnation==registration.incarnation && d.session.is_some_and(|s|s.generation==local.generation) && d.online && d.removal.is_none()){return Ok(());}
-                if ready && let Some(payload)=payload {let (result,_)=oneshot::channel();uplink.try_send(session::Uplink{payload,result}).map_err(|_|io::Error::new(io::ErrorKind::WouldBlock,"cloud uplink capacity exceeded"))?;}
+                if ready && let Some(payload)=payload {let (result,_)=oneshot::channel();uplink.try_send(session::Uplink{payload,topic:None,result}).map_err(|_|io::Error::new(io::ErrorKind::WouldBlock,"cloud uplink capacity exceeded"))?;}
             }
         }
     }

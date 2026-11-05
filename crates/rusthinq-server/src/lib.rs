@@ -85,8 +85,8 @@ pub enum Event {
     Ready(SessionId, serde_json::Value),
     CloudBound(SessionId, Vec<u8>),
     BridgedCloudBound(SessionId, u64, Vec<u8>),
-    /// A publish the session dropped: its topic and original payload, for trace logging.
-    PublishIgnored(SessionId, String, Vec<u8>),
+    /// A publish the session dropped: why, its topic and original payload, for trace logging.
+    PublishIgnored(SessionId, rusthinq_protocol::thinq2::Error, String, Vec<u8>),
     BridgeChanged(SessionId, u64, bool),
     /// Raw MQTT Last Will observation; L6 owns publication and retained storage.
     Will {

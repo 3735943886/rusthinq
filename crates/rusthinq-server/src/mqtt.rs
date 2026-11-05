@@ -377,12 +377,17 @@ impl IgnoredPublishes {
                 client: client.clone(),
                 session: guard.id.clone(),
                 ready,
-                reason,
+                reason: reason.clone(),
                 publish: rejected_publish(&topic, &payload),
             });
         }
         if let Some(session) = &guard.id {
-            guard.publish(Event::PublishIgnored(session.clone(), topic, payload));
+            guard.publish(Event::PublishIgnored(
+                session.clone(),
+                reason,
+                topic,
+                payload,
+            ));
         }
     }
 }

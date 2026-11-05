@@ -82,9 +82,10 @@ pub fn runtime_event(event: &Event) {
         }
         // Full wire data and publications are available only with explicit trace logging.
         // CLIP payloads are JSON text; their Debug form would be a list of byte values.
-        Event::Transport(Transport::PublishIgnored(session, topic, payload)) => {
+        Event::Transport(Transport::PublishIgnored(session, reason, topic, payload)) => {
             tracing::trace!(
                 ?session,
+                ?reason,
                 topic,
                 payload = %String::from_utf8_lossy(payload),
                 "ignored publish payload"
@@ -316,6 +317,7 @@ mod tests {
             });
             runtime_event(&Event::Transport(Transport::PublishIgnored(
                 session.clone(),
+                ThinQ2Error::OutsideClip,
                 "express/monitoring".into(),
                 br#"{"mon":1}"#.to_vec(),
             )));
