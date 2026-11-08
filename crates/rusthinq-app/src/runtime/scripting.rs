@@ -1,4 +1,25 @@
 use super::*;
+/// A retired session's `on_drop` publications. Grace delays only the offline report, so
+/// they wait for it: a successor within grace discards them unpublished.
+pub(super) struct Dropped {
+    context: crate::scripts::Context,
+    payloads: Vec<String>,
+    /// L2 reported the device offline (or it already was when the hook finished).
+    due: bool,
+}
+impl Dropped {
+    /// The ended session is still the device's last one, with no successor or removal.
+    fn current(&self, devices: &[Device]) -> bool {
+        let session = self.context.session;
+        devices.iter().any(|device| {
+            device.entry.id == self.context.device
+                && device.entry.incarnation == session.incarnation
+                && device.entry.last_generation == session.generation
+                && device.session.is_none()
+                && device.removal.is_none()
+        })
+    }
+}
 impl Runtime {
     pub(super) fn script_rejected(&self, device: String, reason: impl std::fmt::Debug) {
         self.emit(Event::Rejected {
@@ -269,13 +290,13 @@ impl Runtime {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(context.device.clone(), context.clone());
             self.shared.state_changed.send_replace(());
+            let mut payloads = Vec::new();
             for output in outcome.outputs {
                 let result = match output {
-                    rusthinq_scripting::Output::Publish(payload) => self
-                        .script_sink
-                        .as_ref()
-                        .ok_or_else(|| "publication sink disabled".to_string())
-                        .and_then(|sink| sink.try_publish_retired(&context, payload)),
+                    rusthinq_scripting::Output::Publish(payload) => {
+                        payloads.push(payload);
+                        Ok::<(), String>(())
+                    }
                     rusthinq_scripting::Output::Send(_) => {
                         Err("shutdown callback cannot send to device".into())
                     }
@@ -290,8 +311,62 @@ impl Runtime {
                     break;
                 }
             }
+            if !payloads.is_empty() {
+                let online = self
+                    .model
+                    .devices()
+                    .iter()
+                    .any(|device| device.entry.id == context.device && device.online);
+                self.dropped.insert(
+                    context.device.clone(),
+                    Dropped {
+                        context: context.clone(),
+                        payloads,
+                        due: !online,
+                    },
+                );
+            }
             if let Some(error) = outcome.error {
                 self.script_rejected(context.device, error);
+            }
+        }
+        self.release_dropped();
+    }
+    /// L2 reported the device offline after grace for this incarnation.
+    pub(super) fn device_offline(&mut self, id: &str, incarnation: u64) {
+        match self.dropped.get_mut(id) {
+            Some(held) if held.context.session.incarnation == incarnation => held.due = true,
+            Some(_) => {
+                self.dropped.remove(id);
+            }
+            None => {}
+        }
+        self.release_dropped();
+    }
+    /// Publish due `on_drop` output through the disconnected-session fence, once.
+    fn release_dropped(&mut self) {
+        let devices = self.model.devices();
+        let due = self
+            .dropped
+            .iter()
+            .filter(|(_, held)| held.due)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in due {
+            let held = self.dropped.remove(&id).expect("listed output");
+            if !held.current(&devices) {
+                continue;
+            }
+            for payload in held.payloads {
+                let result = self
+                    .script_sink
+                    .as_ref()
+                    .ok_or_else(|| "publication sink disabled".to_string())
+                    .and_then(|sink| sink.try_publish_retired(&held.context, payload));
+                if let Err(reason) = result {
+                    self.script_rejected(id.clone(), reason);
+                    break;
+                }
             }
         }
     }
@@ -559,6 +634,11 @@ impl Runtime {
                 Err(error) => self.script_rejected(String::new(), error),
             }
         }
+        // L3 is already down: no session can return within grace, so publish now.
+        for held in self.dropped.values_mut() {
+            held.due = true;
+        }
+        self.release_dropped();
         if let Some(request) = self.pending_attach.take() {
             let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
         }
@@ -583,6 +663,8 @@ impl Runtime {
         if let Some(scripts) = &mut self.scripts {
             scripts.reconcile(&self.model.devices());
         }
+        // A successor session, forget or re-pairing discards held output unpublished.
+        self.dropped.retain(|_, held| held.current(devices));
         self.shared
             .retired_scripts
             .lock()
