@@ -385,6 +385,9 @@ pub struct Runtime {
     script_sink: Option<Arc<dyn crate::scripts::PublishSink>>,
     #[cfg(feature = "scripting")]
     scripts: Option<crate::scripts::Owner>,
+    /// `on_drop` publications held until L2 reports the device offline after grace.
+    #[cfg(feature = "scripting")]
+    dropped: BTreeMap<String, scripting::Dropped>,
     model: Model,
     storage: Option<Storage>,
     write: Option<WriteTask>,
@@ -616,6 +619,8 @@ impl Runtime {
             script_sink: None,
             #[cfg(feature = "scripting")]
             scripts: None,
+            #[cfg(feature = "scripting")]
+            dropped: BTreeMap::new(),
             model,
             storage: Some(storage),
             write: None,
@@ -1171,6 +1176,8 @@ impl Runtime {
         for action in outcome.actions {
             self.emit(Event::Lifecycle(action.clone()));
             match action {
+                #[cfg(feature = "scripting")]
+                Action::Offline { id, incarnation } => self.device_offline(&id, incarnation),
                 Action::Removed { id, .. } => {
                     #[cfg(feature = "bridge")]
                     {
