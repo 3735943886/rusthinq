@@ -13,7 +13,11 @@ set -euo pipefail
 target=$1 tarball=$2 prefix=$3
 
 case "$target" in
-    x86_64-unknown-linux-musl) os=linux-x86_64 cc_default=musl-gcc arch_flags=(-m64) ;;
+    # The baseline ISA is explicit: GitHub's ubuntu-26.04 image installs Ubuntu's amd64v3
+    # variant, whose gcc defaults to x86-64-v3 (AVX2) and made 0.2.x SIGILL on CPUs
+    # without AVX (Atom/Celeron J-series). OpenSSL's assembly still picks AVX paths at run time.
+    x86_64-unknown-linux-musl)
+        os=linux-x86_64 cc_default=musl-gcc arch_flags=(-m64 -march=x86-64 -mtune=generic) ;;
     aarch64-unknown-linux-musl) os=linux-aarch64 cc_default=aarch64-linux-musl-gcc arch_flags=() ;;
     armv7-unknown-linux-musleabihf)
         os=linux-armv4 cc_default=arm-linux-musleabihf-gcc
