@@ -338,3 +338,19 @@ async fn connection_and_transfer_timeouts_release_capacity() {
     assert_eq!(connector.calls.load(Ordering::SeqCst), 2);
     harness.shutdown().await;
 }
+
+#[test]
+fn failed_local_handshake_does_not_relay_the_retry() {
+    use rusthinq_server::tls::Passthrough;
+    let relay = Relay::new(Config::default(), destination(None)).unwrap();
+    // unknown_ca on the first attach, then the retry that fetches /route/certificate.
+    relay.handshake_failed("common.lgthinq.com");
+    relay.handshake_failed("common.lgthinq.com");
+    assert!(!relay.claims("common.lgthinq.com"));
+    assert!(relay.snapshot().unwrap().is_empty());
+    // Hosts from real firmware commands are still relayed.
+    relay
+        .learn_command(&json!("https://cdn.example/fw"))
+        .unwrap();
+    assert!(relay.claims("cdn.example"));
+}
