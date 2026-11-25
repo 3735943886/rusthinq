@@ -203,11 +203,12 @@ async fn tls10_cbc_is_enabled_only_by_explicit_compatibility_policy() {
     let (address, shutdown, task, _, mut rejects) =
         start(Config::default(), TlsPolicy::Baseline, None).await;
     assert!(connect(address, "first.example", true, true).await.is_err());
-    let reason = timeout(Duration::from_secs(2), rejects.recv())
+    let rejection = timeout(Duration::from_secs(2), rejects.recv())
         .await
         .unwrap()
-        .unwrap()
-        .reason;
+        .unwrap();
+    assert_eq!(rejection.name.as_deref(), Some("first.example"));
+    let reason = rejection.reason;
     assert!(
         matches!(&reason, Failure::Tls(detail) if !detail.is_empty()),
         "{reason:?}"
@@ -229,7 +230,11 @@ async fn no_sni_is_refused_unless_a_served_default_is_explicit() {
             .await
             .is_err()
     );
-    assert_eq!(rejects.recv().await.unwrap().reason, Failure::Unserved);
+    let rejection = rejects.recv().await.unwrap();
+    assert_eq!(
+        (rejection.name, rejection.reason),
+        (None, Failure::Unserved)
+    );
     stop(shutdown, task).await;
     let (address, shutdown, task, _, _) = start(
         Config {

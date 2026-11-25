@@ -73,14 +73,15 @@ impl Harness {
         peer.write_all(&hello(host)).await.unwrap();
         peer
     }
-    async fn rejected(&mut self) {
+    /// A relay refusal or failure, reported with the requested name.
+    async fn rejected(&mut self, host: &str) {
+        let rejection = timeout(Duration::from_secs(2), self.rejects.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(2), self.rejects.recv())
-                .await
-                .unwrap()
-                .unwrap()
-                .reason,
-            Failure::Io
+            (rejection.name.as_deref(), rejection.reason),
+            (Some(host), Failure::Io)
         );
     }
     async fn shutdown(self) {
@@ -222,7 +223,7 @@ async fn unlearned_host_is_refused_then_suspected_and_protected_hosts_never_dial
     let mut harness = Harness::start(relay.clone()).await;
     // First attempt: no evidence, refused without dialing, as 0.1's failed local handshake.
     let _first = harness.connect("cdn.example").await;
-    harness.rejected().await;
+    harness.rejected("cdn.example").await;
     assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
     assert!(matches!(
         relay.snapshot().unwrap()["cdn.example"],
@@ -240,7 +241,7 @@ async fn unlearned_host_is_refused_then_suspected_and_protected_hosts_never_dial
     // Local proof is never weakened by refusal, on any number of retries.
     for _ in 0..2 {
         let _protected = harness.connect("protected.example").await;
-        harness.rejected().await;
+        harness.rejected("protected.example").await;
     }
     assert_eq!(
         relay.snapshot().unwrap()["protected.example"],
@@ -274,7 +275,7 @@ async fn capacity_rejection_and_shutdown_close_both_sides() {
     let mut prefix = vec![0; hello("cdn.example").len()];
     remote.read_exact(&mut prefix).await.unwrap();
     let _extra = harness.connect("cdn.example").await;
-    harness.rejected().await;
+    harness.rejected("cdn.example").await;
     assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
     harness.shutdown().await;
     assert_eq!(
@@ -311,7 +312,7 @@ async fn connection_and_transfer_timeouts_release_capacity() {
         .unwrap();
     let mut harness = Harness::start(relay).await;
     let _peer = harness.connect("cdn.example").await;
-    harness.rejected().await;
+    harness.rejected("cdn.example").await;
     harness.shutdown().await;
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let connector = destination(Some(upstream.local_addr().unwrap()));
@@ -330,10 +331,10 @@ async fn connection_and_transfer_timeouts_release_capacity() {
     let mut harness = Harness::start(relay).await;
     let _peer = harness.connect("cdn.example").await;
     let (_remote, _) = upstream.accept().await.unwrap();
-    harness.rejected().await;
+    harness.rejected("cdn.example").await;
     let _second = harness.connect("cdn.example").await;
     let (_remote2, _) = upstream.accept().await.unwrap();
-    harness.rejected().await;
+    harness.rejected("cdn.example").await;
     assert_eq!(connector.calls.load(Ordering::SeqCst), 2);
     harness.shutdown().await;
 }

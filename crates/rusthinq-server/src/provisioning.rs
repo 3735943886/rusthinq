@@ -14,7 +14,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use rusthinq_protocol::client_hello::hostname;
 use serde_json::{Value, json};
 use std::{convert::Infallible, io, sync::Arc, time::Duration};
-use tokio::time::timeout;
+use tokio::{sync::broadcast, time::timeout};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -44,6 +44,15 @@ impl Config {
         }
     }
 }
+/// A request answered with the empty fallback, so an appliance's unknown calls are visible.
+/// The query string is left out; `path` is cut to [`MAX_REPORTED_PATH`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnhandledRequest {
+    pub method: String,
+    pub path: String,
+    pub host: Option<String>,
+}
+pub const MAX_REPORTED_PATH: usize = 256;
 #[derive(Clone)]
 pub struct Service {
     state: Arc<State>,
@@ -52,6 +61,7 @@ struct State {
     config: Config,
     root: String,
     signer: SigningHandle,
+    unhandled: broadcast::Sender<UnhandledRequest>,
 }
 impl Service {
     /// Custom root only changes the trust material served by /route/certificate.
@@ -104,8 +114,12 @@ impl Service {
                 config,
                 root,
                 signer,
+                unhandled: broadcast::channel(64).0,
             }),
         })
+    }
+    pub fn unhandled_requests(&self) -> broadcast::Receiver<UnhandledRequest> {
+        self.state.unhandled.subscribe()
     }
     pub(crate) async fn request(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
         let path = request.uri().path();
@@ -230,13 +244,32 @@ impl Service {
                     _ => json_response(StatusCode::OK, json!({"resultCode":"9999"})),
                 }
             }
-            _ => Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "text/xml;charset=utf-8")
-                .body(Full::new(Bytes::new()))
-                .expect("static response"),
+            _ => {
+                let mut end = path.len().min(MAX_REPORTED_PATH);
+                while !path.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let _ = self.state.unhandled.send(UnhandledRequest {
+                    method: request.method().to_string(),
+                    path: path[..end].to_owned(),
+                    host: request
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(host_header)
+                        .map(str::to_owned),
+                });
+                fallback()
+            }
         }
     }
+}
+fn fallback() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/xml;charset=utf-8")
+        .body(Full::new(Bytes::new()))
+        .expect("static response")
 }
 impl LocalService for Service {
     fn serve(&self, stream: Transport) -> LocalFuture {
