@@ -107,7 +107,7 @@ impl Relay {
         self.with_hosts(|hosts, now| hosts.protect_local_endpoints(payload, now))
     }
     /// Explicit suspicion from a URL. Without front-door minting, refused unlearned SNI
-    /// names are suspected by `relay`; failed local handshakes never suspect.
+    /// names are suspected by `relay`; with it, failed local handshakes are.
     pub fn suspect(&self, download_url: &str) -> io::Result<()> {
         self.with_hosts(|hosts, now| hosts.suspect(download_url, now))
     }
@@ -122,10 +122,19 @@ impl Passthrough for Relay {
     fn handshake_succeeded(&self, name: &str) {
         let _ = self.confirm_local(name);
     }
-    /// A failed local handshake is deliberately not evidence: `unknown_ca` is the expected
-    /// first step of an appliance replacing LG's pinned root with ours, and suspecting the
-    /// name would relay its `/route/certificate` retry back to LG. Only hosts learned from
-    /// cloud firmware commands (`learn_command`) are relayed under front-door minting.
+    fn handshake_failed(&self, name: &str) {
+        match self.suspect(&format!("https://{name}/")) {
+            Ok(()) => tracing::info!(
+                host = name,
+                "firmware passthrough: local handshake failed, host suspected; retries are relayed"
+            ),
+            Err(error) => tracing::warn!(
+                host = name,
+                %error,
+                "firmware passthrough: local handshake failed, host not suspected"
+            ),
+        }
+    }
     fn relay(&self, name: String, mut stream: PrefixedStream) -> PassthroughFuture {
         let relay = self.clone();
         Box::pin(async move {
