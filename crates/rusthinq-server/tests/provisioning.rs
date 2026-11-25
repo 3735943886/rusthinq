@@ -26,12 +26,14 @@ struct Harness {
     signer: JoinHandle<()>,
     handle: SigningHandle,
     metadata: tokio::sync::mpsc::Receiver<rusthinq_server::thinq1_http::Metadata>,
+    unhandled: tokio::sync::broadcast::Receiver<rusthinq_server::provisioning::UnhandledRequest>,
 }
 impl Harness {
     async fn start(config: Config, custom: Option<&[u8]>) -> Self {
         let ca = support::authority();
         let (owner, handle) = Signer::new(ca.clone(), SignConfig::default()).unwrap();
         let provisioning = Service::new(config, &ca, handle.clone(), custom).unwrap();
+        let unhandled = provisioning.unhandled_requests();
         let (thin, metadata) = rusthinq_server::thinq1_http::Service::new(
             Default::default(),
             Arc::new(rusthinq_server::mqtt::SystemClock),
@@ -60,6 +62,7 @@ impl Harness {
             signer,
             handle,
             metadata,
+            unhandled,
         }
     }
     async fn connect(&self) -> SslStream<TcpStream> {
@@ -169,10 +172,21 @@ async fn https_routes_advertise_default_and_explicit_ports_and_root_list() {
     );
     assert_eq!(
         harness
-            .request("GET", "/unknown", "local.example", b"")
+            .request("GET", "/unknown?token=secret", "local.example:443", b"")
             .await,
         (200, Value::Null)
     );
+    // Only the fallback is reported, without its query string.
+    let mut harness = harness;
+    assert_eq!(
+        harness.unhandled.try_recv().unwrap(),
+        rusthinq_server::provisioning::UnhandledRequest {
+            method: "GET".into(),
+            path: "/unknown".into(),
+            host: Some("local.example".into()),
+        }
+    );
+    assert!(harness.unhandled.try_recv().is_err());
     harness.shutdown().await;
     let mut config = Config::new("local.example".into());
     config.advertise_requested_host = true;

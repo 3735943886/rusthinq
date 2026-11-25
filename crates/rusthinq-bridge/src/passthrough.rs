@@ -123,39 +123,61 @@ impl Passthrough for Relay {
         let _ = self.confirm_local(name);
     }
     fn handshake_failed(&self, name: &str) {
-        let _ = self.suspect(&format!("https://{name}/"));
+        match self.suspect(&format!("https://{name}/")) {
+            Ok(()) => tracing::info!(
+                host = name,
+                "firmware passthrough: local handshake failed, host suspected; retries are relayed"
+            ),
+            Err(error) => tracing::warn!(
+                host = name,
+                %error,
+                "firmware passthrough: local handshake failed, host not suspected"
+            ),
+        }
     }
     fn relay(&self, name: String, mut stream: PrefixedStream) -> PassthroughFuture {
         let relay = self.clone();
         Box::pin(async move {
-            let _permit = relay
-                .inner
-                .slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "relay capacity"))?;
-            if !relay.with_hosts(|hosts, now| hosts.route_or_suspect(&name, now))? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "unlearned or local host",
-                ));
+            let host = name.trim_end_matches('.').to_ascii_lowercase();
+            let outcome = async {
+                let _permit = relay
+                    .inner
+                    .slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "relay capacity"))?;
+                if !relay.with_hosts(|hosts, now| hosts.route_or_suspect(&name, now))? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unlearned or local host",
+                    ));
+                }
+                tracing::info!(host, "firmware passthrough: relay started");
+                let mut remote = timeout(
+                    relay.inner.config.connect_timeout,
+                    relay.inner.connector.connect(host.clone()),
+                )
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relay connect timeout"))??;
+                let transfer = copy_bidirectional(&mut stream, &mut remote);
+                if let Some(limit) = relay.inner.config.transfer_timeout {
+                    timeout(limit, transfer).await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "relay transfer timeout")
+                    })?
+                } else {
+                    transfer.await
+                }
             }
-            let name = name.trim_end_matches('.').to_ascii_lowercase();
-            let mut remote = timeout(
-                relay.inner.config.connect_timeout,
-                relay.inner.connector.connect(name),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relay connect timeout"))??;
-            let transfer = copy_bidirectional(&mut stream, &mut remote);
-            if let Some(limit) = relay.inner.config.transfer_timeout {
-                timeout(limit, transfer).await.map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "relay transfer timeout")
-                })??;
-            } else {
-                transfer.await?;
+            .await;
+            match &outcome {
+                Ok((sent, received)) => {
+                    tracing::info!(host, sent, received, "firmware passthrough: relay finished")
+                }
+                Err(error) => {
+                    tracing::warn!(host, %error, "firmware passthrough: relay failed")
+                }
             }
-            Ok(())
+            outcome.map(|_| ())
         })
     }
 }

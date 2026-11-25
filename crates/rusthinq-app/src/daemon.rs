@@ -422,6 +422,8 @@ pub struct Daemon {
     plain: Vec<(https::Service, TcpListener)>,
     /// Device TLS refusals, reported on stderr as 0.1 warned about failed handshakes.
     mqtt_diagnostics: tokio::sync::broadcast::Receiver<rusthinq_server::MqttDiagnostic>,
+    /// HTTPS requests answered with the empty fallback, so unknown appliance calls are visible.
+    unhandled_https: tokio::sync::broadcast::Receiver<provisioning::UnhandledRequest>,
     rejections: Vec<(
         &'static str,
         tokio::sync::broadcast::Receiver<rusthinq_server::tls::Rejection>,
@@ -618,6 +620,7 @@ impl Daemon {
         provisioning_config.mqtt_server = mqtt_server;
         let provisioning =
             provisioning::Service::new(provisioning_config, &ca, signing, custom_root.as_deref())?;
+        let unhandled_https = provisioning.unhandled_requests();
         let (xml, metadata) = thinq1_http::Service::new(Default::default(), Arc::new(SystemClock))?;
         let https = https::Service::new(
             xml,
@@ -695,6 +698,7 @@ impl Daemon {
             mqtt: mqtt.map(|listener| (mqtt_front, listener)),
             plain,
             mqtt_diagnostics,
+            unhandled_https,
             rejections,
             endpoints,
             #[cfg(feature = "bridge")]
@@ -756,6 +760,25 @@ impl Daemon {
                 }
             });
         }
+        {
+            let mut unhandled = self.unhandled_https;
+            let mut stop = services_stopped.clone();
+            tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => return Ok(()),
+                        request = unhandled.recv() => match request {
+                            Ok(request) => tracing::warn!(method = %request.method, path = %request.path, host = ?request.host, "unhandled HTTPS request answered with an empty response"),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => tracing::warn!(lost, "unhandled HTTPS request diagnostics lost"),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                let _ = stop.wait_for(|stopped| *stopped).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
         for (label, mut rejections) in self.rejections {
             let mut stop = services_stopped.clone();
             tasks.spawn(async move {
@@ -763,7 +786,7 @@ impl Daemon {
                     tokio::select! {
                         _ = stop.changed() => return Ok(()),
                         rejection = rejections.recv() => match rejection {
-                            Ok(rejection) => tracing::warn!(listener = label, peer = %rejection.peer, reason = ?rejection.reason, "connection refused"),
+                            Ok(rejection) => tracing::warn!(listener = label, peer = %rejection.peer, sni = ?rejection.name, reason = ?rejection.reason, "connection refused"),
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => tracing::warn!(listener = label, lost, "connection refusal diagnostics lost"),
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 // A finished listener is reported by the core; wait for shutdown.

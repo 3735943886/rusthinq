@@ -74,6 +74,8 @@ pub enum Failure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rejection {
     pub peer: std::net::SocketAddr,
+    /// The ClientHello's server name; None without SNI or before it was read.
+    pub name: Option<String>,
     pub reason: Failure,
 }
 /// Owns bytes read for routing, replaying them exactly once before reading the socket.
@@ -302,7 +304,7 @@ impl FrontDoor {
                 _ = stop.changed() => break Ok(()),
                 joined = pending.join_next(), if !pending.is_empty() => {
                     match joined {
-                        Some(Ok((peer, Ok(Some(stream))))) => {
+                        Some(Ok((peer, name, Ok(Some(stream))))) => {
                             if let Some(service) = &service {
                                 let service = service.clone();
                                 let events = self.events.clone();
@@ -310,28 +312,28 @@ impl FrontDoor {
                                     let mut guard = PanicGuard { peer, events, armed: true };
                                     let result = service.serve(stream).await.map(|_| None).map_err(|_| Failure::Io);
                                     guard.armed = false;
-                                    (peer, result)
+                                    (peer, name, result)
                                 });
                             } else if let Some(server) = &mut server
-                                && server.admit(stream).is_err() { let _ = self.events.send(Rejection { peer, reason: Failure::SessionRejected }); }
+                                && server.admit(stream).is_err() { let _ = self.events.send(Rejection { peer, name, reason: Failure::SessionRejected }); }
                         }
-                        Some(Ok((peer, Err(reason)))) => { let _ = self.events.send(Rejection { peer, reason }); }
+                        Some(Ok((peer, name, Err(reason)))) => { let _ = self.events.send(Rejection { peer, name, reason }); }
                         _ => {}, // Panic is reported by the per-peer guard, with no retry.
                     }
                 }
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
                         if pending.len() >= self.router.config.max_pending {
-                            let _ = self.events.send(Rejection { peer, reason: Failure::Capacity });
+                            let _ = self.events.send(Rejection { peer, name: None, reason: Failure::Capacity });
                             continue;
                         }
                         let router = self.router.clone();
                         let events = self.events.clone();
                         pending.spawn(async move {
                             let mut guard = PanicGuard { peer, events, armed: true };
-                            let outcome = router.route(stream).await;
+                            let (name, outcome) = router.route(stream).await;
                             guard.armed = false;
-                            (peer, outcome)
+                            (peer, name, outcome)
                         });
                     }
                     Err(error) => break Err(error),
@@ -357,6 +359,7 @@ impl Drop for PanicGuard {
         if self.armed && std::thread::panicking() {
             let _ = self.events.send(Rejection {
                 peer: self.peer,
+                name: None,
                 reason: Failure::Panic,
             });
         }
@@ -364,14 +367,33 @@ impl Drop for PanicGuard {
 }
 pub type Transport = SslStream<PrefixedStream>;
 impl Router {
-    async fn route(&self, mut stream: TcpStream) -> Result<Option<Transport>, Failure> {
+    /// The requested server name (once the ClientHello was read) and the outcome.
+    async fn route(
+        &self,
+        mut stream: TcpStream,
+    ) -> (Option<String>, Result<Option<Transport>, Failure>) {
         let deadline = Instant::now() + self.config.handshake_timeout;
-        let (name, prefix) = timeout_at(
+        let hello = timeout_at(
             deadline,
             read_hello(&mut stream, self.config.max_client_hello),
         )
         .await
-        .map_err(|_| Failure::Timeout)??;
+        .map_err(|_| Failure::Timeout)
+        .and_then(|hello| hello);
+        let (name, prefix) = match hello {
+            Ok(hello) => hello,
+            Err(failure) => return (None, Err(failure)),
+        };
+        let outcome = self.dispatch(stream, &name, prefix, deadline).await;
+        (name, outcome)
+    }
+    async fn dispatch(
+        &self,
+        stream: TcpStream,
+        name: &Option<String>,
+        prefix: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Option<Transport>, Failure> {
         let stream = PrefixedStream {
             stream,
             prefix,
@@ -389,7 +411,7 @@ impl Router {
                 .map_err(tls_failure)?;
             return Ok(Some(transport));
         }
-        if let (Some(name), Some(hook)) = (&name, &self.passthrough)
+        if let (Some(name), Some(hook)) = (name, &self.passthrough)
             && (self.minter.is_none() || hook.claims(name))
         {
             hook.relay(name.clone(), stream)
@@ -411,7 +433,7 @@ impl Router {
             Ok(transport)
         }
         .await;
-        if let (Some(name), Some(hook)) = (&name, &self.passthrough) {
+        if let (Some(name), Some(hook)) = (name, &self.passthrough) {
             match &accepted {
                 Ok(_) => hook.handshake_succeeded(name),
                 Err(_) => hook.handshake_failed(name),
