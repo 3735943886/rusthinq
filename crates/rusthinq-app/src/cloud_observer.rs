@@ -224,6 +224,9 @@ impl Observer {
                 continue;
             };
             epoch.borrow_and_update();
+            // A token renewal republishes the same account; only another account (or none)
+            // invalidates the feed. Its MQTT session is certificate-bound, not token-bound.
+            let account = account_key(&Some(client.clone()));
             self.status(Status::Connecting);
             // Await pure key generation before cancellation so shutdown owns its worker.
             let identity =
@@ -258,7 +261,7 @@ impl Observer {
                 _ = stop.changed() => break,
                 _ = wanted.changed() => continue,
                 _ = epoch.changed() => { self.clear(); continue; },
-                _ = clients.changed() => { self.clear(); continue; },
+                _ = changed_by(&mut clients, &account, account_key) => { self.clear(); continue; },
                 value = connection => value,
             };
             if let Ok((stream, id, filters)) = ready {
@@ -274,7 +277,7 @@ impl Observer {
                         _ = stop.changed() => return,
                         _ = wanted.changed() => break,
                         _ = epoch.changed() => { self.clear(); break; },
-                        _ = clients.changed() => { self.clear(); break; },
+                        _ = changed_by(&mut clients, &account, account_key) => { self.clear(); break; },
                         _ = &mut session => break,
                         value = rx.recv() => {
                             let Some(value) = value else { break; };
@@ -293,11 +296,33 @@ impl Observer {
                 _ = stop.changed() => break,
                 _ = wanted.changed() => {},
                 _ = epoch.changed() => self.clear(),
-                _ = clients.changed() => self.clear(),
+                _ = changed_by(&mut clients, &account, account_key) => self.clear(),
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
             }
         }
         self.status(Status::Disabled);
+    }
+}
+/// The authenticated account a client speaks for: None when signed out.
+#[cfg(feature = "bridge")]
+fn account_key(client: &Option<Arc<rusthinq_bridge::cloud::Client>>) -> Option<Option<String>> {
+    client
+        .as_ref()
+        .filter(|client| client.authenticated())
+        .map(|client| client.account_identity().map(str::to_owned))
+}
+/// Resolves when `key` of the watched value differs from `current`, or the sender is gone.
+/// Republishing an equal value (a token renewal for the same account) is not a change.
+#[cfg(feature = "bridge")]
+async fn changed_by<T, K: PartialEq>(
+    receiver: &mut watch::Receiver<T>,
+    current: &K,
+    key: impl Fn(&T) -> K,
+) {
+    while receiver.changed().await.is_ok() {
+        if key(&receiver.borrow_and_update()) != *current {
+            return;
+        }
     }
 }
 pub(crate) fn matches_device(value: &Value, device: &str) -> bool {
@@ -341,6 +366,23 @@ fn collect_ids(value: &Value, depth: usize, ids: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "bridge")]
+    #[tokio::test]
+    async fn republishing_the_same_key_is_not_a_change() {
+        let (sender, mut receiver) = watch::channel((1, "account"));
+        let mut changed = Box::pin(changed_by(&mut receiver, &"account", |value| value.1));
+        // A renewal republishes the same account with a new token.
+        sender.send_replace((2, "account"));
+        sender.send_replace((3, "account"));
+        tokio::task::yield_now().await;
+        assert!(futures_util::poll!(changed.as_mut()).is_pending());
+        sender.send_replace((4, "other"));
+        changed.await;
+        // A dropped sender resolves rather than hanging the observer.
+        let (sender, mut receiver) = watch::channel(0);
+        drop(sender);
+        changed_by(&mut receiver, &0, |value| *value).await;
+    }
     #[test]
     fn invalid_or_oversized_envelopes_do_not_allocate_a_sequence() {
         let observer = Observer::new(true);
