@@ -358,6 +358,28 @@ impl Handle {
             .await
             .map_err(|_| rusthinq_scripting::Error::Stopped)?
     }
+    /// Prepare again a device whose driver preparation failed for `session`, as a
+    /// reconnect would. Does nothing when nothing failed for that session.
+    #[cfg(feature = "scripting")]
+    pub(crate) async fn retry_driver_preparation(
+        &self,
+        device: String,
+        session: SessionKey,
+    ) -> Result<(), rusthinq_scripting::Error> {
+        let (result, received) = oneshot::channel();
+        self.0
+            .scripts
+            .send(ScriptCommand::RetryPreparation {
+                device,
+                session,
+                result,
+            })
+            .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?;
+        received
+            .await
+            .map_err(|_| rusthinq_scripting::Error::Stopped)?
+    }
     #[cfg(feature = "scripting")]
     async fn reload_prepared(
         &self,

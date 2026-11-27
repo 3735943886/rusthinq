@@ -42,6 +42,22 @@ impl<K: Clone + PartialEq> Preparation<K> {
         self.buffers.remove(id);
         self.failed.insert(id.into(), scope.clone());
     }
+    /// Allow a failed scope to be prepared again (its driver source changed).
+    /// False when `scope` has not failed. Input dropped while it was failed stays dropped.
+    pub fn retry(&mut self, id: &str, scope: &K) -> bool {
+        if self.failed.get(id) != Some(scope) {
+            return false;
+        }
+        self.failed.remove(id);
+        if self
+            .attempts
+            .get(id)
+            .is_some_and(|(current, _)| current == scope)
+        {
+            self.attempts.remove(id);
+        }
+        true
+    }
     pub fn buffer(&mut self, id: &str, scope: K, data: &[u8]) -> Result<(), String> {
         if self.failed.get(id) == Some(&scope) {
             return Ok(());
@@ -132,6 +148,26 @@ mod tests {
         assert_eq!(
             policy.take_buffer("a", &2),
             VecDeque::from([b"new".to_vec()])
+        );
+    }
+    #[test]
+    fn retry_reopens_only_the_failed_scope() {
+        let mut policy = Preparation::new(2);
+        assert!(!policy.retry("a", &1));
+        assert!(policy.begin("a", 1, "model"));
+        assert!(
+            !policy.retry("a", &1),
+            "an attempt in flight has not failed"
+        );
+        policy.fail("a", &1);
+        assert!(!policy.retry("a", &2));
+        assert!(policy.retry("a", &1));
+        assert!(!policy.retry("a", &1));
+        policy.buffer("a", 1, b"after").unwrap();
+        assert!(policy.begin("a", 1, "model"));
+        assert_eq!(
+            policy.take_buffer("a", &1),
+            VecDeque::from([b"after".to_vec()])
         );
     }
     #[test]
