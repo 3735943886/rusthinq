@@ -100,17 +100,21 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
     let mut states = app.state_changes();
     let mut scopes = BTreeMap::new();
     let mut revisions = BTreeMap::new();
+    // Devices without a script: the source scan last seen for their session, so only a
+    // change to their own driver (or its imports) retries preparation.
+    let mut unattached = BTreeMap::new();
     let mut initial = true;
     let mut retry = false;
     loop {
         if *stop.borrow() {
             return Ok(());
         }
+        let mut sources_changed = retry;
         if !initial {
             tokio::select! {
                 biased;
                 _ = stop.changed() => return Ok(()),
-                result = changes.next() => result?,
+                result = changes.next() => { result?; sources_changed = true; },
                 result = states.changed() => {
                     if result.is_err() { return Ok(()); }
                     let current: BTreeMap<_, _> = app.script_states().into_iter()
@@ -124,6 +128,7 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
         revisions.retain(|id, _| models.contains_key(id));
         let mut scanned = BTreeMap::new();
         let script_states = app.script_states();
+        unattached.retain(|id, _| models.contains_key(id) && !script_states.contains_key(id));
         scopes = script_states
             .iter()
             .map(|(id, (session, generation, _))| (id.clone(), (*session, *generation)))
@@ -133,6 +138,31 @@ pub async fn run(config: Config, app: Handle, mut stop: watch::Receiver<bool>) -
                 return Ok(());
             }
             let Some((attached, generation, _)) = script_states.get(&id).copied() else {
+                // Preparation failed for this session (e.g. the driver did not exist yet).
+                // Retry once its source appears or changes, as a reconnect would.
+                let scan = source_revision(&config, &id, &model, &mut scanned).await;
+                let missing = scan
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+                let key = (session, scan.map_err(|error| error.to_string()));
+                let previous = unattached.insert(id.clone(), key.clone());
+                if !sources_changed || previous.as_ref() == Some(&key) || missing {
+                    continue;
+                }
+                if let Err(error) = key.1 {
+                    app.driver_error(id, format!("driver preparation retry source scan: {error}"));
+                    continue;
+                }
+                match app.retry_driver_preparation(id.clone(), session).await {
+                    Ok(_) => {}
+                    Err(rusthinq_scripting::Error::Busy) => {
+                        retry = true;
+                        unattached.remove(&id);
+                    }
+                    Err(error) => {
+                        app.driver_error(id, format!("driver preparation retry: {error:?}"))
+                    }
+                }
                 continue;
             };
             if attached != session {
@@ -443,6 +473,107 @@ mod tests {
         );
         assert_eq!(app.script_states()["d"].1, 1);
 
+        stop.send_replace(true);
+        timeout(Duration::from_secs(3), watcher)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.shutdown().await;
+        runtime.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_events_attach_a_driver_whose_preparation_failed() {
+        use crate::{
+            lifecycle_storage::Storage,
+            runtime::{Event, Runtime},
+        };
+        use rusthinq_server::{Server, thinq1_http::Metadata};
+        use tokio::{io::AsyncWriteExt, sync::mpsc, time::timeout};
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = config(directory.path());
+        options.limits.source_bytes = 600000;
+        options.limits.worker_capacity = 3;
+        options.limits.input_bytes = 8192;
+        let storage = Storage::open(&directory.path().join("devices.json"), 4).unwrap();
+        let mut server = Server::new(Default::default()).unwrap();
+        let (metadata, receiver) = mpsc::channel(4);
+        let runtime = Runtime::new(storage, server.handle(), Duration::ZERO, 64)
+            .unwrap()
+            .with_metadata(receiver)
+            .with_drivers(options.clone())
+            .unwrap();
+        let app = runtime.handle();
+        let mut events = app.subscribe();
+        let (stop, stopped) = watch::channel(false);
+        let watcher = tokio::spawn(run(options, app.clone(), stopped.clone()));
+        let runtime = tokio::spawn(runtime.run(stopped));
+        metadata
+            .send(Metadata {
+                device_id: "d".into(),
+                model_name: "Late".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (stream, mut peer) = tokio::io::duplex(8192);
+        server.admit(stream).unwrap();
+        peer.write_all(
+            &rusthinq_protocol::thinq1::encode(
+                br#"{"Header":{"x-lgedm-deviceId":"d"},"Body":{"Cmd":"Mon"}}"#,
+                8192,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !matches!(events.recv().await.unwrap(), Event::Rejected {reason,..} if reason.contains("Late.rhai not found")) {}
+        })
+        .await
+        .unwrap();
+        assert!(!app.script_states().contains_key("d"));
+        // A driver that does not scan is reported, not attached; unrelated edits stay quiet.
+        std::fs::write(directory.path().join("Late.rhai"), "fn broken(").unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !matches!(events.recv().await.unwrap(), Event::Rejected {device,reason} if device == "d" && reason.contains("source scan")) {}
+        })
+        .await
+        .unwrap();
+        std::fs::write(directory.path().join("Other.rhai"), "fn start(ctx) {}").unwrap();
+        assert!(
+            timeout(Duration::from_millis(800), async {
+                while !matches!(events.recv().await.unwrap(), Event::Rejected {device,..} if device == "d") {}
+            })
+            .await
+            .is_err(),
+            "an unrelated edit must not prepare the failed device again"
+        );
+        assert!(!app.script_states().contains_key("d"));
+        let temporary = directory.path().join("Late.tmp");
+        std::fs::write(
+            &temporary,
+            "fn start(ctx) {ctx.publish_raw(\"test/state\",\"late\",false);}",
+        )
+        .unwrap();
+        std::fs::rename(temporary, directory.path().join("Late.rhai")).unwrap();
+        let attached = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::ScriptOutput { context, payload } = events.recv().await.unwrap()
+                    && serde_json::from_str::<serde_json::Value>(&payload).unwrap()["payload"]
+                        == "late"
+                {
+                    break context;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attached.generation, 1);
+        assert_eq!(app.script_states()["d"].1, 1);
+
+        drop(peer);
         stop.send_replace(true);
         timeout(Duration::from_secs(3), watcher)
             .await

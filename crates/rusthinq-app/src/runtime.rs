@@ -283,6 +283,12 @@ enum ScriptCommand {
     Attach(Box<AttachScript>),
     Reload(Box<ReloadScript>),
     PrepareReload(PrepareReload),
+    /// Prepare again a device whose preparation failed for `session`.
+    RetryPreparation {
+        device: String,
+        session: SessionKey,
+        result: oneshot::Sender<Result<bool, rusthinq_scripting::Error>>,
+    },
     Invoke {
         device: String,
         session: SessionKey,
@@ -304,6 +310,9 @@ impl ScriptCommand {
             }
             Self::PrepareReload(request) => {
                 let _ = request.result.send(Err(rusthinq_scripting::Error::Stopped));
+            }
+            Self::RetryPreparation { result, .. } => {
+                let _ = result.send(Err(rusthinq_scripting::Error::Stopped));
             }
             Self::Invoke { result, .. } => {
                 let _ = result.send(Err(rusthinq_scripting::Error::Stopped));
@@ -890,10 +899,11 @@ impl Runtime {
         self.emit(Event::Metadata(metadata));
         self.prepare_driver(&id);
     }
+    /// True when a preparation job was started.
     #[cfg(feature = "scripting")]
-    fn prepare_driver(&mut self, id: &str) {
+    fn prepare_driver(&mut self, id: &str) -> bool {
         let Some(config) = self.drivers.as_ref() else {
-            return;
+            return false;
         };
         if !rusthinq_scripting::preparation::Preparation::<SessionKey>::can_start(
             self.driver_preparation.len() + self.driver_reload_preparation.len(),
@@ -902,7 +912,7 @@ impl Runtime {
                 .and_then(|owner| owner.generation(id))
                 .is_some(),
         ) {
-            return;
+            return false;
         }
         let Some(device) = self
             .model
@@ -910,10 +920,10 @@ impl Runtime {
             .into_iter()
             .find(|d| d.entry.id == id && d.online && d.removal.is_none())
         else {
-            return;
+            return false;
         };
         let Some(session) = device.session else {
-            return;
+            return false;
         };
         let model = self
             .shared
@@ -938,10 +948,10 @@ impl Runtime {
             };
             (model.clone(), thinq2)
         } else {
-            return;
+            return false;
         };
         if !self.preparation_policy.begin(id, session, &model) {
-            return;
+            return false;
         }
         self.shared
             .driver_models
@@ -974,6 +984,7 @@ impl Runtime {
             });
             (id, session, model, prepared)
         });
+        true
     }
     #[cfg(feature = "scripting")]
     fn buffer_driver(&mut self, id: &SessionId, data: &[u8]) {
@@ -1635,7 +1646,9 @@ impl Runtime {
         Ok(())
     }
     fn reconcile_scripts(&mut self, _devices: &[Device]) {}
-    fn prepare_driver(&mut self, _id: &str) {}
+    fn prepare_driver(&mut self, _id: &str) -> bool {
+        false
+    }
     fn buffer_driver(&mut self, _id: &SessionId, _data: &[u8]) {}
     fn script_transport(&mut self, _event: &TransportEvent) {}
     fn fire_timers(&mut self) {}
