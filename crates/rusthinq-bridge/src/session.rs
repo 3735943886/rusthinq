@@ -202,6 +202,17 @@ fn publication(topic: &str, payload: &[u8], id: Option<u16>) -> io::Result<Vec<u
     body.extend_from_slice(payload);
     packet(if id.is_some() { 0x32 } else { 0x30 }, &body)
 }
+/// Name the handshake step LG closed the connection in, instead of tokio's bare "early eof".
+fn closed_before(error: io::Error, step: &str) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("LG closed the MQTT connection before {step}"),
+        )
+    } else {
+        error
+    }
+}
 fn short(text: &str) -> String {
     text.chars().take(128).collect()
 }
@@ -245,13 +256,19 @@ pub async fn thinq2<S: AsyncRead + AsyncWrite + Unpin>(
         timeout(DEADLINE, async {
             write(&mut stream, &packet(0x10, &connect)?).await?;
             let mut ack = [0; 4];
-            stream.read_exact(&mut ack).await?;
+            stream
+                .read_exact(&mut ack)
+                .await
+                .map_err(|e| closed_before(e, "CONNACK"))?;
             if ack != [0x20, 2, 0, 0] {
                 return Err(invalid());
             }
             write(&mut stream, &packet(0x82, &sub)?).await?;
             let mut ack = [0; 5];
-            stream.read_exact(&mut ack).await?;
+            stream
+                .read_exact(&mut ack)
+                .await
+                .map_err(|e| closed_before(e, "SUBACK"))?;
             if !matches!(ack, [0x90, 3, 0, 1, 0 | 1]) {
                 return Err(invalid());
             }
