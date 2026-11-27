@@ -99,7 +99,7 @@ enum Scan {
     Missing,
     /// The driver exists but does not scan: a syntax error, a missing or invalid
     /// import, a limit. A broken source has no fingerprint, so the error text stands in
-    /// for it; it is only compared within this process.
+    /// for it to detect edits; it is only compared within this process.
     Broken(String),
     Ready(u64),
 }
@@ -146,32 +146,23 @@ impl Unattached {
     ) -> bool {
         let key = (session, scan(config, id, model, scanned).await);
         let previous = self.0.insert(id.to_owned(), key.clone());
-        if !sources_changed || previous.as_ref() == Some(&key) {
+        if !sources_changed || previous.as_ref() == Some(&key) || key.1 == Scan::Missing {
             return false;
         }
-        match key.1 {
-            Scan::Missing => false,
-            Scan::Broken(error) => {
+        // A broken source is prepared too: preparation reports why it fails.
+        match app.retry_driver_preparation(id.to_owned(), session).await {
+            Ok(()) => false,
+            Err(rusthinq_scripting::Error::Busy) => {
+                self.0.remove(id);
+                true
+            }
+            Err(error) => {
                 app.driver_error(
                     id.to_owned(),
-                    format!("driver preparation retry source scan: {error}"),
+                    format!("driver preparation retry: {error:?}"),
                 );
                 false
             }
-            Scan::Ready(_) => match app.retry_driver_preparation(id.to_owned(), session).await {
-                Ok(()) => false,
-                Err(rusthinq_scripting::Error::Busy) => {
-                    self.0.remove(id);
-                    true
-                }
-                Err(error) => {
-                    app.driver_error(
-                        id.to_owned(),
-                        format!("driver preparation retry: {error:?}"),
-                    );
-                    false
-                }
-            },
         }
     }
 }
@@ -573,7 +564,7 @@ mod tests {
         .unwrap();
         std::fs::write(directory.path().join("Late.rhai"), "fn broken(").unwrap();
         timeout(Duration::from_secs(5), async {
-            while !matches!(events.recv().await.unwrap(), Event::Rejected {device,reason} if device == "d" && reason.contains("source scan")) {}
+            while !matches!(events.recv().await.unwrap(), Event::Rejected {device,reason} if device == "d" && reason.contains("Expecting ')'")) {}
         })
         .await
         .unwrap();
