@@ -273,3 +273,31 @@ async fn mqtt_relays_topic_uplink_verbatim() {
     stop.send_replace(true);
     task.await.unwrap().unwrap();
 }
+#[tokio::test]
+async fn lg_closing_before_connack_names_the_step() {
+    let (client, mut peer) = duplex(8192);
+    let (_uplink, rx) = mpsc::channel(4);
+    let (events, _received) = mpsc::channel(4);
+    let (_stop, stopped) = watch::channel(false);
+    let config = MqttConfig {
+        identity: identity(),
+        publish: "up".into(),
+        provisioning: "prov".into(),
+        subscribe: "down".into(),
+        deploy: json!({"did":"d","kind":"MODEL","mid":7,"data":{"appInfo":{"protocolVer":"7"},"platformInfo":{"version":"real"}}}),
+    };
+    let task = tokio::spawn(session::thinq2(client, config, rx, events, stopped));
+    assert_eq!(mqtt(&mut peer).await[0], 0x10);
+    // LG drops the connection after CONNECT without answering.
+    drop(peer);
+    let error = timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(
+        error.to_string(),
+        "LG closed the MQTT connection before CONNACK"
+    );
+}
