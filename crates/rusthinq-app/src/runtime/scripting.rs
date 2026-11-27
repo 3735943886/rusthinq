@@ -542,13 +542,13 @@ impl Runtime {
         }
     }
     /// Start preparation again for a device whose attempt failed for `session`, as
-    /// `TransportEvent::Ready` would on a reconnect. Ok(false): nothing failed for that
-    /// session, or a script is attached. Busy leaves the failure in place.
+    /// `TransportEvent::Ready` would on a reconnect. Nothing happens when nothing failed
+    /// for that session or a script is attached. Busy leaves the failure in place.
     pub(super) fn retry_preparation_request(
         &mut self,
         device: String,
         session: SessionKey,
-        result: oneshot::Sender<Result<bool, rusthinq_scripting::Error>>,
+        result: oneshot::Sender<Result<(), rusthinq_scripting::Error>>,
     ) {
         if result.is_closed() {
             return;
@@ -560,21 +560,19 @@ impl Runtime {
             .and_then(|owner| owner.generation(&device))
             .is_some()
         {
-            Ok(false)
+            Ok(())
         } else if !rusthinq_scripting::preparation::Preparation::<SessionKey>::can_prepare(
             self.driver_preparation.len() + self.driver_reload_preparation.len(),
         ) {
             Err(rusthinq_scripting::Error::Busy)
-        } else if self.preparation_policy.retry(&device, &session) {
-            if self.prepare_driver(&device) {
-                Ok(true)
-            } else {
-                // Not started (offline, no model): keep dropping its input as before.
-                self.preparation_policy.fail(&device, &session);
-                Ok(false)
-            }
         } else {
-            Ok(false)
+            if self.preparation_policy.retry(&device, &session) && !self.prepare_driver(&device) {
+                // Not started (offline, or the attempt table is full): mark it failed again
+                // so its input is still dropped. Its attempt record is gone, so the sweep
+                // after the next completed preparation may start it.
+                self.preparation_policy.fail(&device, &session);
+            }
+            Ok(())
         };
         let _ = result.send(outcome);
     }

@@ -287,7 +287,7 @@ enum ScriptCommand {
     RetryPreparation {
         device: String,
         session: SessionKey,
-        result: oneshot::Sender<Result<bool, rusthinq_scripting::Error>>,
+        result: oneshot::Sender<Result<(), rusthinq_scripting::Error>>,
     },
     Invoke {
         device: String,
